@@ -15,7 +15,16 @@ CLEANUP_MEMORY = False
 
 @ray.remote
 class PiperActor:
-    def __init__(self, actor_id, world_size, dp_rank=0, dp_degree=1, pp_degree=1, optim_fn=None):
+    def __init__(
+        self,
+        actor_id: int,
+        world_size: int,
+        dp_rank: int = 0,
+        dp_degree: int = 1,
+        pp_degree: int = 1,
+        optim_fn: Callable | None = None,
+        overlap_grad_sync: bool = True,
+    ):
         self.logger = create_logger("piper_actor", "INFO")
         
         start = time.perf_counter()
@@ -63,7 +72,9 @@ class PiperActor:
         # accumuate loss for each microbatch
         self.loss = []
         # map stage_id -> list of (param_group, optimizer) for overlapped sync+step
-        self.param_group_optims = dict()
+        self.overlap_grad_sync = overlap_grad_sync
+        if overlap_grad_sync:
+            self.param_group_optims: dict[int, list] = {}
 
         # Timing infrastructure
         self.tracing = False  # Toggle for timing and memory tracing
@@ -157,15 +168,16 @@ class PiperActor:
         if params:
             self.optims[stage_id] = self.optim_fn(params)
 
-            # Create per-group optimizers for overlapped sync+step in DP mode
-            GROUP_SIZE = 64  # Tunable: trade-off between overlap and optimizer overhead
-            param_groups = [
-                params[i:i + GROUP_SIZE]
-                for i in range(0, len(params), GROUP_SIZE)
-            ]
-            self.param_group_optims[stage_id] = [
-                (group, self.optim_fn(group)) for group in param_groups
-            ]
+            if self.overlap_grad_sync:
+                # Create per-group optimizers for overlapped sync+step in DP mode
+                GROUP_SIZE = 64  # Tunable: trade-off between overlap and optimizer overhead
+                param_groups = [
+                    params[i:i + GROUP_SIZE]
+                    for i in range(0, len(params), GROUP_SIZE)
+                ]
+                self.param_group_optims[stage_id] = [
+                    (group, self.optim_fn(group)) for group in param_groups
+                ]
 
         del gm_data
 
@@ -452,7 +464,7 @@ class PiperActor:
         # step the optimizer for each stage
         assert self.optim_fn
         if self.dp_degree > 1:
-            if True:
+            if self.overlap_grad_sync:
                 # Use overlapped sync+step for DP mode
                 self._overlapped_sync_and_step()
             else:
