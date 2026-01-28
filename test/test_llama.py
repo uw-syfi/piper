@@ -168,7 +168,7 @@ def main(args):
 
     # Definte one iteration of the schedule
     def iter_schedule():
-        out = piper_exec(compiled, schedule, [None], None, loss_fn, num_mbs, num_stages)
+        out = piper_exec(compiled, schedule, [x], y, loss_fn, num_mbs, num_stages)
         # ray.wait(out, fetch_local=False)
         ray.get(out)
 

@@ -62,6 +62,8 @@ class PiperActor:
         self.activation = defaultdict(dict)
         # accumuate loss for each microbatch
         self.loss = []
+        # map stage_id -> list of (param_group, optimizer) for overlapped sync+step
+        self.param_group_optims = dict()
 
         # Timing infrastructure
         self.tracing = False  # Toggle for timing and memory tracing
@@ -151,8 +153,19 @@ class PiperActor:
         self.parameters[stage_id] = graphargs
 
         # initialize the optimizer for this stage
-        if [param for param in self.parameters[stage_id] if param is not None]:
-            self.optims[stage_id] = self.optim_fn([param for param in self.parameters[stage_id] if param is not None])
+        params = [param for param in self.parameters[stage_id] if param is not None]
+        if params:
+            self.optims[stage_id] = self.optim_fn(params)
+
+            # Create per-group optimizers for overlapped sync+step in DP mode
+            GROUP_SIZE = 64  # Tunable: trade-off between overlap and optimizer overhead
+            param_groups = [
+                params[i:i + GROUP_SIZE]
+                for i in range(0, len(params), GROUP_SIZE)
+            ]
+            self.param_group_optims[stage_id] = [
+                (group, self.optim_fn(group)) for group in param_groups
+            ]
 
         del gm_data
 
@@ -388,14 +401,41 @@ class PiperActor:
         return ret + ret
 
     def synchronize_gradients(self):
-        """Synchronize gradients across all DP ranks for this stage using all-reduce."""     
+        """Synchronize gradients across all DP ranks for this stage using all-reduce."""
         self.logger.debug(f"Actor {self.actor_id} global rank {self.global_rank} synchronizing gradients")
-        
+
         # Iterate over all stages on this actor and synchronize their parameters
         for stage_id, parameters in self.parameters.items():
             for param in parameters:
                 if param is not None and param.grad is not None:
                     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.dp_group)
+
+    def _overlapped_sync_and_step(self):
+        """Overlap gradient sync with optimizer step using per-group optimizers."""
+        self.logger.debug(f"Actor {self.actor_id} global rank {self.global_rank} running overlapped sync+step")
+        comm_stream = torch.cuda.Stream()
+
+        for stage_id in self.parameters:
+            if stage_id not in self.param_group_optims:
+                continue
+
+            for param_group, optim in self.param_group_optims[stage_id]:
+                handles = []
+                with torch.cuda.stream(comm_stream):
+                    for param in param_group:
+                        if param.grad is not None:
+                            h = dist.all_reduce(
+                                param.grad,
+                                op=dist.ReduceOp.AVG,
+                                group=self.dp_group,
+                                async_op=True
+                            )
+                            handles.append(h)
+
+                for h in handles:
+                    h.wait()
+                optim.step()
+                optim.zero_grad()
 
     def update(self, *done_mbs):
         self.logger.debug(f"Calling update on actor {self.actor_id} global rank {self.global_rank}")
@@ -409,15 +449,23 @@ class PiperActor:
 
             start_event.record()
         
-        # if dp degree > 1, synchronize the gradients
-        if self.dp_degree > 1:
-            self.synchronize_gradients()
-        
         # step the optimizer for each stage
         assert self.optim_fn
-        for _, optim in self.optims.items():
-            optim.step()
-            optim.zero_grad()
+        if self.dp_degree > 1:
+            if True:
+                # Use overlapped sync+step for DP mode
+                self._overlapped_sync_and_step()
+            else:
+                # Standard all-reduce then step
+                self.synchronize_gradients()
+                for _, optim in self.optims.items():
+                    optim.step()
+                    optim.zero_grad()
+        else:
+            # Non-DP mode: just step optimizers
+            for _, optim in self.optims.items():
+                optim.step()
+                optim.zero_grad()
         losses = self.loss
         self.loss.clear()
 
@@ -487,7 +535,7 @@ class PiperActor:
     def start_mem_tracing(self) -> None:
         torch.cuda.memory._record_memory_history()
         return "done"
-    
+
     def stop_mem_tracing(self) -> None:
         torch.cuda.memory._dump_snapshot(f"actor{self.actor_id}_memory_snapshot_mb4_gpipe.pickle")
         self.logger.info(f"Saved memory snapshot to actor{self.actor_id}_memory_snapshot_mb4_gpipe.pickle")
