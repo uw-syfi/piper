@@ -1,0 +1,8 @@
+__pycache__/
+
+.venv
+piper.egg-info/
+out/
+.vscode/
+.codex
+ec2-trust-policy.json

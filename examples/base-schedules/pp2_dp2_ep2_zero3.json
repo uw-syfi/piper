@@ -1,0 +1,76 @@
+[
+  {
+    "op": "place",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      2
+    ],
+    "stream": "pp_stream"
+  },
+  {
+    "op": "place",
+    "filter": {
+      "PP": 1
+    },
+    "devices": [
+      1,
+      3
+    ],
+    "stream": "pp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      2
+    ],
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "PP": 1
+    },
+    "devices": [
+      1,
+      3
+    ],
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "PP": 0,
+      "EP": "*"
+    },
+    "devices": [
+      0,
+      2
+    ],
+    "stream": "dp_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "PP": 1,
+      "EP": "*"
+    },
+    "devices": [
+      1,
+      3
+    ],
+    "stream": "dp_stream"
+  }
+]

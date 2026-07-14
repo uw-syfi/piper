@@ -1,0 +1,10 @@
+torchtitan
+numpy
+torch==2.10.0
+ray==2.44.1
+click<8.1
+cupy-cuda12x
+bitsandbytes
+graphviz
+matplotlib
+pytest
