@@ -12,10 +12,13 @@ license = "MIT"
 dependencies = [
   "torchtitan",
   "numpy",
-  "torch==2.10.0",
+  # PyTorch 2.11 is the first CUDA-enabled PyPI build for Linux aarch64.
+  "torch==2.10.0; platform_machine == 'x86_64'",
+  "torch==2.11.0; platform_machine == 'aarch64'",
   "ray==2.44.1",
   "click<8.1",
-  "cupy-cuda12x",
+  "cupy-cuda12x; platform_machine == 'x86_64'",
+  "cupy-cuda13x; platform_machine == 'aarch64'",
   "bitsandbytes",
   "graphviz",
   "matplotlib",

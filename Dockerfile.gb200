@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+
+# GB200/Grace (Linux aarch64) development image.
+#
+# Build from the repository root:
+#   docker build -f Dockerfile.gb200 \
+#     --build-arg USER_UID="$(id -u)" \
+#     --build-arg USER_GID="$(id -g)" \
+#     -t piper-gb200:latest .
+#
+# Run with the current checkout mounted over the copy baked into the image:
+#   docker run --rm -it --gpus all --ipc=host --network=host \
+#     -v "$PWD:/workspace/piper" \
+#     piper-gb200:latest
+
+ARG CUDA_IMAGE=nvidia/cuda:13.2.1-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG USER_NAME=piper
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+ENV VIRTUAL_ENV=/opt/piper-venv \
+    PATH=/opt/piper-venv/bin:${PATH} \
+    HOME=/home/${USER_NAME} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    CUPY_CACHE_DIR=/tmp/piper/cupy_cache
+
+# Fail early if this GB200-specific image is accidentally built for x86_64.
+RUN test "$(dpkg --print-architecture)" = "arm64"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        graphviz \
+        openssh-client \
+        python3 \
+        python3-pip \
+        python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv "${VIRTUAL_ENV}" && \
+    python -m pip install --upgrade \
+        pip \
+        "setuptools>=68,<82" \
+        wheel
+
+# Keep this layer dependent only on requirements.txt. BuildKit stores downloaded
+# wheels in its cache, while the installed packages live in the image layer
+# instead of the quota-limited repository filesystem.
+COPY requirements.txt /tmp/piper-requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install -r /tmp/piper-requirements.txt
+
+# Install the checkout editable without resolving dependencies again. Mounting a
+# newer checkout at /workspace/piper therefore updates the code without rebuilding
+# the heavy dependency layer.
+WORKDIR /workspace/piper
+COPY . /workspace/piper
+RUN python -m pip install --no-deps --no-build-isolation -e . && \
+    mkdir -p /tmp/piper/cupy_cache /tmp/piper/ray_tmp && \
+    groupadd --gid "${USER_GID}" "${USER_NAME}" && \
+    useradd --uid "${USER_UID}" --gid "${USER_GID}" \
+        --create-home --shell /bin/bash "${USER_NAME}" && \
+    chown -R "${USER_UID}:${USER_GID}" /workspace/piper /tmp/piper
+
+USER ${USER_NAME}
+
+CMD ["bash"]
