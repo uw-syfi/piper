@@ -153,6 +153,7 @@ def print_training_dag_order(
     label: str = "",
     rank: int = 0,
     out_dir: str = "out",
+    output_name: str | None = None,
 ) -> None:
     """Write and log the actor dispatch order for a TrainingDAG."""
     topo_levels = _topological_levels(dag)
@@ -192,7 +193,10 @@ def print_training_dag_order(
     lines.append("-" * len(header))
 
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"training_dag_order_rank{rank}")
+    out_path = os.path.join(
+        out_dir,
+        output_name or f"training_dag_order_rank{rank}",
+    )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     logger.info("Pipeline schedule visualization saved to %s", out_path)

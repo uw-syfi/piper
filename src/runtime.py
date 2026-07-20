@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 from concurrent.futures import Future, ThreadPoolExecutor
 
+from .profiling import normalize_profile_mode
+
 
 @dataclass
 class BufferStore:
@@ -143,6 +145,7 @@ class RuntimeState:
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
     streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
+    profile_p2p_streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
 
@@ -189,6 +192,76 @@ class RuntimeState:
 
     def default_stream(self) -> torch.cuda.Stream:
         return self.stream_for_id("default_stream")
+
+    def initialize_profile_p2p_streams(self) -> None:
+        """Create the two directional P2P streams used by serialized profiling.
+
+        Non-P2P profile work is intentionally collapsed onto ``default_stream``.
+        P2P is the exception: keeping the lo->hi and hi->lo communicators on
+        separate CUDA streams lets both directions make progress concurrently
+        and avoids introducing a profiling-only send/recv deadlock.
+        """
+        if self.profile_p2p_streams:
+            return
+        self.profile_p2p_streams = {
+            "pp_lo_hi": torch.cuda.Stream(device=self.device),
+            "pp_hi_lo": torch.cuda.Stream(device=self.device),
+        }
+
+    def profile_p2p_stream_for_task(self, task: Any) -> torch.cuda.Stream:
+        """Return the profiling stream matching the task's directional group."""
+        self.initialize_profile_p2p_streams()
+        peer_pp_rank = getattr(task, "peer_pp_rank", None)
+        if peer_pp_rank is None:
+            meta = getattr(task, "node_meta", {}) or {}
+            peer_pp_rank = meta.get("peer_pp_rank")
+        if peer_pp_rank is None:
+            raise ValueError(
+                f"P2P task {getattr(task, 'uid', '<unknown>')} is missing peer_pp_rank"
+            )
+
+        peer_global_rank = self.pipeline_peer_global_rank(int(peer_pp_rank))
+        node_kind = getattr(task, "node_kind", None)
+        if node_kind == "SEND_COMM":
+            group_kind = (
+                "pp_lo_hi" if peer_global_rank > self.global_rank else "pp_hi_lo"
+            )
+        elif node_kind == "RECV_COMM":
+            group_kind = (
+                "pp_hi_lo" if peer_global_rank > self.global_rank else "pp_lo_hi"
+            )
+        else:
+            raise ValueError(
+                "profile_p2p_stream_for_task requires SEND_COMM or RECV_COMM, "
+                f"got node_kind={node_kind!r}"
+            )
+        return self.profile_p2p_streams[group_kind]
+
+    def profile_stream_for_task(
+        self,
+        task: Any,
+        logical_stream: torch.cuda.Stream,
+        *,
+        profile_mode: str = "interference_free",
+    ) -> torch.cuda.Stream:
+        """Resolve the physical stream for one profiling policy.
+
+        Isolated profiling collapses non-P2P work onto the default stream so
+        CUDA-event durations are free from actor-local kernel contention.
+        Concurrent profiling retains the normal logical stream assignment so
+        its durations capture the contention present in an ordinary step.
+
+        P2P is deliberately identical in both modes: sends and receives use
+        the dedicated lo->hi and hi->lo streams.  Serializing both directions
+        can create a profiling-only NCCL rendezvous deadlock.
+        """
+
+        mode = normalize_profile_mode(profile_mode)
+        if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
+            return self.profile_p2p_stream_for_task(task)
+        if mode == "interference_free":
+            return self.default_stream()
+        return logical_stream
 
     def nvtx_push(self, label: str) -> None:
         if not self.no_nvtx:

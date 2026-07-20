@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch.fx as fx
 
 from .fx import AnnotationSegment
+
+if TYPE_CHECKING:
+    from .profiling import NodeProfile
 
 def _collect_triton_constant_args(gm: fx.GraphModule) -> dict[int, Any]:
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
@@ -37,6 +42,9 @@ class TrainingDAGNode:
     device: list[int] | None
     stream: str
     node_meta: dict[str, Any] = field(default_factory=dict)
+    # Rank-specific named timing datasets. Keep these out of node_meta, which
+    # also contains live FX/runtime objects and is not a durable interchange.
+    profile_times_by_mode: dict[str, dict[int, NodeProfile]] = field(default_factory=dict)
 
 
 @dataclass
@@ -46,6 +54,11 @@ class TrainingDAG:
     succs: dict[str, set[str]] = field(default_factory=dict)
     preds: dict[str, set[str]] = field(default_factory=dict)
     edge_keys: set[tuple[str, str, str, str | None]] = field(default_factory=set)
+    # Gradient-buffer initialization happens before the first scheduled node,
+    # so it has no natural TrainingDAGNode to carry its profile.
+    prologue_profile_times_by_mode: dict[str, dict[int, NodeProfile]] = field(
+        default_factory=dict
+    )
 
     def add_node(self, node: TrainingDAGNode) -> None:
         if node.uid in self.nodes:

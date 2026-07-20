@@ -32,6 +32,83 @@ The directive rewrites insert point-to-point pipeline communication, DP collecti
 The runtime decomposes the global DAG into per-device execution plans and runs them on Ray actors.
 Each actor manages local CUDA streams, process groups/communicators, model-state buffers, and intermediate tensors.
 
+### Training-step simulation
+
+Piper can profile finalized TrainingDAG nodes and replay their logical stream
+schedule in a CUDA-free event simulator. The profiler collects two compatible
+timing datasets:
+
+* `interference_free` serializes non-P2P work onto one CUDA stream to measure
+  node durations without same-device compute or memory contention.
+* `normal` preserves the actual logical CUDA streams and records contended
+  durations plus iteration-aligned GPU start offsets. Normal replay uses those
+  offsets as release constraints, preserving launch gaps that dependency edges
+  and durations alone cannot reconstruct.
+
+Pipeline SEND/RECV operations are never forced onto the serialized stream.
+Both modes retain separate `pp_lo_hi` and `pp_hi_lo` NCCL groups and CUDA
+streams, allowing opposite directions to make progress concurrently and
+avoiding profiler-induced P2P deadlock.
+
+Every DP worker participating in a training program must call the profiling
+API. The merged artifact contains rank-specific node durations and a slim copy
+of the finalized DAGs:
+
+```python
+from src.piper import piper_profile_dags, simulate_profiled_modes
+from src.profiling import ProfileConfig
+
+plan = piper_profile_dags(
+    loss_fn,
+    ProfileConfig(),  # 5 warmups; exactly 30 measured iterations per mode
+    profile_modes=("interference_free", "normal"),
+    output_path="out/step_time_profiles.json",
+)
+comparison = simulate_profiled_modes(plan, actual_step_samples_s=hardware_samples)
+print(comparison.interference_free_statistics)
+print(comparison.normal_statistics)
+print(comparison.normal_prediction_error)
+```
+
+A saved artifact can be simulated without GPUs or Ray:
+
+```bash
+python scripts/simulate_step_times.py \
+  out/step_time_profiles.json \
+  --mode both \
+  --actual-step-time-s 0.0645 \
+  --output out/interference_free_simulation.json
+```
+
+To rank profiled nodes by their normal-to-interference-free median duration:
+
+```bash
+python scripts/export_node_profile_ratios.py \
+  out/step_time_profiles.json \
+  --output out/node_profile_time_ratios.csv
+```
+
+The exporter pools each node's raw samples across its profiled global-rank
+entries, omits non-executing bookkeeping nodes with no samples in either mode,
+and sorts the CSV by descending duration ratio.
+
+The simulator preserves stream FIFO, data/temporal dependencies, P2P and
+collective rendezvous, but has no shared SM, memory-bandwidth, or network-link
+capacity clock. Independent streams therefore progress at their profiled solo
+rates. Because a communication endpoint's CUDA-event timing may include time
+waiting for peers, a collapsed rendezvous uses the minimum endpoint estimate
+as its optimistic service time after all participants become ready; the
+timeline still reports every endpoint's raw profiled duration.
+
+The normal hardware baseline uses exactly `--iters` measured iterations and
+each profile mode uses exactly `--profile-iters` measured iterations (both
+default to 30). Confidence intervals and their relative errors are descriptive;
+they never change the iteration count. The harness reports the sample count,
+estimator, mean, median, standard deviation, 95% CI, and relative CI error for
+actual time, throughput, simulated normal time, simulated interference-free
+time, instrumented normal-profile time, and peak memory. It also reports simulated
+normal prediction error against the measured median.
+
 ## Installation
 
 Requires Python 3.10+ on Linux with CUDA GPUs.
@@ -88,6 +165,37 @@ Stage `PP=0` runs on device group `[0, 2]`, while `PP=1` runs on device group `[
 This example also expects four visible CUDA devices.
 The harness appends 1F1B `split` and `order` directives for two pipeline ranks and four microbatches.
 Each run creates `out/<timestamp>/` with the complete generated schedule and metrics.
+
+### Multi-host Ray
+
+Piper does not discover remote hosts automatically. Start a Ray head inside the
+GB200 container on the first host, then join each worker from its own container.
+Use private IPs reachable over the interface that NCCL will use:
+
+```bash
+# Host 1
+scripts/start_ray_head.sh --node-ip <head-private-ip>
+
+# Host 2
+scripts/join_ray_worker.sh \
+  --head-address <head-private-ip>:6379 \
+  --node-ip <worker-private-ip>
+```
+
+Both scripts use `/opt/piper-venv`, advertise all visible GPUs, stop any stale
+local Ray daemon, disable Ray usage reporting, and use
+`/tmp/piper/ray_tmp`. On multi-NIC hosts, pass the same communication interface
+on both machines with `--network-interface <name>`. Use `--no-stop` to preserve
+an existing local Ray session or `--dry-run` to inspect the resolved command.
+
+Verify the cluster from the head:
+
+```bash
+/opt/piper-venv/bin/ray status --address=<head-private-ip>:6379
+```
+
+Then pass the head address to the harness with
+`--address <head-private-ip> --port 6379`.
 
 ## Overview of Inputs
 
@@ -161,12 +269,22 @@ out/<timestamp>/
 `-- results.csv
 ```
 
-`results.csv` contains a row for each SPMD rank (e.g., each DP rank) reporting the mean/std iteration time, training throughput in tokens/sec, and per-PP-rank peak memory in GB.
+`results.csv` contains a row for each SPMD rank (e.g., each DP rank), including
+raw-distribution summaries and percentage uncertainty for iteration time,
+training throughput, and per-PP-rank peak memory. With
+`--profile-and-simulate`, the run directory also contains the reusable
+multi-mode profile JSON and normal/interference-free simulation statistics.
 
 Optional artifact generation flags:
 
 * `--viz` renders the generated pipeline schedule and per-PP-rank DAG IRs under the run directory.
 * `--pytorch-profiler --pytorch-profiler-iters <n>` runs extra profiled iterations and writes combined Chrome trace files per SPMD rank; Piper annotates GPU events with DAG IR node labels.
+* `--profile-and-simulate` collects interference-free and normal node profiles,
+  replays both, and reports normal-replay prediction error. `--profile-iters`
+  sets the exact measured iteration count for each mode and
+  `--profile-warmup-iters` sets its warmup count.
+* Normal hardware timing runs exactly `--iters` measured iterations after
+  `--warmup` warmup iterations.
 
 ## Citation
 

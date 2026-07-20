@@ -17,12 +17,93 @@ from .state import (
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
 from .executors import CommunicationExecutor, ComputeExecutor, DagExecutor
 from .ordering import _serial_topological_order
-from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
+from .profiling import (
+    ActorProfileResult,
+    DEFAULT_NORMAL_SCOPE,
+    DEFAULT_ISOLATION_SCOPE,
+    NodeProfile,
+    finalized_dag_fingerprint,
+    normalize_profile_mode,
+)
+from .runtime import (
+    BufferStore,
+    EventStore,
+    ParamStorage,
+    RuntimeState,
+    StageStore,
+)
 from .tasks import training_dag_task_type as _training_dag_task_type
 
 CLEANUP_MEMORY = False
 
 logger = create_logger("actor", LOG_LEVEL)
+
+
+class _CudaEventTimingRecorder:
+    """Collect one CUDA-event sample for every dispatched DAG node."""
+
+    def __init__(self) -> None:
+        self._node_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        self._active_node_starts: dict[str, torch.cuda.Event] = {}
+        self._prologue_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self._prologue_start: torch.cuda.Event | None = None
+        self.node_samples_us: dict[str, float] = {}
+        self.node_start_offsets_us: dict[str, float] = {}
+        self.prologue_sample_us: float | None = None
+
+    @staticmethod
+    def _event() -> torch.cuda.Event:
+        return torch.cuda.Event(enable_timing=True)
+
+    def before_prologue(self, stream: torch.cuda.Stream) -> None:
+        start = self._event()
+        start.record(stream)
+        self._prologue_start = start
+
+    def after_prologue(self, stream: torch.cuda.Stream) -> None:
+        if self._prologue_start is None:
+            raise RuntimeError("profile recorder saw prologue end before start")
+        end = self._event()
+        end.record(stream)
+        self._prologue_events = (self._prologue_start, end)
+        self._prologue_start = None
+
+    def before_node(self, node: Any, stream: torch.cuda.Stream) -> None:
+        start = self._event()
+        start.record(stream)
+        self._active_node_starts[str(node.uid)] = start
+
+    def after_node(self, node: Any, stream: torch.cuda.Stream) -> None:
+        uid = str(node.uid)
+        try:
+            start = self._active_node_starts.pop(uid)
+        except KeyError as exc:
+            raise RuntimeError(f"profile recorder saw node end before start: {uid}") from exc
+        end = self._event()
+        end.record(stream)
+        self._node_events[uid] = (start, end)
+
+    def finish(self) -> None:
+        if self._active_node_starts:
+            raise RuntimeError(
+                "profile recorder has unfinished nodes: "
+                f"{sorted(self._active_node_starts)}"
+            )
+        self.node_samples_us = {
+            uid: float(start.elapsed_time(end)) * 1000.0
+            for uid, (start, end) in self._node_events.items()
+        }
+        if self._prologue_events is not None:
+            start, end = self._prologue_events
+            self.prologue_sample_us = float(start.elapsed_time(end)) * 1000.0
+            # CUDA events carry a device-wide timestamp even when recorded on
+            # different streams.  Reuse the existing events to capture exact
+            # rank-local GPU start positions without adding callbacks, events,
+            # or per-node synchronization to the hot path.
+            self.node_start_offsets_us = {
+                uid: float(start.elapsed_time(node_start)) * 1000.0
+                for uid, (node_start, _node_end) in self._node_events.items()
+            }
 
 def _disable_functorch_donated_buffers() -> None:
     import importlib
@@ -62,12 +143,30 @@ def _create_actors(
             "python-backtrace": "cuda",
             "stop-on-exit": "true",
         }} if profile else {}
+        forwarded_env = {
+            name: os.environ[name]
+            for name in (
+                "CPATH",
+                "C_INCLUDE_PATH",
+                "CPLUS_INCLUDE_PATH",
+                "LIBRARY_PATH",
+                "TRITON_CACHE_DIR",
+                "NCCL_CUMEM_ENABLE",
+                "NCCL_DEBUG",
+                "NCCL_DEBUG_FILE",
+                "NCCL_DEBUG_SUBSYS",
+                "NCCL_SOCKET_IFNAME",
+                "GLOO_SOCKET_IFNAME",
+            )
+            if os.environ.get(name)
+        }
         nccl_env = {
             "env_vars": {
                 # "NCCL_SOCKET_IFNAME": "ens32",
                 # "GLOO_SOCKET_IFNAME": "ens32",
                 # "NCCL_P2P_DISABLE": "1",
                 # "NCCL_DEBUG": "INFO",
+                **forwarded_env,
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
         }
@@ -143,6 +242,15 @@ class PiperActor:
         # DAG execution state
         self.dag = None
         self.sorted_dag_nodes = None
+        # Interference-free and normal profiles must never be combined:
+        # they answer different simulation questions from the same DAG.
+        self._profile_node_samples: dict[
+            str, dict[str, list[float]]
+        ] = {}
+        self._profile_node_start_offsets: dict[
+            str, dict[str, list[float]]
+        ] = {}
+        self._profile_prologue_samples: dict[str, list[float]] = {}
 
         self.buffers = BufferStore()
         self.events = EventStore()
@@ -731,17 +839,185 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
-    def run_dag(self, loss_fn=None):
+    def _execute_dag(
+        self,
+        loss_fn=None,
+        *,
+        stream_override=None,
+        timing_recorder=None,
+        iteration_label: str = "iter",
+    ):
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
-        self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
-        self.dag_executor.run(
-            self.dag,
-            self.sorted_dag_nodes,
-            self.inputs,
-            self.labels,
-            self.loss,
-            loss_fn=loss_fn,
+        self._nvtx_push(
+            f"{iteration_label}_{iter_idx}_rank_{self.runtime.global_rank}"
         )
-        self._nvtx_pop()
+        try:
+            return self.dag_executor.run(
+                self.dag,
+                self.sorted_dag_nodes,
+                self.inputs,
+                self.labels,
+                self.loss,
+                loss_fn=loss_fn,
+                stream_override=stream_override,
+                timing_recorder=timing_recorder,
+            )
+        finally:
+            self._nvtx_pop()
+
+    def run_dag(self, loss_fn=None):
+        return self._execute_dag(loss_fn=loss_fn)
+
+    def reset_profile_samples(
+        self, *, profile_mode: str = "interference_free"
+    ) -> None:
+        """Discard samples from an earlier session for one profiling policy."""
+
+        mode = normalize_profile_mode(profile_mode)
+        self._profile_node_samples[mode] = defaultdict(list)
+        if mode == "normal":
+            self._profile_node_start_offsets[mode] = defaultdict(list)
+        else:
+            self._profile_node_start_offsets.pop(mode, None)
+        self._profile_prologue_samples[mode] = []
+
+    def _profile_stream_override(
+        self,
+        node: Any,
+        logical_stream: torch.cuda.Stream,
+        *,
+        profile_mode: str = "interference_free",
+    ) -> torch.cuda.Stream:
+        return self.runtime.profile_stream_for_task(
+            node,
+            logical_stream,
+            profile_mode=profile_mode,
+        )
+
+    def profile_run_dag(
+        self,
+        loss_fn=None,
+        *,
+        record: bool = True,
+        profile_mode: str = "interference_free",
+    ) -> None:
+        """Run one timed iteration using interference-free or normal streams.
+
+        ``interference_free`` collapses non-P2P payloads onto the default
+        stream, while ``normal`` preserves their normal logical streams. Both policies
+        retain independent lo->hi and hi->lo P2P streams so a profiling-only
+        receive/send cycle cannot prevent NCCL progress.
+        """
+        mode = normalize_profile_mode(profile_mode)
+        if self.runtime.pytorch_profiler_enabled:
+            raise RuntimeError(
+                f"{mode} profiling cannot run while torch.profiler is active"
+            )
+        torch.cuda.synchronize(self.runtime.device)
+        recorder = _CudaEventTimingRecorder() if record else None
+        self._execute_dag(
+            loss_fn=loss_fn,
+            stream_override=lambda node, logical_stream: self._profile_stream_override(
+                node,
+                logical_stream,
+                profile_mode=mode,
+            ),
+            timing_recorder=recorder,
+            iteration_label=f"profile_{mode}_iter",
+        )
+        if recorder is None:
+            return
+        missing = set(self.dag.nodes) - set(recorder.node_samples_us)
+        if missing:
+            raise RuntimeError(
+                f"profile iteration did not record nodes: {sorted(missing)}"
+            )
+        node_samples = self._profile_node_samples.setdefault(mode, defaultdict(list))
+        for uid, sample_us in recorder.node_samples_us.items():
+            node_samples[uid].append(sample_us)
+        if mode == "normal":
+            node_start_offsets = self._profile_node_start_offsets.setdefault(
+                mode, defaultdict(list)
+            )
+            for uid, offset_us in recorder.node_start_offsets_us.items():
+                node_start_offsets[uid].append(offset_us)
+        if recorder.prologue_sample_us is not None:
+            self._profile_prologue_samples.setdefault(mode, []).append(
+                recorder.prologue_sample_us
+            )
+
+    def get_profile_result(
+        self,
+        *,
+        estimator: str = "median",
+        profile_mode: str = "interference_free",
+    ) -> ActorProfileResult:
+        """Aggregate samples into the detached, rank-keyed profile interface."""
+        mode = normalize_profile_mode(profile_mode)
+        if self.dag is None:
+            raise RuntimeError("load_training_dag() must precede profiling")
+        mode_node_samples = self._profile_node_samples.get(mode, {})
+        mode_node_start_offsets = self._profile_node_start_offsets.get(mode, {})
+        node_profiles: dict[str, NodeProfile] = {}
+        for uid, node in self.dag.nodes.items():
+            if getattr(node, "node_kind", None) == "ORDER_DUMMY":
+                node_profiles[uid] = NodeProfile.skipped(
+                    "order_dummy",
+                    isolation_scope=(
+                        DEFAULT_ISOLATION_SCOPE
+                        if mode == "interference_free"
+                        else DEFAULT_NORMAL_SCOPE
+                    ),
+                )
+                continue
+            samples = mode_node_samples.get(uid, [])
+            if not samples:
+                raise RuntimeError(
+                    f"no {mode} profile samples collected for node {uid}"
+                )
+            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
+                isolation_scope = "normal_directional_p2p"
+            elif mode == "interference_free":
+                isolation_scope = DEFAULT_ISOLATION_SCOPE
+            else:
+                isolation_scope = DEFAULT_NORMAL_SCOPE
+            node_profiles[uid] = NodeProfile.from_samples(
+                samples,
+                estimator=estimator,
+                isolation_scope=isolation_scope,
+                start_offset_samples_us=mode_node_start_offsets.get(uid, ()),
+            )
+
+        prologue_samples = self._profile_prologue_samples.get(mode, [])
+        prologue_profile = (
+            NodeProfile.from_samples(
+                prologue_samples,
+                estimator=estimator,
+                isolation_scope=(
+                    DEFAULT_ISOLATION_SCOPE
+                    if mode == "interference_free"
+                    else DEFAULT_NORMAL_SCOPE
+                ),
+            )
+            if prologue_samples
+            else None
+        )
+        props = torch.cuda.get_device_properties(self.runtime.device)
+        return ActorProfileResult(
+            profile_mode=mode,
+            graph_fingerprint=finalized_dag_fingerprint(self.dag),
+            global_rank=self.runtime.global_rank,
+            dp_rank=self.runtime.dp_rank,
+            pp_rank=self.runtime.pp_rank,
+            device_metadata={
+                "name": props.name,
+                "compute_capability": f"{props.major}.{props.minor}",
+                "total_memory": int(props.total_memory),
+                "torch_version": str(torch.__version__),
+                "cuda_version": str(torch.version.cuda),
+            },
+            node_profiles=node_profiles,
+            prologue_profile=prologue_profile,
+        )
