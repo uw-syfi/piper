@@ -13,16 +13,26 @@ import csv
 import importlib.util
 import json
 import logging
+import os
 import re
 import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
 
+# When invoked as ``python examples/test_harness.py``, Python otherwise places
+# ``examples/`` (rather than this checkout's root) first on sys.path.  An
+# editable install of another Piper checkout can then satisfy ``import src``.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+sys.path.insert(0, _REPO_ROOT)
+
 import ray
 from ray.util.placement_group import placement_group_table
 
 from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
+from src.profile_statistics import summarize_timing_samples
 from src.schedule import load_schedule_directives
 from src.visualization import visualize_order_directives
 
@@ -31,6 +41,21 @@ from build_schedule import (
     build_dualpipev_schedule,
     build_interleaved_1f1b_schedule,
     build_zerobubble_schedule,
+)
+
+
+_RAY_FORWARDED_ENV_VARS = (
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "LIBRARY_PATH",
+    "TRITON_CACHE_DIR",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_FILE",
+    "NCCL_DEBUG_SUBSYS",
+    "NCCL_SOCKET_IFNAME",
+    "GLOO_SOCKET_IFNAME",
 )
 
 
@@ -106,6 +131,24 @@ def main() -> None:
              "chrome traces into one trace per dp-rank under out/.",
     )
     parser.add_argument(
+        "--profile-and-simulate",
+        dest="profile_and_simulate",
+        action="store_true",
+        help="Profile and simulate both normal and interference-free step times.",
+    )
+    parser.add_argument(
+        "--profile-warmup-iters",
+        type=int,
+        default=5,
+        help="Warmup iterations for each node-profile mode.",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=30,
+        help="Exact number of measured iterations for each node-profile mode.",
+    )
+    parser.add_argument(
         "--address",
         default="",
         help="Ray head address to connect to. Omit to start a local Ray session.",
@@ -153,6 +196,18 @@ def main() -> None:
     forwarded_args = _replace_schedule_arg(test_args, generated_schedule)
     if args.viz:
         forwarded_args.append("--viz")
+    if args.profile_and_simulate:
+        forwarded_args.extend(
+            [
+                "--profile-and-simulate",
+                "--profile-warmup-iters",
+                str(args.profile_warmup_iters),
+                "--profile-iters",
+                str(args.profile_iters),
+                "--step-time-profile-output",
+                str((run_dir / "step_time_profiles.json").resolve()),
+            ]
+        )
 
     profile_dir: Path | None = None
     if args.pytorch_profiler and not args.dry_run:
@@ -232,12 +287,23 @@ def _run_test_module(
         test_ns.num_stages = test_module._derive_num_stages(test_ns.schedule_directives_file)
 
     namespace = args.ray_namespace or module_name.rsplit(".", 1)[-1].replace("test_", "")
+    forwarded_env = {
+        name: os.environ[name]
+        for name in _RAY_FORWARDED_ENV_VARS
+        if os.environ.get(name)
+    }
+    runtime_env_kwargs = (
+        {"runtime_env": {"env_vars": forwarded_env}}
+        if forwarded_env
+        else {}
+    )
     ray.init(
         address=f"{args.address}:{args.port}" if args.address else None,
         namespace=namespace,
         log_to_driver=True,
         include_dashboard=False,
         _temp_dir=args.temp_dir,
+        **runtime_env_kwargs,
     )
     try:
         pp_outer = getattr(test_ns, "pp_outer", False)
@@ -555,6 +621,58 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
             "iter_time_std_s": std_iter,
             "throughput_tokens_per_s": throughput,
         }
+        if iter_times:
+            actual_stats = summarize_timing_samples(iter_times, estimator="median")
+            _add_timing_statistics_columns(row, "actual_step_time", actual_stats)
+            throughput_stats = summarize_timing_samples(
+                (tokens / sample for sample in iter_times), estimator="median"
+            )
+            _add_scalar_statistics_columns(
+                row, "throughput_tokens_per_s", throughput_stats
+            )
+
+        for prefix, samples_key, scalar_key in (
+            (
+                "simulated_normal_step_time",
+                "simulated_normal_step_time_samples_s",
+                "simulated_normal_step_time_s",
+            ),
+            (
+                "simulated_interference_free_step_time",
+                "simulated_interference_free_step_time_samples_s",
+                "interference_free_step_time_s",
+            ),
+            (
+                "instrumented_normal_profile_step_time",
+                "instrumented_normal_profile_step_time_samples_s",
+                None,
+            ),
+        ):
+            statistic_samples = m.get(samples_key) or []
+            if statistic_samples:
+                stats = summarize_timing_samples(statistic_samples, estimator="median")
+                _add_timing_statistics_columns(row, prefix, stats)
+            elif scalar_key is not None and m.get(scalar_key) is not None:
+                stats = summarize_timing_samples(
+                    [float(m[scalar_key])], estimator="median"
+                )
+                _add_timing_statistics_columns(row, prefix, stats)
+
+        for key in (
+            "simulated_normal_prediction_error_pct",
+            "simulated_normal_absolute_error_pct",
+            "predicted_interference_reduction_pct",
+            "profile_event_overhead_pct",
+        ):
+            if m.get(key) is not None:
+                row[key] = float(m[key])
+        if m.get("interference_free_step_time_s") is not None:
+            row["interference_free_step_time_s"] = m[
+                "interference_free_step_time_s"
+            ]
+            row["interference_free_step_time_us"] = m.get(
+                "interference_free_step_time_us"
+            )
         # peak_memory_by_rank is keyed by global rank; within a DP replica the
         # global ranks ascend with pp stage (both pp-inner and pp-outer layouts),
         # so enumerate them as local stage indices for columns that align across
@@ -562,8 +680,51 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
         peak = m.get("peak_memory_by_rank") or {}
         for stage, rank in enumerate(sorted(peak, key=lambda r: int(r))):
             row[f"peak_memory_pp{stage}_gb"] = float(peak[rank]) / (1024 ** 3)
+            raw_peak_samples = (m.get("peak_memory_samples_by_rank") or {}).get(
+                rank,
+                (m.get("peak_memory_samples_by_rank") or {}).get(str(rank), ()),
+            )
+            if raw_peak_samples:
+                peak_stats = summarize_timing_samples(
+                    (float(sample) / (1024 ** 3) for sample in raw_peak_samples),
+                    estimator="median",
+                )
+                prefix = f"peak_memory_pp{stage}"
+                row[f"{prefix}_samples"] = peak_stats.samples
+                row[f"{prefix}_estimator"] = peak_stats.estimator
+                row[f"{prefix}_estimate_gb"] = peak_stats.estimate
+                row[f"{prefix}_mean_gb"] = peak_stats.mean
+                row[f"{prefix}_median_gb"] = peak_stats.median
+                row[f"{prefix}_std_gb"] = peak_stats.std
+                row[f"{prefix}_ci95_low_gb"] = peak_stats.ci95_low
+                row[f"{prefix}_ci95_high_gb"] = peak_stats.ci95_high
+                row[f"{prefix}_error_pct"] = peak_stats.error_pct
         rows.append(row)
     return rows
+
+
+def _add_scalar_statistics_columns(row: dict, prefix: str, stats) -> None:
+    row[f"{prefix}_samples"] = stats.samples
+    row[f"{prefix}_estimator"] = stats.estimator
+    row[f"{prefix}_estimate"] = stats.estimate
+    row[f"{prefix}_mean"] = stats.mean
+    row[f"{prefix}_median"] = stats.median
+    row[f"{prefix}_std"] = stats.std
+    row[f"{prefix}_ci95_low"] = stats.ci95_low
+    row[f"{prefix}_ci95_high"] = stats.ci95_high
+    row[f"{prefix}_error_pct"] = stats.error_pct
+
+
+def _add_timing_statistics_columns(row: dict, prefix: str, stats) -> None:
+    row[f"{prefix}_samples"] = stats.samples
+    row[f"{prefix}_estimator"] = stats.estimator
+    row[f"{prefix}_estimate_s"] = stats.estimate
+    row[f"{prefix}_mean_s"] = stats.mean
+    row[f"{prefix}_median_s"] = stats.median
+    row[f"{prefix}_std_s"] = stats.std
+    row[f"{prefix}_ci95_low_s"] = stats.ci95_low
+    row[f"{prefix}_ci95_high_s"] = stats.ci95_high
+    row[f"{prefix}_error_pct"] = stats.error_pct
 
 
 def _write_results_csv(csv_path: Path, rows: list[dict]) -> None:

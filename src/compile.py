@@ -38,6 +38,8 @@ class _CompiledDataStore:
     def __init__(self):
         self._training_dag_data = None
         self._training_dag_ready = False
+        self._profile_generation = 0
+        self._profile_shards = {}
 
     def publish_training_dag_data(self, data: dict):
         self._training_dag_data = data
@@ -57,9 +59,34 @@ class _CompiledDataStore:
     def get_training_dag_data(self) -> dict:
         return self._training_dag_data
 
+    def begin_profile_generation(self) -> int:
+        """Start a fresh distributed profile collection and return its id."""
+        self._profile_generation += 1
+        self._profile_shards = {}
+        return self._profile_generation
 
+    def current_profile_generation(self) -> int:
+        return self._profile_generation
 
+    def publish_profile_shard(self, generation: int, dp_rank: int, shard) -> None:
+        if generation != self._profile_generation:
+            raise ValueError(
+                f"stale profile generation {generation}; current={self._profile_generation}"
+            )
+        self._profile_shards[int(dp_rank)] = shard
 
+    def profile_shards_ready(self, generation: int, dp_degree: int) -> bool:
+        return (
+            generation == self._profile_generation
+            and len(self._profile_shards) == int(dp_degree)
+        )
+
+    def get_profile_shards(self, generation: int) -> dict:
+        if generation != self._profile_generation:
+            raise ValueError(
+                f"stale profile generation {generation}; current={self._profile_generation}"
+            )
+        return dict(self._profile_shards)
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -174,6 +201,8 @@ def piper_setup(
     piper_metadata.training_dag = None
     piper_metadata.per_pp_training_dags = None
     piper_metadata.compiled_data_store = None
+    piper_metadata.profile_generation = 0
+    piper_metadata.profiled_training_plan = None
 
     pp_degree = int(schedule_info["pp_degree"])
 
@@ -304,6 +333,7 @@ def piper_setup(
         while training_dag_data is None:
             try:
                 store = ray.get_actor(_COMPILED_DATA_ACTOR)
+                piper_metadata.compiled_data_store = store
                 if ray.get(store.is_training_dag_ready.remote()):
                     training_dag_data = ray.get(store.get_training_dag_data.remote())
             except ValueError:

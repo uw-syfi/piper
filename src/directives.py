@@ -432,6 +432,11 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
         recv_uid = f"recv.{recv_idx}"
         recv_idx += 1
         stream_name = comm_stream if comm_stream is not None else "pp_stream"
+        src_pp_rank = device_to_pp_rank[src_device_key]
+        dst_pp_rank = device_to_pp_rank[dst_device_key]
+        comm_id = f"p2p:{src.uid}->{dst.uid}:{edge.tensor_name or '-'}"
+        comm_group_kind = "pp_lo_hi" if src_pp_rank < dst_pp_rank else "pp_hi_lo"
+        participants = sorted(set(int(rank) for rank in (*src.device, *dst.device)))
         send_node = TrainingDAGNode(
             uid=send_uid,
             node_kind="SEND_COMM",
@@ -442,8 +447,11 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
             node_meta={
                 "from_uid": src.uid,
                 "to_uid": dst.uid,
-                "peer_pp_rank": device_to_pp_rank[dst_device_key],
+                "peer_pp_rank": dst_pp_rank,
                 "bucket_key": src.node_meta.get("bucket_key"),
+                "comm_id": comm_id,
+                "comm_group_kind": comm_group_kind,
+                "participants": participants,
             },
         )
         recv_node = TrainingDAGNode(
@@ -456,8 +464,11 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
             node_meta={
                 "from_uid": src.uid,
                 "to_uid": dst.uid,
-                "peer_pp_rank": device_to_pp_rank[src_device_key],
+                "peer_pp_rank": src_pp_rank,
                 "bucket_key": dst.node_meta.get("bucket_key"),
+                "comm_id": comm_id,
+                "comm_group_kind": comm_group_kind,
+                "participants": participants,
             },
         )
         dag.add_node(send_node)
@@ -498,6 +509,10 @@ def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
                         device=list(dev_key),
                         stream=upd.stream,
                         node_meta=dict(upd.node_meta),
+                        profile_times_by_mode={
+                            mode: dict(profiles)
+                            for mode, profiles in upd.profile_times_by_mode.items()
+                        },
                     )
                 )
             created_uids.append(nu)
@@ -798,6 +813,9 @@ def _insert_reduce_comm_nodes(
             node_meta={
                 "bwd_uid": node.uid,
                 "bucket_key": node.node_meta.get("bucket_key"),
+                "comm_id": f"all_reduce:{node.uid}",
+                "comm_group_kind": "dp",
+                "participants": sorted(int(rank) for rank in node.device),
             },
         )
         dag.add_node(reduce_node)
@@ -872,6 +890,9 @@ def _insert_all_gather_comm_nodes(
             node_meta={
                 "compute_uid": node.uid,
                 "bucket_key": node.node_meta.get("bucket_key"),
+                "comm_id": f"all_gather:{node.uid}",
+                "comm_group_kind": "dp",
+                "participants": sorted(int(rank) for rank in node.device),
             },
         )
         dag.add_node(ag_node)
@@ -937,6 +958,9 @@ def _insert_reduce_scatter_comm_nodes(
             node_meta={
                 "bwd_uid": node.uid,
                 "bucket_key": node.node_meta.get("bucket_key"),
+                "comm_id": f"reduce_scatter:{node.uid}",
+                "comm_group_kind": "dp",
+                "participants": sorted(int(rank) for rank in node.device),
             },
         )
         node.node_meta["zero_alloc_full_grads_before"] = True
@@ -1123,6 +1147,9 @@ def _insert_shard_a2a_comm_nodes(
                     "target_uid": uid,
                     "a2a_tensor_idx": a2a_tensor_idx,
                     "bucket_key": node.node_meta.get("bucket_key", src_node.node_meta.get("bucket_key")),
+                    "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
+                    "comm_group_kind": "ep",
+                    "participants": sorted(int(rank) for rank in node.device),
                 },
             )
             dag.add_node(comm_node)
@@ -1148,6 +1175,9 @@ def _insert_shard_a2a_comm_nodes(
                     "source_uid": uid,
                     "a2a_tensor_idx": a2a_tensor_idx,
                     "bucket_key": node.node_meta.get("bucket_key", dst_node.node_meta.get("bucket_key")),
+                    "comm_id": f"a2a:{uid}->{e.dst_uid}:{a2a_tensor_idx}",
+                    "comm_group_kind": "ep",
+                    "participants": sorted(int(rank) for rank in node.device),
                 },
             )
             dag.add_node(comm_node)
@@ -1260,6 +1290,10 @@ def _apply_split_directive(
                     device=list(n.device) if n.device is not None else None,
                     stream=n.stream,
                     node_meta=copied_meta,
+                    profile_times_by_mode={
+                        mode: dict(profiles)
+                        for mode, profiles in n.profile_times_by_mode.items()
+                    },
                 )
             )
 

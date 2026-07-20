@@ -6,7 +6,13 @@ import time
 import os
 
 from src.compile import piper_setup
-from src.piper import piper_exec_dag
+from src.piper import (
+    piper_exec_dag,
+    piper_measure_dags,
+    piper_profile_dags,
+    simulate_profiled_modes,
+)
+from src.profiling import ProfileConfig
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
 
@@ -90,22 +96,43 @@ def main(args, pg):
         if args.iteration_sleep > 0:
             time.sleep(args.iteration_sleep)
 
-    logger.info(f"Running {args.iters} timed iterations")
-    ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
-    iter_times = []
-    for _ in range(args.iters):
-        start = time.perf_counter()
-        piper_exec_dag(loss_fn, log_stats=True)
-        end = time.perf_counter()
-        iter_times.append(end - start)
-        if args.iteration_sleep > 0:
-            time.sleep(args.iteration_sleep)
-
-    peak_memory_stats = ray.get(
-        [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
+    logger.info("Running %d timed iterations", args.iters)
+    timing = piper_measure_dags(
+        loss_fn,
+        iterations=args.iters,
+        iteration_sleep=args.iteration_sleep,
+        log_stats=True,
+        collect_peak_memory=True,
     )
+    iter_times = list(timing.step_samples_s)
+    peak_memory_samples_by_rank = {
+        rank: list(samples)
+        for rank, samples in timing.peak_memory_samples_by_rank.items()
+    }
+
+    peak_memory_stats = [
+        (rank, max(samples))
+        for rank, samples in sorted(peak_memory_samples_by_rank.items())
+    ]
 
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
+    metrics["peak_memory_samples_by_rank"] = peak_memory_samples_by_rank
+
+    if args.profile_and_simulate:
+        profile_config = ProfileConfig(
+            warmup_iters=args.profile_warmup_iters,
+            repeat_iters=args.profile_iters,
+        )
+        plan = piper_profile_dags(
+            loss_fn,
+            profile_config,
+            profile_modes=("interference_free", "normal"),
+            output_path=args.step_time_profile_output or None,
+        )
+        comparison = simulate_profiled_modes(
+            plan, actual_step_samples_s=iter_times
+        )
+        _add_profile_comparison_metrics(metrics, comparison, plan)
 
     if args.pytorch_profiler:
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
@@ -154,8 +181,8 @@ def parse_args(argv=None):
                         help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, 30-A3B-half, or 72B (default: 9M)')
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--iteration-sleep", type=float, default=0.0)
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--nsight", action="store_true", default=False,
@@ -200,4 +227,51 @@ def parse_args(argv=None):
         default=3,
         help="Number of iterations to run under the PyTorch profiler.",
     )
+    parser.add_argument(
+        "--profile-and-simulate",
+        dest="profile_and_simulate",
+        action="store_true",
+        default=False,
+        help="Profile and simulate both normal and interference-free step times.",
+    )
+    parser.add_argument("--profile-warmup-iters", type=int, default=5)
+    parser.add_argument("--profile-iters", type=int, default=30)
+    parser.add_argument("--step-time-profile-output", default="")
     return parser.parse_args(argv)
+
+
+def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
+    metrics["interference_free_step_time_us"] = (
+        comparison.interference_free_statistics.estimate
+    )
+    metrics["interference_free_step_time_s"] = (
+        comparison.interference_free_statistics.estimate / 1_000_000.0
+    )
+    metrics["simulated_interference_free_step_time_samples_s"] = [
+        sample / 1_000_000.0
+        for sample in comparison.interference_free_samples_us
+    ]
+    metrics["simulated_normal_step_time_us"] = comparison.normal_statistics.estimate
+    metrics["simulated_normal_step_time_s"] = (
+        comparison.normal_statistics.estimate / 1_000_000.0
+    )
+    metrics["simulated_normal_step_time_samples_s"] = [
+        sample / 1_000_000.0 for sample in comparison.normal_samples_us
+    ]
+    if comparison.normal_prediction_error is not None:
+        metrics["simulated_normal_prediction_error_pct"] = (
+            comparison.normal_prediction_error.signed_pct
+        )
+        metrics["simulated_normal_absolute_error_pct"] = (
+            comparison.normal_prediction_error.absolute_pct
+        )
+    metrics["predicted_interference_reduction_pct"] = (
+        comparison.predicted_interference_reduction_pct
+    )
+    metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
+    instrumented = plan.profile_metadata.get(
+        "instrumented_global_step_samples_us_by_mode", {}
+    ).get("normal", ())
+    metrics["instrumented_normal_profile_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0 for sample in instrumented
+    ]

@@ -5,4 +5,5 @@ piper.egg-info/
 out/
 .vscode/
 .codex
+.gb200_tmux_state/
 ec2-trust-policy.json

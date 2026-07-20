@@ -48,5 +48,7 @@ class PiperMetadata:
     schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
     schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
     schedule_info: dict = {}  # Derived schedule facts such as pp/dp/mbs
+    profile_generation: int = 0  # Last distributed profile generation consumed locally
+    profiled_training_plan = None  # Latest merged interference-free profile artifact
 
 piper_metadata = PiperMetadata()

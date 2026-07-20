@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Protocol
 
 import torch
 import torch.distributed as dist
@@ -10,8 +10,34 @@ from torch.autograd.graph import GradientEdge, Node
 from torch.nn import Parameter
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
+from .execution_plan import (
+    build_execution_plan,
+    is_relaxable_p2p_ordering_dependency,
+)
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
+
+
+class TimingRecorder(Protocol):
+    """Callbacks used to measure payloads without duplicating dispatch logic.
+
+    Node dependency waits happen before ``before_node``.  A recorder can
+    synthesize zero duration for ``ORDER_DUMMY`` by making its node callbacks
+    no-ops and emitting an explicit zero-valued profile in ``finish``.
+    """
+
+    def before_prologue(self, stream: torch.cuda.Stream) -> None: ...
+
+    def after_prologue(self, stream: torch.cuda.Stream) -> None: ...
+
+    def before_node(self, node: Any, stream: torch.cuda.Stream) -> None: ...
+
+    def after_node(self, node: Any, stream: torch.cuda.Stream) -> None: ...
+
+    def finish(self) -> None: ...
+
+
+StreamOverride = Callable[[Any, torch.cuda.Stream], torch.cuda.Stream]
 
 
 @dataclass
@@ -503,13 +529,52 @@ class DagExecutor:
         items = sorted(tag.items(), key=lambda kv: kv[0])
         return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
 
-    def _wait_for_all_gather(self, compute_node: Any) -> None:
-        compute_stream = self.runtime.stream_for_task(compute_node)
+    def _wait_for_all_gather(
+        self,
+        compute_node: Any,
+        compute_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        if compute_stream is None:
+            compute_stream = self.runtime.stream_for_task(compute_node)
         for pred in compute_node.data_preds:
             if pred.task_type == TaskType.ALL_GATHER:
                 ag_evt = self.events.all_gather.get(pred.uid)
                 if ag_evt is not None:
                     compute_stream.wait_event(ag_evt)
+
+    def _wait_for_backward_input_events(
+        self,
+        node: Any,
+        compute_stream: torch.cuda.Stream,
+        *,
+        wait: bool = True,
+    ) -> tuple[Any | None, Any | None]:
+        """Consume communication inputs shared by BWD and BWD_I.
+
+        ``run`` passes ``wait=False`` because the shared execution plan has
+        already enqueued these waits before profiling starts.  The default is
+        retained for direct callers and older execution paths.
+        """
+        recv_pred = next(
+            (p for p in node.data_preds if p.task_type == TaskType.RECV), None
+        )
+        if recv_pred is not None and recv_pred.uid in self.events.recv:
+            recv_event = self.events.recv.pop(recv_pred.uid)
+            if wait:
+                compute_stream.wait_event(recv_event)
+
+        if wait:
+            self._wait_for_all_gather(node, compute_stream)
+
+        a2a_pred = next(
+            (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
+        )
+        if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
+            a2a_event = self.events.a2a.pop(a2a_pred.uid)
+            if wait:
+                compute_stream.wait_event(a2a_event)
+
+        return recv_pred, a2a_pred
 
     def _all_to_all_ep_boundary(
         self,
@@ -517,19 +582,23 @@ class DagExecutor:
         tensor: torch.Tensor,
         stream: torch.cuda.Stream,
     ) -> torch.Tensor:
-        direction = self._node_meta(node).get("direction")
-        if direction == "outgoing":
-            tensor = tensor.contiguous()
-        elif direction != "incoming":
-            raise ValueError(
-                f"A2A node uid={getattr(node, 'uid', '<unknown>')} has invalid "
-                f"direction={direction!r}; expected 'incoming' or 'outgoing'"
-            )
+        # Keep boundary layout kernels on the same stream as the collective.
+        # This is especially important in profiling mode, where the timing
+        # events delimit this physical stream rather than CUDA's ambient one.
+        with torch.cuda.stream(stream):
+            direction = self._node_meta(node).get("direction")
+            if direction == "outgoing":
+                tensor = tensor.contiguous()
+            elif direction != "incoming":
+                raise ValueError(
+                    f"A2A node uid={getattr(node, 'uid', '<unknown>')} has invalid "
+                    f"direction={direction!r}; expected 'incoming' or 'outgoing'"
+                )
 
-        tensor = self.communication.all_to_all(tensor, stream=stream)
-        if direction == "incoming":
-            tensor = tensor.contiguous()
-        return tensor
+            tensor = self.communication.all_to_all(tensor, stream=stream)
+            if direction == "incoming":
+                tensor = tensor.contiguous()
+            return tensor
 
     def run(
         self,
@@ -539,10 +608,35 @@ class DagExecutor:
         labels: Any,
         loss_buffer: list,
         loss_fn=None,
+        *,
+        stream_override: StreamOverride | None = None,
+        timing_recorder: TimingRecorder | None = None,
     ) -> None:
-        """Run one iteration of the loaded TrainingDAG."""
+        """Run one iteration of the loaded TrainingDAG.
+
+        ``stream_override`` receives ``(node, logical_cuda_stream)`` and must
+        return the physical CUDA stream on which that node should execute.  It
+        is called for every node so profiling policies can preserve or replace
+        P2P streams independently from their non-P2P policy.  SEND/RECV still
+        select their existing lo-to-hi or hi-to-lo NCCL process group inside
+        :class:`CommunicationExecutor`.
+        """
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
+
+        execution_plan = build_execution_plan(
+            dag,
+            [node.uid for node in sorted_dag_nodes],
+        )
+        planned_by_uid = {operation.uid: operation for operation in execution_plan}
+        physical_stream_by_uid: dict[str, torch.cuda.Stream] = {}
+        for node in sorted_dag_nodes:
+            logical_stream = self.runtime.stream_for_task(node)
+            physical_stream_by_uid[node.uid] = (
+                logical_stream
+                if stream_override is None
+                else stream_override(node, logical_stream)
+            )
 
         self.params.drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
@@ -551,25 +645,61 @@ class DagExecutor:
         self.events.reset()
         self.params.clear_param_grads()
         default_stream = self.runtime.default_stream()
+        if timing_recorder is not None:
+            timing_recorder.before_prologue(default_stream)
         self.params.zero_grad_buffers(default_stream)
+        if timing_recorder is not None:
+            timing_recorder.after_prologue(default_stream)
         zero_evt = torch.cuda.Event()
         zero_evt.record(default_stream)
-        for stream in self.runtime.streams.values():
+
+        # An override may return streams not registered in RuntimeState (for
+        # example dedicated directional P2P streams in profiling mode).  Gate
+        # each distinct physical stream on the prologue too.
+        initial_streams = [
+            *self.runtime.streams.values(),
+            *physical_stream_by_uid.values(),
+        ]
+        seen_streams: list[torch.cuda.Stream] = []
+        for stream in initial_streams:
+            if stream is default_stream:
+                continue
+            if any(stream is seen for seen in seen_streams):
+                continue
+            seen_streams.append(stream)
             if stream is not default_stream:
                 stream.wait_event(zero_evt)
-        comp_events: dict[Any, torch.cuda.Event] = {}
+        completion_events: dict[str, torch.cuda.Event] = {}
+        completion_streams: dict[str, torch.cuda.Stream] = {}
 
         self.buffers.init_refcounts(dag)
-        last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
 
         for node in sorted_dag_nodes:
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
             ubid = self._node_bucket_key(node)
-            node_stream = self.runtime.stream_for_task(node)
-            node_stream_id = self.runtime.stream_id(node)
+            node_stream = physical_stream_by_uid[node.uid]
             node_tag = self._node_tag_str(node)
+
+            operation = planned_by_uid[node.uid]
+            for predecessor_uid in operation.completion_predecessors:
+                predecessor_event = completion_events.get(predecessor_uid)
+                if predecessor_event is None:
+                    raise RuntimeError(
+                        f"planned predecessor {predecessor_uid!r} for node "
+                        f"{node.uid!r} has no completion event"
+                    )
+                predecessor_stream = completion_streams[predecessor_uid]
+                if predecessor_stream is not node_stream:
+                    dependency_reason = operation.reason_for(predecessor_uid)
+                    if is_relaxable_p2p_ordering_dependency(
+                        dag.nodes[predecessor_uid],
+                        node,
+                        dependency_reason,
+                    ):
+                        continue
+                    node_stream.wait_event(predecessor_event)
 
             if debug_enabled:
                 self.logger.debug(
@@ -580,11 +710,12 @@ class DagExecutor:
             task_label = f"{task_type.value}:{node_tag}:uid{node.uid}"
             self.runtime.nvtx_push(task_label)
             rf = self._rf_enter(task_label)
+            if timing_recorder is not None:
+                timing_recorder.before_node(node, node_stream)
 
             match task_type:
                 case TaskType.SEND:
                     compute_node = node.data_preds[0]
-                    node_stream.wait_event(comp_events[compute_node.uid])
                     send_data = self.buffers.task[compute_node.uid]["send_output"]
                     self.communication.send(send_data, node.peer_pp_rank, stream=node_stream)
                     send_buf = self.buffers.task.get(compute_node.uid)
@@ -594,9 +725,6 @@ class DagExecutor:
 
                 case TaskType.RECV:
                     compute_node = node.data_succs[0]
-                    comp_evt = last_comp_event_by_stream.get(self.runtime.stream_id(compute_node))
-                    if comp_evt is not None:
-                        node_stream.wait_event(comp_evt)
                     if compute_node.task_type == TaskType.FWD:
                         recv_ubid = self._node_bucket_key(compute_node)
                         recv_tensors = self.communication.recv_fwd(
@@ -616,7 +744,6 @@ class DagExecutor:
 
                 case TaskType.FWD_A2A:
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
-                    node_stream.wait_event(comp_events[fwd_pred.uid])
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
@@ -635,7 +762,6 @@ class DagExecutor:
                         p for p in node.data_preds
                         if p.task_type in (TaskType.BWD, TaskType.BWD_I)
                     )
-                    node_stream.wait_event(comp_events[bwd_pred.uid])
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     bwd_buf = dict(self.buffers.task[bwd_pred.uid])
                     self.buffers.release(bwd_pred.uid)
@@ -659,7 +785,6 @@ class DagExecutor:
                     assert ar_ubids, (
                         f"ALL_REDUCE node uid={node.uid} has no sync_payload_ubids"
                     )
-                    node_stream.wait_event(comp_events[bwd_node.uid])
                     for ar_ubid in ar_ubids:
                         self.communication.all_reduce_grads(ar_ubid, stream=node_stream)
                     ar_evt = torch.cuda.Event()
@@ -673,7 +798,6 @@ class DagExecutor:
                     assert rs_ubid is not None, (
                         f"REDUCE_SCATTER node uid={node.uid} has no bucket_key"
                     )
-                    node_stream.wait_event(comp_events[bwd_node.uid])
                     rs_bytes = self.communication.reduce_scatter(rs_ubid, stream=node_stream)
                     rs_evt = torch.cuda.Event()
                     rs_evt.record(node_stream)
@@ -699,13 +823,13 @@ class DagExecutor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
+                        self.events.recv.pop(recv_pred.uid)
 
                     a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
+                        self.events.a2a.pop(a2a_pred.uid)
 
                     fwd_data_pred = next(
                         (p for p in node.data_preds
@@ -720,8 +844,6 @@ class DagExecutor:
                     else:
                         input_tensors = inputs
 
-                    self._wait_for_all_gather(node)
-
                     fwd_out = self.compute.forward(ubid, input_tensors, node_stream)
                     self.buffers.task[node.uid] = fwd_out
                     fwd_key = (node.node_meta.get("bucket_key"), node.uid)
@@ -731,24 +853,13 @@ class DagExecutor:
                     self.buffers.task[fwd_key] = fwd_out
                     evt = torch.cuda.Event()
                     evt.record(node_stream)
-                    comp_events[node.uid] = evt
-                    last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD:
-                    recv_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.RECV), None
+                    recv_pred, a2a_pred = self._wait_for_backward_input_events(
+                        node, node_stream, wait=False
                     )
-                    if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
-                    self._wait_for_all_gather(node)
-
-                    a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
-                    )
-                    if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_uid = node.node_meta.get("fwd_uid")
                     fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
@@ -831,19 +942,14 @@ class DagExecutor:
                     del self.buffers.task[fwd_key]
                     evt = torch.cuda.Event()
                     evt.record(node_stream)
-                    comp_events[node.uid] = evt
                     self.events.backward[ubid] = evt
-                    last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD_I:
-                    recv_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.RECV), None
+                    recv_pred, bwd_a2a_pred = self._wait_for_backward_input_events(
+                        node, node_stream, wait=False
                     )
-                    if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
-                    self._wait_for_all_gather(node)
 
                     fwd_uid = node.node_meta.get("fwd_uid")
                     fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
@@ -867,9 +973,6 @@ class DagExecutor:
                         stage_outputs_or_loss = fwd_out["out_with_grad"]
                         output_grads = None
 
-                    bwd_a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
-                    )
                     if (
                         bwd_a2a_pred is not None
                         and not self._node_meta(node).get("compute_loss", False)
@@ -918,14 +1021,11 @@ class DagExecutor:
                     del self.buffers.task[fwd_key]
                     evt = torch.cuda.Event()
                     evt.record(node_stream)
-                    comp_events[node.uid] = evt
                     self.events.backward[ubid] = evt
-                    last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD_W:
-                    self._wait_for_all_gather(node)
                     if self._node_meta(node).get("zero_alloc_full_grads_before"):
                         self.params.alloc_full_grads(ubid, node_stream)
                     bwdi_node = next(p for p in node.data_preds if p.task_type == TaskType.BWD_I)
@@ -949,38 +1049,63 @@ class DagExecutor:
                     self.buffers.release(bwdi_node.uid)
                     evt = torch.cuda.Event()
                     evt.record(node_stream)
-                    comp_events[node.uid] = evt
                     self.events.backward[ubid] = evt
-                    last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(node_stream, loss_buffer)
+                    self._update(
+                        node_stream,
+                        loss_buffer,
+                        wait_for_dependencies=False,
+                        synchronize=timing_recorder is None,
+                    )
 
                 case TaskType.ORDER_DUMMY:
                     pass
 
+            if timing_recorder is not None:
+                timing_recorder.after_node(node, node_stream)
+            completion_event = torch.cuda.Event()
+            completion_event.record(node_stream)
+            completion_events[node.uid] = completion_event
+            completion_streams[node.uid] = node_stream
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
 
-    def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
-        self.params.drain_pending_frees()
-        if self.params.has_zero_shard_optimizers():
-            self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
-            losses = loss_buffer
-            loss_buffer.clear()
+        if timing_recorder is not None:
+            # CUDA event elapsed times are valid only after their work has
+            # completed.  Synchronize once per iteration, never per node: a
+            # per-node sync can deadlock rendezvous communication.
             torch.cuda.synchronize()
-            return losses
+            timing_recorder.finish()
 
-        for ar_evt in self.events.all_reduce.values():
-            stream.wait_event(ar_evt)
+    def _update(
+        self,
+        stream: torch.cuda.Stream,
+        loss_buffer: list,
+        *,
+        wait_for_dependencies: bool = True,
+        synchronize: bool = True,
+    ):
+        self.params.drain_pending_frees()
+        has_zero_shard_optimizers = self.params.has_zero_shard_optimizers()
+
+        if wait_for_dependencies:
+            for ar_evt in self.events.all_reduce.values():
+                stream.wait_event(ar_evt)
+
+        if has_zero_shard_optimizers:
+            self.params.step_zero_shard_optimizers(
+                stream,
+                self.events.reduce_scatter if wait_for_dependencies else {},
+            )
 
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
             bwd_evt = self.events.backward.get(ubid)
-            if bwd_evt is not None:
+            if wait_for_dependencies and bwd_evt is not None:
                 stream.wait_event(bwd_evt)
 
             with torch.cuda.stream(stream):
@@ -989,7 +1114,11 @@ class DagExecutor:
         losses = loss_buffer
         loss_buffer.clear()
 
-        torch.cuda.synchronize()
+        if synchronize:
+            torch.cuda.synchronize()
+
+        if has_zero_shard_optimizers:
+            return losses
 
         return {
             "losses": losses,
