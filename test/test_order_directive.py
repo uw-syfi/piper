@@ -279,7 +279,7 @@ def test_sharded_gradient_lifetime_pruning_still_coalesces_within_microbatch() -
     assert "zero_alloc_full_grads_before" not in second.node_meta
 
 
-def test_expert_shard_clears_accumulated_grad_markers_for_all_microbatches() -> None:
+def test_expert_shard_retains_accumulated_grad_sync_for_replicated_weights() -> None:
     dag = TrainingDAG()
     backwards = []
     for mb in range(3):
@@ -310,12 +310,12 @@ def test_expert_shard_clears_accumulated_grad_markers_for_all_microbatches() -> 
         [0, 2],
     )
 
-    assert not any(
+    assert any(
         node.node_kind == "REDUCE_SCATTER_COMM"
         for node in dag.nodes.values()
     )
     assert all(
-        "zero_alloc_full_grads_before" not in node.node_meta
+        node.node_meta.get("zero_alloc_full_grads_before") is True
         for node in backwards
     )
 
@@ -580,7 +580,7 @@ def test_apply_order_directive_rejects_cross_device_order_edge() -> None:
         )
 
 
-def test_shard_removes_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
+def test_shard_retains_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
     dag = TrainingDAG()
     node = TrainingDAGNode(
         uid="expert.bwd",
@@ -600,8 +600,8 @@ def test_shard_removes_zero_grad_lifetime_metadata_with_reduce_scatter() -> None
 
     directives._insert_shard_a2a_comm_nodes(dag, [{"PP": 0, "EP": 0}], [0, 2])
 
-    assert "zero_alloc_full_grads_before" not in node.node_meta
-    assert not any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
+    assert node.node_meta["zero_alloc_full_grads_before"] is True
+    assert any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
 
 
 def test_validate_schedule_tags_exist_rejects_tags_missing_from_model() -> None:

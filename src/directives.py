@@ -1136,67 +1136,6 @@ def _insert_shard_a2a_comm_nodes(
                 f"shard requires matched node {uid} to have devices={devices}, got node_devices={node.device}"
             )
 
-        if node.compute_subkind == "FWD":
-            node.node_meta["apply_zero"] = False
-        elif _is_backward_compute_subkind(node.compute_subkind):
-            fwd_uid = node.node_meta.get("fwd_uid")
-            if isinstance(fwd_uid, str) and fwd_uid in dag.nodes:
-                dag.nodes[fwd_uid].node_meta["apply_zero"] = False
-
-        # Shard replaces replicate-style grad/param sync comms around matched
-        # compute nodes; remove existing gather/reduce comm nodes attached to
-        # this compute node before inserting A2A edges.
-        removable_sync_kinds = {"ALL_GATHER_COMM", "REDUCE_COMM", "REDUCE_SCATTER_COMM"}
-        removable_comm_uids: set[str] = set()
-        for e in list(dag.edges):
-            if e.dep_kind != "data":
-                continue
-            if e.src_uid == uid and e.dst_uid in dag.nodes:
-                other = dag.nodes[e.dst_uid]
-                if other.node_kind in removable_sync_kinds:
-                    removable_comm_uids.add(other.uid)
-            elif e.dst_uid == uid and e.src_uid in dag.nodes:
-                other = dag.nodes[e.src_uid]
-                if other.node_kind in removable_sync_kinds:
-                    removable_comm_uids.add(other.uid)
-        for comm_uid in sorted(removable_comm_uids):
-            if comm_uid not in dag.nodes:
-                continue
-            comm_node = dag.nodes[comm_uid]
-            if comm_node.node_kind == "REDUCE_SCATTER_COMM":
-                # A reduce-scatter can represent every microbatch contributing
-                # to one accumulated gradient bucket while only its final
-                # contributor carries the data edge.  Removing that collective
-                # for expert sharding must clear the ZeRO grad-allocation
-                # marker from every contributor, including temporal-only ones.
-                contributor_uids = comm_node.node_meta.get(
-                    "bwd_uids",
-                    [comm_node.node_meta.get("bwd_uid")],
-                )
-                for contributor_uid in contributor_uids:
-                    if contributor_uid in dag.nodes:
-                        dag.nodes[contributor_uid].node_meta.pop(
-                            "zero_alloc_full_grads_before",
-                            None,
-                        )
-            # Bypass removed sync-comm nodes so dataflow remains connected:
-            # pred -> COMM -> succ  ==>  pred -> succ
-            in_comm = [e for e in list(dag.edges) if e.dep_kind == "data" and e.dst_uid == comm_uid]
-            out_comm = [e for e in list(dag.edges) if e.dep_kind == "data" and e.src_uid == comm_uid]
-            for ie in in_comm:
-                for oe in out_comm:
-                    dag.add_edge(
-                        TrainingDAGEdge(
-                            src_uid=ie.src_uid,
-                            dst_uid=oe.dst_uid,
-                            dep_kind="data",
-                            tensor_name=(oe.tensor_name if oe.tensor_name is not None else ie.tensor_name),
-                        )
-                    )
-            _remove_node_and_incident_edges(dag, comm_uid)
-        if removable_comm_uids:
-            node.node_meta.pop("zero_alloc_full_grads_before", None)
-            node.node_meta.pop("zero_free_full_params_after", None)
         if node.compute_subkind == "BWD_W":
             continue
 
