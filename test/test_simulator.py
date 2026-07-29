@@ -319,7 +319,7 @@ def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
     assert result.step_time_us == pytest.approx(6.0)
 
 
-def test_p2p_transactions_do_not_gain_synthetic_directional_fifo() -> None:
+def test_same_direction_p2p_transactions_preserve_directional_fifo() -> None:
     send1 = _node(
         "send.1",
         {0: 5.0},
@@ -364,8 +364,8 @@ def test_p2p_transactions_do_not_gain_synthetic_directional_fifo() -> None:
     result = simulate_training_step([_dag(send1, send2), _dag(recv1, recv2)])
 
     assert result.event(0, "send.1").start_us == pytest.approx(0.0)
-    assert result.event(0, "send.2").start_us == pytest.approx(0.0)
-    assert result.step_time_us == pytest.approx(6.0)
+    assert result.event(0, "send.2").start_us == pytest.approx(4.0)
+    assert result.step_time_us == pytest.approx(10.0)
 
 
 def test_p2p_group_participants_are_validated_across_dp_lanes() -> None:

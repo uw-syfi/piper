@@ -83,6 +83,31 @@ def test_actor_only_retains_start_offsets_for_normal_profiles(monkeypatch) -> No
     }
 
 
+def test_actor_normal_run_uses_directional_execution_stream_policy() -> None:
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    directional_stream = object()
+    actor.runtime = SimpleNamespace(
+        execution_stream_for_task=lambda _node, _logical: directional_stream
+    )
+    captured = {}
+    expected_result = object()
+
+    def execute_dag(**kwargs):
+        captured.update(kwargs)
+        return expected_result
+
+    actor._execute_dag = execute_dag
+    loss_fn = object()
+
+    assert actor.run_dag(loss_fn=loss_fn) is expected_result
+    assert captured["loss_fn"] is loss_fn
+    assert (
+        captured["stream_override"](object(), object())
+        is directional_stream
+    )
+
+
 def test_actor_result_keeps_normal_duration_and_offset_samples_paired(
     monkeypatch,
 ) -> None:

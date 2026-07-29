@@ -4,7 +4,10 @@ import pytest
 
 from scripts.export_node_profile_ratios import (
     build_node_profile_ratios,
+    export_node_profile_ratio_csvs,
+    summarize_node_types,
     write_node_profile_ratios,
+    write_node_type_summaries,
 )
 from src.dag import TrainingDAG, TrainingDAGNode
 from src.profiling import NodeProfile, ProfileConfig, ProfiledTrainingPlan
@@ -82,8 +85,47 @@ def test_build_node_profile_ratios_pools_ranks_and_sorts_descending(tmp_path) ->
     assert rows[0].normal_to_interference_free_ratio == pytest.approx(3.2)
     assert skipped_count == 1
 
+    summaries = summarize_node_types(rows)
+    assert len(summaries) == 1
+    assert summaries[0].node_type == "forward"
+    assert summaries[0].node_count == 2
+    assert summaries[0].average_normal_to_interference_free_ratio == pytest.approx(
+        2.1
+    )
+
     output_path = tmp_path / "ratios.csv"
     write_node_profile_ratios(output_path, rows)
     with output_path.open(newline="") as output_file:
         csv_rows = list(csv.DictReader(output_file))
     assert [row["node_uid"] for row in csv_rows] == ["high_ratio", "unit_ratio"]
+
+    summary_path = tmp_path / "summary.csv"
+    write_node_type_summaries(summary_path, summaries)
+    with summary_path.open(newline="") as summary_file:
+        summary_rows = list(csv.DictReader(summary_file))
+    assert summary_rows == [
+        {
+            "node_type": "forward",
+            "node_count": "2",
+            "average_normal_to_interference_free_ratio": "2.1",
+        }
+    ]
+
+    profile_path = tmp_path / "step_time_profiles.json"
+    plan.save_json(profile_path)
+    export_result = export_node_profile_ratio_csvs(profile_path)
+    assert export_result.ratio_csv_path == (
+        tmp_path / "node_profile_time_ratios.csv"
+    )
+    assert export_result.summary_csv_path == (
+        tmp_path / "node_profile_time_ratios_summary.csv"
+    )
+    assert export_result.measured_node_count == 2
+    assert export_result.skipped_node_count == 1
+    assert [summary.node_type for summary in export_result.summaries] == ["forward"]
+    with export_result.ratio_csv_path.open(newline="") as automatic_output:
+        automatic_rows = list(csv.DictReader(automatic_output))
+    assert [row["node_uid"] for row in automatic_rows] == [
+        "high_ratio",
+        "unit_ratio",
+    ]

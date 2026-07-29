@@ -4,6 +4,7 @@ import os
 import re
 from typing import Any
 import gc
+from datetime import timedelta
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
 import torch.distributed as dist
 from collections import defaultdict
@@ -155,8 +156,10 @@ def _create_actors(
                 "NCCL_DEBUG",
                 "NCCL_DEBUG_FILE",
                 "NCCL_DEBUG_SUBSYS",
+                "NCCL_NET",
                 "NCCL_SOCKET_IFNAME",
                 "GLOO_SOCKET_IFNAME",
+                "PIPER_PROCESS_GROUP_TIMEOUT_MINUTES",
             )
             if os.environ.get(name)
         }
@@ -170,16 +173,21 @@ def _create_actors(
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
         }
-        # When pp_outer=True, one bundle corresponds to one pipeline stage and
-        # holds all DP replicas for that stage (placement group shape is
-        # [{"GPU": dp}] * pp). Otherwise one bundle is one DP replica holding
-        # all PP ranks (shape is [{"GPU": pp}] * dp).
-        bundle_index = pp_rank if pp_outer else dp_rank
+        # The shared placement plan is authoritative when an innermost group
+        # spans multiple node-sized bundles. Keep accepting raw placement groups
+        # for callers that rely on Piper's original one-bundle-per-group layout.
+        ray_pg = getattr(pg, "placement_group", pg)
+        placement_plan = getattr(pg, "plan", None)
+        bundle_index = (
+            placement_plan.actor_bundle_index(pp_rank, dp_rank)
+            if placement_plan is not None
+            else (pp_rank if pp_outer else dp_rank)
+        )
         actor = PiperActor.options(
             num_gpus=0.6,
             runtime_env={**nsight_env, **nccl_env},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg,
+                placement_group=ray_pg,
                 placement_group_bundle_index=bundle_index,
             ),
         ).remote(
@@ -358,11 +366,21 @@ class PiperActor:
         torch.cuda.set_device(self.runtime.device)
 
         if self.runtime.pp_degree > 1 or self.runtime.dp_degree > 1:
+            timeout_minutes = float(
+                os.environ.get("PIPER_PROCESS_GROUP_TIMEOUT_MINUTES", "10")
+            )
+            if timeout_minutes <= 0:
+                raise ValueError(
+                    "PIPER_PROCESS_GROUP_TIMEOUT_MINUTES must be positive, "
+                    f"got {timeout_minutes}"
+                )
+            self._process_group_timeout = timedelta(minutes=timeout_minutes)
             dist.init_process_group(
                 "nccl",
                 init_method=init_method,
                 rank=self.runtime.global_rank,
                 world_size=self.runtime.world_size,
+                timeout=self._process_group_timeout,
             )
 
             if self.runtime.dp_degree > 1:
@@ -381,8 +399,16 @@ class PiperActor:
             # Two separate NCCL communicators over the same ranks: one for allreduce,
             # one for all2all.  Sharing a communicator causes both op types to run on
             # the same internal NCCL proxy stream, which prevents true overlap.
-            process_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            ep_process_group = dist.new_group(ranks=group_ranks, backend="nccl")
+            process_group = dist.new_group(
+                ranks=group_ranks,
+                backend="nccl",
+                timeout=self._process_group_timeout,
+            )
+            ep_process_group = dist.new_group(
+                ranks=group_ranks,
+                backend="nccl",
+                timeout=self._process_group_timeout,
+            )
             if self.runtime.global_rank % num_dp_groups == dp_group_id:
                 self.runtime.dp_group = process_group
                 self.runtime.ep_group = ep_process_group
@@ -394,8 +420,16 @@ class PiperActor:
             group_ranks = [
                 (pp_group_id * self.runtime.pp_degree + i) for i in range(self.runtime.pp_degree)
             ]
-            lo_hi_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            hi_lo_group = dist.new_group(ranks=group_ranks, backend="nccl")
+            lo_hi_group = dist.new_group(
+                ranks=group_ranks,
+                backend="nccl",
+                timeout=self._process_group_timeout,
+            )
+            hi_lo_group = dist.new_group(
+                ranks=group_ranks,
+                backend="nccl",
+                timeout=self._process_group_timeout,
+            )
 
             if self.runtime.global_rank in group_ranks:
                 self.runtime.pp_lo_hi = lo_hi_group
@@ -868,7 +902,10 @@ class PiperActor:
             self._nvtx_pop()
 
     def run_dag(self, loss_fn=None):
-        return self._execute_dag(loss_fn=loss_fn)
+        return self._execute_dag(
+            loss_fn=loss_fn,
+            stream_override=self.runtime.execution_stream_for_task,
+        )
 
     def reset_profile_samples(
         self, *, profile_mode: str = "interference_free"

@@ -2,8 +2,10 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import Mock, call
 
+import torch
+
 import src.executors as executors
-from src.executors import DagExecutor
+from src.executors import ComputeExecutor, DagExecutor
 from src.tasks import TaskType
 
 
@@ -94,3 +96,16 @@ def test_update_steps_sharded_and_regular_optimizers(monkeypatch) -> None:
     )
     regular_optimizer.step.assert_called_once_with()
     synchronize.assert_called_once_with()
+
+
+def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
+    weight = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    weight.grad_dtype = torch.float32
+
+    grad = ComputeExecutor.grad_with_param_layout(
+        weight,
+        torch.ones_like(weight),
+    )
+
+    assert grad.dtype == torch.float32
+    weight.grad = grad

@@ -243,7 +243,7 @@ def piper(gm, example_inputs, **kwargs):
     )
 
     def callback(*args, _gm=gm):
-        logger.warning(
+        logger.debug(
             "piper compiled callback invoked directly; running local graph execution"
         )
         return _gm(*args)

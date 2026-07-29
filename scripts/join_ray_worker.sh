@@ -5,9 +5,11 @@ RAY_BIN="${RAY_BIN:-/opt/piper-venv/bin/ray}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/piper-venv/bin/python}"
 HEAD_ADDRESS="${RAY_HEAD_ADDRESS:-}"
 PORT="${RAY_PORT:-6379}"
+NODE_IP="${RAY_NODE_IP:-}"
 NUM_GPUS="${RAY_NUM_GPUS:-}"
-TEMP_DIR="${RAY_TEMP_DIR:-/tmp/piper/ray_tmp}"
 NETWORK_INTERFACE="${RAY_NETWORK_INTERFACE:-}"
+MIN_WORKER_PORT="${RAY_MIN_WORKER_PORT:-0}"
+MAX_WORKER_PORT="${RAY_MAX_WORKER_PORT:-0}"
 STOP_EXISTING=true
 DRY_RUN=false
 
@@ -20,15 +22,18 @@ Join the current host/container to an existing Ray head.
 Options:
   --head-address ADDRESS    Required Ray head hostname/IP, optionally with port.
   --port PORT               Port appended when ADDRESS omits it (default: 6379).
+  --node-ip ADDRESS         IP advertised by this worker (default: auto-detect).
   --num-gpus COUNT          GPUs advertised by this node (default: auto-detect).
-  --temp-dir PATH           Ray temporary directory (default: /tmp/piper/ray_tmp).
   --network-interface NAME  Export NAME for NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME.
+  --min-worker-port PORT    Lowest worker port, or 0 for random (default: 0).
+  --max-worker-port PORT    Highest worker port, or 0 for random (default: 0).
   --no-stop                 Do not stop an existing local Ray daemon first.
   --dry-run                 Print the resolved command without changing Ray state.
   -h, --help                Show this help.
 
-Environment equivalents: RAY_HEAD_ADDRESS, RAY_PORT,
-RAY_NUM_GPUS, RAY_TEMP_DIR, RAY_NETWORK_INTERFACE, RAY_BIN, and PYTHON_BIN.
+Environment equivalents: RAY_HEAD_ADDRESS, RAY_PORT, RAY_NODE_IP,
+RAY_NUM_GPUS, RAY_NETWORK_INTERFACE, RAY_MIN_WORKER_PORT,
+RAY_MAX_WORKER_PORT, RAY_BIN, and PYTHON_BIN.
 EOF
 }
 
@@ -84,9 +89,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --head-address) HEAD_ADDRESS="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
+        --node-ip) NODE_IP="$2"; shift 2 ;;
         --num-gpus) NUM_GPUS="$2"; shift 2 ;;
-        --temp-dir) TEMP_DIR="$2"; shift 2 ;;
         --network-interface) NETWORK_INTERFACE="$2"; shift 2 ;;
+        --min-worker-port) MIN_WORKER_PORT="$2"; shift 2 ;;
+        --max-worker-port) MAX_WORKER_PORT="$2"; shift 2 ;;
         --no-stop) STOP_EXISTING=false; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -106,6 +113,17 @@ done
 [[ -n "$HEAD_ADDRESS" ]] || die "--head-address is required"
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) \
     || die "invalid port: $PORT"
+[[ "$MIN_WORKER_PORT" =~ ^[0-9]+$ ]] && (( MIN_WORKER_PORT <= 65535 )) \
+    || die "invalid minimum worker port: $MIN_WORKER_PORT"
+[[ "$MAX_WORKER_PORT" =~ ^[0-9]+$ ]] && (( MAX_WORKER_PORT <= 65535 )) \
+    || die "invalid maximum worker port: $MAX_WORKER_PORT"
+if (( MIN_WORKER_PORT == 0 || MAX_WORKER_PORT == 0 )); then
+    (( MIN_WORKER_PORT == 0 && MAX_WORKER_PORT == 0 )) \
+        || die "minimum and maximum worker ports must both be 0 for random ports"
+else
+    (( MIN_WORKER_PORT >= 1024 && MAX_WORKER_PORT > MIN_WORKER_PORT )) \
+        || die "worker port range must be within 1024-65535 and maximum must exceed minimum"
+fi
 
 if [[ "$HEAD_ADDRESS" != *:* ]]; then
     HEAD_ADDRESS="$HEAD_ADDRESS:$PORT"
@@ -115,8 +133,10 @@ if [[ -n "$NETWORK_INTERFACE" && ! -d "/sys/class/net/$NETWORK_INTERFACE" ]]; th
     die "network interface does not exist: $NETWORK_INTERFACE"
 fi
 
-if ! NODE_IP="$(detect_node_ip)"; then
-    die "could not detect a cluster-reachable node IP"
+if [[ -z "$NODE_IP" ]]; then
+    if ! NODE_IP="$(detect_node_ip)"; then
+        die "could not detect a cluster-reachable node IP"
+    fi
 fi
 [[ -n "$NODE_IP" ]] || die "could not detect a cluster-reachable node IP"
 
@@ -136,11 +156,17 @@ START_COMMAND=(
     "--address=$HEAD_ADDRESS"
     "--node-ip-address=$NODE_IP"
     "--num-gpus=$NUM_GPUS"
+    "--min-worker-port=$MIN_WORKER_PORT"
+    "--max-worker-port=$MAX_WORKER_PORT"
     --disable-usage-stats
-    "--temp-dir=$TEMP_DIR"
 )
 
-echo "Ray worker configuration: node=$NODE_IP head=$HEAD_ADDRESS gpus=$NUM_GPUS temp_dir=$TEMP_DIR"
+if (( MIN_WORKER_PORT == 0 )); then
+    WORKER_PORTS=random
+else
+    WORKER_PORTS="$MIN_WORKER_PORT-$MAX_WORKER_PORT"
+fi
+echo "Ray worker configuration: node=$NODE_IP head=$HEAD_ADDRESS gpus=$NUM_GPUS worker_ports=$WORKER_PORTS"
 if [[ -n "$NETWORK_INTERFACE" ]]; then
     echo "Communication interface: $NETWORK_INTERFACE"
 fi
@@ -158,7 +184,6 @@ if [[ "$DRY_RUN" == true ]]; then
     exit 0
 fi
 
-mkdir -p "$TEMP_DIR"
 "${START_COMMAND[@]}"
 
 cat <<EOF

@@ -4,6 +4,7 @@ from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
     _has_path,
+    _remove_edge,
     _remove_node_and_incident_edges,
     _topological_levels,
 )
@@ -54,11 +55,19 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
             for e in dag.edges
         )
 
-    def _build_chains(candidates: list[str], topo_order: list[str]) -> list[list[str]]:
+    def _build_chains(
+        candidates: list[str],
+        topo_order: list[str],
+        *,
+        partition_key=None,
+    ) -> list[list[str]]:
         chains: list[list[str]] = []
         by_bucket: dict[Any, list[str]] = {}
         for uid in candidates:
-            by_bucket.setdefault(_chain_bucket(uid), []).append(uid)
+            key = _chain_bucket(uid)
+            if partition_key is not None:
+                key = (key, partition_key(uid))
+            by_bucket.setdefault(key, []).append(uid)
         topo_idx = {uid: i for i, uid in enumerate(topo_order)}
         for bucket, uids in sorted(by_bucket.items(), key=lambda item: str(item[0])):
             uid_set = set(uids)
@@ -141,12 +150,6 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                 )
         _remove_node_and_incident_edges(dag, ag_uid)
 
-    def _remove_reduce_scatter(rs_uid: str, compute_uid: str, bucket: Any) -> None:
-        del compute_uid, bucket
-        if rs_uid not in dag.nodes:
-            return
-        _remove_node_and_incident_edges(dag, rs_uid)
-
     has_grad_sync = any(
         n.node_kind in ("REDUCE_COMM", "REDUCE_SCATTER_COMM")
         for n in dag.nodes.values()
@@ -156,71 +159,112 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
     grad_chains: list[list[str]] = []
     param_chains: list[list[str]] = []
 
-    # Gradient lifetimes: keep one full-grad allocation and one reduce-scatter
-    # per directly-connected same-bucket gradient chain.
+    # Gradient lifetimes always span every backward microbatch contributing to
+    # a bucket. Replicate lowering records those contributors on the bucket's
+    # single reduce-scatter. Order directives have been applied by this point,
+    # so normalize the contributor list to topological order, keep the full-grad
+    # allocation on the first backward, and anchor the collective's one data
+    # edge on the final backward. All other contributor edges are ordering-only.
     if has_grad_sync:
-        grad_candidates = _compute_uids_with(
-            topo,
-            lambda uid: bool(dag.nodes[uid].node_meta.get("zero_alloc_full_grads_before"))
+        topo_idx = {uid: index for index, uid in enumerate(topo)}
+        reduce_scatters = sorted(
+            (
+                node
+                for node in dag.nodes.values()
+                if node.node_kind == "REDUCE_SCATTER_COMM"
+            ),
+            key=lambda node: topo_idx[node.uid],
         )
-        if grad_candidates:
-            grad_chains = _build_chains(grad_candidates, topo)
-            covered = {uid for chain in grad_chains for uid in chain}
-            assert covered == set(grad_candidates), (
-                "zero_lifetime_prune: gradient mode did not assign every grad-allocation "
-                f"compute node to a chain; missing={sorted(set(grad_candidates) - covered)}"
+        covered_grad_uids: set[str] = set()
+        for rs_node in reduce_scatters:
+            raw_contributors = rs_node.node_meta.get("bwd_uids")
+            if raw_contributors is None:
+                raw_contributors = [rs_node.node_meta.get("bwd_uid")]
+            contributor_uids = [
+                str(uid)
+                for uid in raw_contributors
+                if isinstance(uid, str)
+                and uid in dag.nodes
+                and _is_compute(uid)
+            ]
+            assert contributor_uids, (
+                f"zero_lifetime_prune: reduce-scatter {rs_node.uid} has no "
+                f"live backward contributors: {raw_contributors}"
+            )
+            assert len(contributor_uids) == len(set(contributor_uids)), (
+                f"zero_lifetime_prune: reduce-scatter {rs_node.uid} has duplicate "
+                f"contributors: {contributor_uids}"
+            )
+            chain = sorted(contributor_uids, key=lambda uid: topo_idx[uid])
+            bucket = rs_node.node_meta.get("bucket_key")
+            assert all(_chain_bucket(uid) == bucket for uid in chain), (
+                f"zero_lifetime_prune: gradient chain has mixed buckets: "
+                f"{[(uid, _chain_bucket(uid)) for uid in chain]}, rs_bucket={bucket}"
+            )
+            assert not covered_grad_uids.intersection(chain), (
+                f"zero_lifetime_prune: backward contributors belong to multiple "
+                f"reduce-scatters: {sorted(covered_grad_uids.intersection(chain))}"
+            )
+            covered_grad_uids.update(chain)
+
+            for uid in chain:
+                assert dag.nodes[uid].node_meta.get("zero_alloc_full_grads_before"), (
+                    f"zero_lifetime_prune: gradient contributor {uid} is missing "
+                    "zero_alloc_full_grads_before"
+                )
+            for uid in chain[1:]:
+                dag.nodes[uid].node_meta.pop("zero_alloc_full_grads_before", None)
+
+            contributor_set = set(chain)
+            contribution_edges = [
+                edge
+                for edge in list(dag.edges)
+                if edge.src_uid in contributor_set
+                and edge.dst_uid == rs_node.uid
+                and edge.dep_kind in ("data", "temporal")
+            ]
+            assert {edge.src_uid for edge in contribution_edges} == contributor_set, (
+                f"zero_lifetime_prune: reduce-scatter {rs_node.uid} dependencies "
+                f"do not cover contributors {chain}: {contribution_edges}"
+            )
+            for edge in contribution_edges:
+                _remove_edge(dag, edge)
+            for uid in chain:
+                dag.add_edge(
+                    TrainingDAGEdge(
+                        src_uid=uid,
+                        dst_uid=rs_node.uid,
+                        dep_kind=("data" if uid == chain[-1] else "temporal"),
+                        tensor_name=None,
+                    )
+                )
+
+            rs_node.node_meta["bwd_uid"] = chain[-1]
+            rs_node.node_meta["bwd_uids"] = list(chain)
+            grad_chains.append(chain)
+            logger.debug(
+                "normalized accumulated gradients: bucket=%s nodes=%s "
+                "alloc_before=%s reduce_scatter_after=%s",
+                bucket,
+                chain,
+                chain[0],
+                chain[-1],
             )
 
-            for chain in grad_chains:
-                bucket = _chain_bucket(chain[0])
-                assert all(_chain_bucket(uid) == bucket for uid in chain), (
-                    f"zero_lifetime_prune: gradient chain has mixed buckets: "
-                    f"{[(uid, _chain_bucket(uid)) for uid in chain]}"
-                )
-                logger.debug(
-                    "pruned zero lifetime: bucket=%s nodes=%s keep_alloc_for=%s keep_reduce_scatter_for=%s",
-                    bucket,
-                    chain,
-                    chain[0],
-                    chain[-1],
-                )
-
-                for uid in chain:
-                    rs_uids = _reduce_scatter_succs(uid)
-                    assert rs_uids, (
-                        f"zero_lifetime_prune: gradient chain node {uid} has "
-                        "zero_alloc_full_grads_before but no outgoing reduce-scatter"
-                    )
-
-                for uid in chain[1:]:
-                    dag.nodes[uid].node_meta.pop("zero_alloc_full_grads_before", None)
-                for uid in chain[:-1]:
-                    for rs_uid in _reduce_scatter_succs(uid):
-                        _remove_reduce_scatter(rs_uid, uid, bucket)
-
-                assert dag.nodes[chain[0]].node_meta.get("zero_alloc_full_grads_before"), (
-                    f"zero_lifetime_prune: gradient chain root {chain[0]} lost grad allocation"
-                )
-                for prev_uid, uid in zip(chain, chain[1:]):
-                    assert _has_direct_compute_dependency(prev_uid, uid), (
-                        f"zero_lifetime_prune: gradient chain is not directly linked: "
-                        f"{prev_uid} does not have a direct compute dependency to {uid}; chain={chain}"
-                    )
-                    assert not dag.nodes[uid].node_meta.get("zero_alloc_full_grads_before"), (
-                        f"zero_lifetime_prune: non-root gradient chain node {uid} still allocates grads"
-                    )
-                live_rs = [
-                    (uid, rs_uid)
-                    for uid in chain
-                    for rs_uid in _reduce_scatter_succs(uid)
-                ]
-                assert live_rs, (
-                    f"zero_lifetime_prune: gradient chain has no live reduce-scatter; chain={chain}"
-                )
-                assert all(uid == chain[-1] for uid, _rs_uid in live_rs), (
-                    f"zero_lifetime_prune: only chain tail {chain[-1]} should keep reduce-scatter, "
-                    f"but live reduce-scatters are {live_rs}"
-                )
+        marked_grad_uids = set(
+            _compute_uids_with(
+                topo,
+                lambda uid: bool(
+                    dag.nodes[uid].node_meta.get("zero_alloc_full_grads_before")
+                ),
+            )
+        )
+        expected_roots = {chain[0] for chain in grad_chains}
+        assert marked_grad_uids == expected_roots, (
+            "zero_lifetime_prune: gradient allocation roots do not match "
+            f"reduce-scatter chains; marked={sorted(marked_grad_uids)}, "
+            f"expected={sorted(expected_roots)}"
+        )
 
     # Parameter lifetimes: keep one all-gather and one full-param free per
     # directly-connected same-bucket parameter chain. This pass intentionally

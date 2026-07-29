@@ -11,7 +11,7 @@ def _runtime(global_pp_rank: int = 1) -> RuntimeState:
         pp_degree=4,
         world_size=4,
     )
-    runtime.profile_p2p_streams = {
+    runtime.directional_p2p_streams = {
         "pp_lo_hi": object(),
         "pp_hi_lo": object(),
     }
@@ -22,7 +22,7 @@ def _runtime(global_pp_rank: int = 1) -> RuntimeState:
     return runtime
 
 
-def test_directional_profile_streams_match_p2p_process_groups() -> None:
+def test_directional_streams_match_p2p_process_groups() -> None:
     runtime = _runtime(global_pp_rank=1)
 
     send_up = SimpleNamespace(
@@ -39,35 +39,53 @@ def test_directional_profile_streams_match_p2p_process_groups() -> None:
     )
 
     assert (
-        runtime.profile_p2p_stream_for_task(send_up)
-        is runtime.profile_p2p_streams["pp_lo_hi"]
+        runtime.directional_p2p_stream_for_task(send_up)
+        is runtime.directional_p2p_streams["pp_lo_hi"]
     )
     assert (
-        runtime.profile_p2p_stream_for_task(recv_from_up)
-        is runtime.profile_p2p_streams["pp_hi_lo"]
+        runtime.directional_p2p_stream_for_task(recv_from_up)
+        is runtime.directional_p2p_streams["pp_hi_lo"]
     )
     assert (
-        runtime.profile_p2p_stream_for_task(send_down)
-        is runtime.profile_p2p_streams["pp_hi_lo"]
+        runtime.directional_p2p_stream_for_task(send_down)
+        is runtime.directional_p2p_streams["pp_hi_lo"]
     )
     assert (
-        runtime.profile_p2p_stream_for_task(recv_from_down)
-        is runtime.profile_p2p_streams["pp_lo_hi"]
+        runtime.directional_p2p_stream_for_task(recv_from_down)
+        is runtime.directional_p2p_streams["pp_lo_hi"]
     )
 
 
-def test_profile_p2p_stream_rejects_non_p2p_task() -> None:
+def test_directional_p2p_stream_rejects_non_p2p_task() -> None:
     runtime = _runtime()
     task = SimpleNamespace(
         uid="compute", node_kind="COMPUTE", peer_pp_rank=2
     )
 
     try:
-        runtime.profile_p2p_stream_for_task(task)
+        runtime.directional_p2p_stream_for_task(task)
     except ValueError as exc:
         assert "SEND_COMM or RECV_COMM" in str(exc)
     else:
         raise AssertionError("expected non-P2P profile stream lookup to fail")
+
+
+def test_execution_stream_policy_uses_directional_p2p_streams() -> None:
+    runtime = _runtime(global_pp_rank=1)
+    p2p = SimpleNamespace(
+        uid="send-up", node_kind="SEND_COMM", peer_pp_rank=2
+    )
+    compute = SimpleNamespace(uid="compute", node_kind="COMPUTE")
+    logical_stream = runtime.streams["compute_stream"]
+
+    assert (
+        runtime.execution_stream_for_task(p2p, logical_stream)
+        is runtime.directional_p2p_streams["pp_lo_hi"]
+    )
+    assert (
+        runtime.execution_stream_for_task(compute, logical_stream)
+        is logical_stream
+    )
 
 
 def test_interference_free_profile_collapses_non_p2p_to_default_stream() -> None:
@@ -108,7 +126,7 @@ def test_both_profile_modes_keep_directional_p2p_streams() -> None:
             runtime.profile_stream_for_task(
                 task, logical_stream, profile_mode=profile_mode
             )
-            is runtime.profile_p2p_streams["pp_lo_hi"]
+            is runtime.directional_p2p_streams["pp_lo_hi"]
         )
 
 

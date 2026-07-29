@@ -145,7 +145,9 @@ class RuntimeState:
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
     streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
-    profile_p2p_streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
+    directional_p2p_streams: dict[str, torch.cuda.Stream] = field(
+        default_factory=dict
+    )
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
 
@@ -193,24 +195,24 @@ class RuntimeState:
     def default_stream(self) -> torch.cuda.Stream:
         return self.stream_for_id("default_stream")
 
-    def initialize_profile_p2p_streams(self) -> None:
-        """Create the two directional P2P streams used by serialized profiling.
+    def initialize_directional_p2p_streams(self) -> None:
+        """Create independent CUDA streams for the two PP directions.
 
-        Non-P2P profile work is intentionally collapsed onto ``default_stream``.
-        P2P is the exception: keeping the lo->hi and hi->lo communicators on
-        separate CUDA streams lets both directions make progress concurrently
-        and avoids introducing a profiling-only send/recv deadlock.
+        A single physical PP stream can deadlock when each peer queues a send
+        before the receive needed by the opposite direction.  Directional
+        streams let the matching receive make progress independently.  Normal
+        execution and both profiling policies share this same stream pair.
         """
-        if self.profile_p2p_streams:
+        if self.directional_p2p_streams:
             return
-        self.profile_p2p_streams = {
+        self.directional_p2p_streams = {
             "pp_lo_hi": torch.cuda.Stream(device=self.device),
             "pp_hi_lo": torch.cuda.Stream(device=self.device),
         }
 
-    def profile_p2p_stream_for_task(self, task: Any) -> torch.cuda.Stream:
-        """Return the profiling stream matching the task's directional group."""
-        self.initialize_profile_p2p_streams()
+    def directional_p2p_stream_for_task(self, task: Any) -> torch.cuda.Stream:
+        """Return the CUDA stream matching a P2P task's directional group."""
+        self.initialize_directional_p2p_streams()
         peer_pp_rank = getattr(task, "peer_pp_rank", None)
         if peer_pp_rank is None:
             meta = getattr(task, "node_meta", {}) or {}
@@ -232,10 +234,20 @@ class RuntimeState:
             )
         else:
             raise ValueError(
-                "profile_p2p_stream_for_task requires SEND_COMM or RECV_COMM, "
+                "directional_p2p_stream_for_task requires SEND_COMM or RECV_COMM, "
                 f"got node_kind={node_kind!r}"
             )
-        return self.profile_p2p_streams[group_kind]
+        return self.directional_p2p_streams[group_kind]
+
+    def execution_stream_for_task(
+        self,
+        task: Any,
+        logical_stream: torch.cuda.Stream,
+    ) -> torch.cuda.Stream:
+        """Resolve the physical stream used by an ordinary training step."""
+        if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
+            return self.directional_p2p_stream_for_task(task)
+        return logical_stream
 
     def profile_stream_for_task(
         self,
@@ -251,14 +263,14 @@ class RuntimeState:
         Concurrent profiling retains the normal logical stream assignment so
         its durations capture the contention present in an ordinary step.
 
-        P2P is deliberately identical in both modes: sends and receives use
-        the dedicated lo->hi and hi->lo streams.  Serializing both directions
-        can create a profiling-only NCCL rendezvous deadlock.
+        P2P is deliberately identical to ordinary execution in both modes:
+        sends and receives use the dedicated lo->hi and hi->lo streams.
+        Serializing both directions can create an NCCL rendezvous deadlock.
         """
 
         mode = normalize_profile_mode(profile_mode)
         if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
-            return self.profile_p2p_stream_for_task(task)
+            return self.directional_p2p_stream_for_task(task)
         if mode == "interference_free":
             return self.default_stream()
         return logical_stream

@@ -31,6 +31,7 @@ sys.path.insert(0, _REPO_ROOT)
 import ray
 from ray.util.placement_group import placement_group_table
 
+from scripts.export_node_profile_ratios import export_node_profile_ratio_csvs
 from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
 from src.profile_statistics import summarize_timing_samples
 from src.schedule import load_schedule_directives
@@ -54,8 +55,10 @@ _RAY_FORWARDED_ENV_VARS = (
     "NCCL_DEBUG",
     "NCCL_DEBUG_FILE",
     "NCCL_DEBUG_SUBSYS",
+    "NCCL_NET",
     "NCCL_SOCKET_IFNAME",
     "GLOO_SOCKET_IFNAME",
+    "PIPER_PROCESS_GROUP_TIMEOUT_MINUTES",
 )
 
 
@@ -196,7 +199,9 @@ def main() -> None:
     forwarded_args = _replace_schedule_arg(test_args, generated_schedule)
     if args.viz:
         forwarded_args.append("--viz")
+    step_time_profile_path: Path | None = None
     if args.profile_and_simulate:
+        step_time_profile_path = (run_dir / "step_time_profiles.json").resolve()
         forwarded_args.extend(
             [
                 "--profile-and-simulate",
@@ -205,7 +210,7 @@ def main() -> None:
                 "--profile-iters",
                 str(args.profile_iters),
                 "--step-time-profile-output",
-                str((run_dir / "step_time_profiles.json").resolve()),
+                str(step_time_profile_path),
             ]
         )
 
@@ -253,6 +258,17 @@ def main() -> None:
         results_csv = run_dir / "results.csv"
         _write_results_csv(results_csv, rows)
         print(f"metrics written to {results_csv}")
+    if step_time_profile_path is not None:
+        ratio_export = export_node_profile_ratio_csvs(step_time_profile_path)
+        print(
+            f"node profile ratios written to {ratio_export.ratio_csv_path} "
+            f"({ratio_export.measured_node_count} measured nodes; "
+            f"{ratio_export.skipped_node_count} skipped)"
+        )
+        print(
+            "node profile ratio summary written to "
+            f"{ratio_export.summary_csv_path}"
+        )
     if profile_dir is not None:
         _combine_pytorch_profiles(
             profile_dir,
@@ -307,9 +323,18 @@ def _run_test_module(
     )
     try:
         pp_outer = getattr(test_ns, "pp_outer", False)
-        pg = create_piper_placement_group(test_ns.schedule_directives_file, pp_outer=pp_outer)
-        ray.get(pg.ready(), timeout=600)
-        logging.getLogger(module_name).info(placement_group_table(pg))
+        pg = create_piper_placement_group(
+            test_ns.schedule_directives_file,
+            pp_outer=pp_outer,
+        )
+        ray.get(pg.placement_group.ready(), timeout=600)
+        pg_info = placement_group_table(pg.placement_group)
+        pg.plan.validate_bundle_nodes(pg_info)
+        logging.getLogger(module_name).info(
+            "Piper placement plan:\n%s\nRay placement group:\n%s",
+            pg.plan.describe(),
+            pg_info,
+        )
         coordinator = PiperProgramCoordinator.remote(
             schedule_directives_file=test_ns.schedule_directives_file,
             pp_outer=pp_outer,
