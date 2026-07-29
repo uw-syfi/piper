@@ -8,16 +8,13 @@ import torch.nn.functional as F
 from torch import nn
 
 
-def _run_bmm_experts(
+def _run_sorted_bmm_experts(
     w1: torch.Tensor,
     w2: torch.Tensor,
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
-    if x.is_meta:
-        return torch.empty_like(x)
-
     dim = x.shape[-1]
     num_experts = w1.shape[0]
     counts = num_tokens_per_expert.to(device=x.device, dtype=torch.long)
@@ -50,6 +47,44 @@ def _run_bmm_experts(
     return out
 
 
+def _run_bmm_experts(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    packed_input: torch.Tensor,
+) -> torch.Tensor:
+    """Run experts row-wise while carrying expert IDs through EP all-to-all.
+
+    The last two columns encode the expert ID as base-256 digits. Both digits
+    are exactly representable in bfloat16, including configurations with more
+    than 256 experts.
+    """
+    dim = w1.shape[-1]
+    if packed_input.is_meta:
+        return packed_input.new_empty((*packed_input.shape[:-1], dim))
+
+    x = packed_input[..., :dim]
+    expert_id_low = packed_input[..., dim].to(torch.long)
+    expert_id_high = packed_input[..., dim + 1].to(torch.long)
+    expert_indices = expert_id_low + 256 * expert_id_high
+    permutation = torch.argsort(expert_indices, stable=True)
+    sorted_x = x[permutation]
+    counts = torch.histc(
+        expert_indices.to(torch.float32),
+        bins=w1.shape[0],
+        min=0,
+        max=w1.shape[0],
+    )
+    sorted_output = _run_sorted_bmm_experts(
+        w1, w2, w3, sorted_x, counts
+    )
+    return x.new_zeros(x.shape).scatter(
+        0,
+        permutation[:, None].expand(-1, dim),
+        sorted_output,
+    )
+
+
 _BMM_EXPERTS_LIBS = []
 
 
@@ -62,7 +97,7 @@ def _register_bmm_experts_op() -> None:
 
     def_lib = torch.library.Library("piper_artifact", "DEF")
     def_lib.define(
-        "bmm_experts(Tensor w1, Tensor w2, Tensor w3, Tensor x, Tensor num_tokens_per_expert) -> Tensor"
+        "bmm_experts(Tensor w1, Tensor w2, Tensor w3, Tensor packed_input) -> Tensor"
     )
     impl_lib = torch.library.Library("piper_artifact", "IMPL")
     impl_lib.impl("bmm_experts", _run_bmm_experts, "CPU")
@@ -79,11 +114,10 @@ def bmm_experts(
     w1: torch.Tensor,
     w2: torch.Tensor,
     w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
+    packed_input: torch.Tensor,
 ) -> torch.Tensor:
     return torch.ops.piper_artifact.bmm_experts(
-        w1, w2, w3, x, num_tokens_per_expert
+        w1, w2, w3, packed_input
     )
 
 
@@ -92,8 +126,9 @@ class BmmExperts(nn.Module):
 
     Mirrors torchtitan ``GroupedExperts`` parameter shapes/names so the param
     registry is unchanged, but runs the per-expert SwiGLU via batched matmul
-    instead of ``torch._grouped_mm``. The input must be sorted by expert, and
-    ``num_tokens_per_expert`` gives each expert's dynamic token count.
+    instead of ``torch._grouped_mm``. The input carries a two-column expert ID
+    so EP all-to-all can permute routed rows without separating their routing
+    metadata.
     """
 
     def __init__(self, dim: int, hidden_dim: int, num_experts: int):
@@ -103,8 +138,5 @@ class BmmExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
 
-    def forward(
-        self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor
-    ) -> torch.Tensor:
-        counts = num_tokens_per_expert.to(device=x.device, dtype=torch.long)
-        return bmm_experts(self.w1, self.w2, self.w3, x, counts)
+    def forward(self, packed_input: torch.Tensor) -> torch.Tensor:
+        return bmm_experts(self.w1, self.w2, self.w3, packed_input)
