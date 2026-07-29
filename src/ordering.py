@@ -117,8 +117,11 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
     The default-stream pass runs first so the per-non-default-stream anchors
     below see the post-serialization topological order of default-stream nodes.
 
-    Non-default stream nodes are ordered by the topological order of the
-    default-stream nodes they directly depend on or are depended on by.
+    Non-default stream nodes are ordered by their nearest ready point on the
+    default stream.  A post-compute operation with multiple default-stream
+    predecessors (for example an accumulated reduce-scatter) is anchored to
+    its latest predecessor, while a pure pre-compute operation (for example an
+    all-gather) is anchored to its earliest default-stream successor.
     """
     _resolve_default_stream_order(dag)
 
@@ -138,23 +141,42 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
 
     for stream in streams:
         associated_by_default: dict[str, list[str]] = {uid: [] for uid in default_uids}
-        default_anchors_by_stream_uid: dict[str, list[str]] = {}
+        default_preds_by_stream_uid: dict[str, list[str]] = {}
+        default_succs_by_stream_uid: dict[str, list[str]] = {}
         for edge in dag.edges:
             src = dag.nodes[edge.src_uid]
             dst = dag.nodes[edge.dst_uid]
             if src.stream == _DEFAULT_STREAM and dst.stream == stream:
-                default_anchors_by_stream_uid.setdefault(edge.dst_uid, []).append(edge.src_uid)
+                default_preds_by_stream_uid.setdefault(edge.dst_uid, []).append(
+                    edge.src_uid
+                )
             elif src.stream == stream and dst.stream == _DEFAULT_STREAM:
-                default_anchors_by_stream_uid.setdefault(edge.src_uid, []).append(edge.dst_uid)
+                default_succs_by_stream_uid.setdefault(edge.src_uid, []).append(
+                    edge.dst_uid
+                )
 
         for stream_uid in {
             uid for uid, node in dag.nodes.items()
             if node.stream == stream
         }:
-            default_anchors = default_anchors_by_stream_uid.get(stream_uid, [])
-            if not default_anchors:
+            default_preds = default_preds_by_stream_uid.get(stream_uid, [])
+            default_succs = default_succs_by_stream_uid.get(stream_uid, [])
+            if default_preds:
+                # The stream operation is not ready until all direct default
+                # predecessors complete.  Anchoring to the earliest one can
+                # incorrectly place an accumulated collective before a later
+                # all-gather that feeds one of its remaining contributors.
+                anchor_uid = max(
+                    default_preds,
+                    key=lambda uid: (topo_levels[uid], topo_idx[uid]),
+                )
+            elif default_succs:
+                anchor_uid = min(
+                    default_succs,
+                    key=lambda uid: (topo_levels[uid], topo_idx[uid]),
+                )
+            else:
                 continue
-            anchor_uid = min(default_anchors, key=lambda uid: (topo_levels[uid], topo_idx[uid]))
             associated_by_default.setdefault(anchor_uid, []).append(stream_uid)
 
         current_uid: str | None = None

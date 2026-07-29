@@ -132,16 +132,14 @@ def test_directional_p2p_relaxes_ordering_only_but_not_data_dependencies() -> No
     dag = _dag(lo_hi, hi_lo)
 
     fifo_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
-    fifo_reason = fifo_plan["hi_lo"].reason_for("lo_hi")
-    assert fifo_reason == "stream_fifo"
-    assert is_relaxable_p2p_ordering_dependency(
-        lo_hi, hi_lo, fifo_reason
-    )
+    assert fifo_plan["lo_hi"].logical_stream == "pp_lo_hi"
+    assert fifo_plan["hi_lo"].logical_stream == "pp_hi_lo"
+    assert fifo_plan["hi_lo"].completion_predecessors == ()
 
     dag.add_edge(TrainingDAGEdge("lo_hi", "hi_lo", "temporal"))
     explicit_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
     explicit_reason = explicit_plan["hi_lo"].reason_for("lo_hi")
-    assert explicit_reason == "stream_fifo+same_stream_temporal"
+    assert explicit_reason == "cross_stream_temporal"
     assert is_relaxable_p2p_ordering_dependency(
         lo_hi, hi_lo, explicit_reason
     )
@@ -150,9 +148,39 @@ def test_directional_p2p_relaxes_ordering_only_but_not_data_dependencies() -> No
     dag.add_edge(TrainingDAGEdge("lo_hi", "hi_lo", "data"))
     data_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
     data_reason = data_plan["hi_lo"].reason_for("lo_hi")
-    assert data_reason == "stream_fifo+same_stream_data"
+    assert data_reason == "cross_stream_data"
     assert not is_relaxable_p2p_ordering_dependency(
         lo_hi, hi_lo, data_reason
+    )
+
+
+def test_directional_p2p_preserves_fifo_with_interposed_opposite_direction() -> None:
+    lo_hi_1 = _node("lo_hi_1", stream="pp", kind="SEND_COMM", subkind=None)
+    hi_lo = _node("hi_lo", stream="pp", kind="RECV_COMM", subkind=None)
+    lo_hi_2 = _node("lo_hi_2", stream="pp", kind="SEND_COMM", subkind=None)
+    lo_hi_1.node_meta["comm_group_kind"] = "pp_lo_hi"
+    hi_lo.node_meta["comm_group_kind"] = "pp_hi_lo"
+    lo_hi_2.node_meta["comm_group_kind"] = "pp_lo_hi"
+    dag = _dag(lo_hi_1, hi_lo, lo_hi_2)
+
+    plan = _by_uid(dag, ["lo_hi_1", "hi_lo", "lo_hi_2"])
+
+    assert plan["hi_lo"].completion_predecessors == ()
+    assert plan["lo_hi_2"].completion_predecessors == ("lo_hi_1",)
+    assert plan["lo_hi_2"].reason_for("lo_hi_1") == "stream_fifo"
+    assert not is_relaxable_p2p_ordering_dependency(
+        lo_hi_1,
+        lo_hi_2,
+        plan["lo_hi_2"].reason_for("lo_hi_1"),
+    )
+
+
+def test_p2p_ordering_without_direction_metadata_is_not_relaxed() -> None:
+    first = _node("first", stream="pp", kind="SEND_COMM", subkind=None)
+    second = _node("second", stream="pp", kind="RECV_COMM", subkind=None)
+
+    assert not is_relaxable_p2p_ordering_dependency(
+        first, second, "stream_fifo"
     )
 
 

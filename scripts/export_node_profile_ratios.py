@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 from dataclasses import dataclass
 import math
@@ -30,11 +31,32 @@ CSV_FIELDS = (
     "median_interference_free_time_us",
     "normal_to_interference_free_ratio",
 )
+SUMMARY_CSV_FIELDS = (
+    "node_type",
+    "node_count",
+    "average_normal_to_interference_free_ratio",
+)
+
+
+_NODE_KIND_TYPES = {
+    "A2A_COMM": "a2a",
+    "RECV_COMM": "recv",
+    "REDUCE_COMM": "reduce",
+    "SEND_COMM": "send",
+    "UPD": "update",
+}
+_COMPUTE_SUBKIND_TYPES = {
+    "FWD": "forward",
+    "BWD": "backward",
+    "BWD_I": "backward_input",
+    "BWD_W": "backward_weight",
+}
 
 
 @dataclass(frozen=True)
 class NodeProfileRatio:
     node_uid: str
+    node_type: str
     median_normal_time_us: float
     median_interference_free_time_us: float
     normal_to_interference_free_ratio: float
@@ -50,6 +72,42 @@ class NodeProfileRatio:
                 self.normal_to_interference_free_ratio
             ),
         }
+
+
+@dataclass(frozen=True)
+class NodeTypeSummary:
+    node_type: str
+    node_count: int
+    average_normal_to_interference_free_ratio: float
+
+    def to_csv_row(self) -> dict[str, str | int | float]:
+        return {
+            "node_type": self.node_type,
+            "node_count": self.node_count,
+            "average_normal_to_interference_free_ratio": (
+                self.average_normal_to_interference_free_ratio
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class NodeProfileRatioExportResult:
+    ratio_csv_path: Path
+    summary_csv_path: Path
+    measured_node_count: int
+    skipped_node_count: int
+    summaries: tuple[NodeTypeSummary, ...]
+
+
+def node_type(node: TrainingDAGNode) -> str:
+    """Return the stable summary category for a finalized DAG node."""
+
+    if node.node_kind == "COMPUTE":
+        return _COMPUTE_SUBKIND_TYPES.get(
+            str(node.compute_subkind),
+            f"compute_{str(node.compute_subkind).lower()}",
+        )
+    return _NODE_KIND_TYPES.get(node.node_kind, node.node_kind.lower())
 
 
 def _samples_for_mode(node: TrainingDAGNode, mode: str) -> tuple[float, ...]:
@@ -115,6 +173,7 @@ def build_node_profile_ratios(
             rows.append(
                 NodeProfileRatio(
                     node_uid=node.uid,
+                    node_type=node_type(node),
                     median_normal_time_us=normal_median,
                     median_interference_free_time_us=interference_free_median,
                     normal_to_interference_free_ratio=ratio,
@@ -125,6 +184,33 @@ def build_node_profile_ratios(
     return rows, skipped_nodes
 
 
+def summarize_node_types(
+    rows: list[NodeProfileRatio],
+) -> list[NodeTypeSummary]:
+    """Average per-node ratios within each semantic node type."""
+
+    ratios_by_type: dict[str, list[float]] = collections.defaultdict(list)
+    for row in rows:
+        ratios_by_type[row.node_type].append(
+            row.normal_to_interference_free_ratio
+        )
+    summaries = [
+        NodeTypeSummary(
+            node_type=type_name,
+            node_count=len(ratios),
+            average_normal_to_interference_free_ratio=statistics.fmean(ratios),
+        )
+        for type_name, ratios in ratios_by_type.items()
+    ]
+    summaries.sort(
+        key=lambda summary: (
+            -summary.average_normal_to_interference_free_ratio,
+            summary.node_type,
+        )
+    )
+    return summaries
+
+
 def write_node_profile_ratios(
     output_path: Path, rows: list[NodeProfileRatio]
 ) -> None:
@@ -133,6 +219,49 @@ def write_node_profile_ratios(
         writer = csv.DictWriter(output_file, fieldnames=CSV_FIELDS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(row.to_csv_row() for row in rows)
+
+
+def write_node_type_summaries(
+    output_path: Path, summaries: list[NodeTypeSummary]
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as output_file:
+        writer = csv.DictWriter(
+            output_file,
+            fieldnames=SUMMARY_CSV_FIELDS,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(summary.to_csv_row() for summary in summaries)
+
+
+def export_node_profile_ratio_csvs(
+    profile_path: Path,
+    *,
+    output_path: Path | None = None,
+    summary_output_path: Path | None = None,
+) -> NodeProfileRatioExportResult:
+    """Export sorted per-node ratios and their node-type summary beside a plan."""
+
+    profile_path = Path(profile_path)
+    output_path = output_path or profile_path.with_name(
+        "node_profile_time_ratios.csv"
+    )
+    summary_output_path = summary_output_path or output_path.with_name(
+        f"{output_path.stem}_summary.csv"
+    )
+    plan = ProfiledTrainingPlan.load_json(profile_path)
+    rows, skipped_nodes = build_node_profile_ratios(plan)
+    summaries = summarize_node_types(rows)
+    write_node_profile_ratios(output_path, rows)
+    write_node_type_summaries(summary_output_path, summaries)
+    return NodeProfileRatioExportResult(
+        ratio_csv_path=output_path,
+        summary_csv_path=summary_output_path,
+        measured_node_count=len(rows),
+        skipped_node_count=skipped_nodes,
+        summaries=tuple(summaries),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,19 +275,43 @@ def parse_args() -> argparse.Namespace:
             "the input artifact"
         ),
     )
+    parser.add_argument(
+        "--summary-output",
+        type=Path,
+        help=(
+            "Node-type summary CSV path; defaults to <output_stem>_summary.csv"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     output_path = args.output or args.profile.with_name("node_profile_time_ratios.csv")
-    plan = ProfiledTrainingPlan.load_json(args.profile)
-    rows, skipped_nodes = build_node_profile_ratios(plan)
-    write_node_profile_ratios(output_path, rows)
-    print(
-        f"Wrote {len(rows)} measured nodes to {output_path} "
-        f"(skipped {skipped_nodes} nodes without executed timing samples)"
+    summary_output_path = args.summary_output or output_path.with_name(
+        f"{output_path.stem}_summary.csv"
     )
+    result = export_node_profile_ratio_csvs(
+        args.profile,
+        output_path=output_path,
+        summary_output_path=summary_output_path,
+    )
+    print(
+        f"Wrote {result.measured_node_count} measured nodes to "
+        f"{result.ratio_csv_path} (skipped {result.skipped_node_count} nodes "
+        "without executed timing samples)"
+    )
+    print(
+        f"Wrote {len(result.summaries)} node-type summaries to "
+        f"{result.summary_csv_path}"
+    )
+    print("Node type summary (average normal/interference-free ratio):")
+    for summary in result.summaries:
+        print(
+            f"  {summary.node_type}: "
+            f"{summary.average_normal_to_interference_free_ratio:.6f}x "
+            f"(nodes={summary.node_count})"
+        )
 
 
 if __name__ == "__main__":

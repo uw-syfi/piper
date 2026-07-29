@@ -1,4 +1,7 @@
+import warnings
+from dataclasses import dataclass, replace
 from typing import Optional
+
 import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
@@ -13,214 +16,323 @@ PP_TAG = "PP"
 EP_TAG = "EP"
 
 
+@dataclass(frozen=True)
+class Qwen3ConfigSpec:
+    """Configuration fields for a Qwen model preset."""
+
+    dim: int
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    hidden_dim: int
+    max_seq_len: int
+    rope_theta: float
+    vocab_size: int = 151936
+    norm_eps: float = 1e-6
+    qk_norm: bool = True
+    depth_init: bool = True
+    enable_weight_tying: bool = False
+    moe_inter_dim: int | None = None
+    num_experts: int = 0
+    num_shared_experts: int = 0
+    top_k: int = 0
+    use_grouped_mm: bool = True
+    score_func: str = "softmax"
+    route_norm: bool = True
+    route_scale: float = 1.0
+    gate_bias: bool = False
+    score_before_experts: bool = False
+    load_balance_coeff: float | None = 1e-3
+    exact_backbone: bool = True
+
+
+_QWEN3_30B = Qwen3ConfigSpec(
+    dim=2048,
+    n_layers=8,
+    n_heads=32,
+    n_kv_heads=4,
+    head_dim=128,
+    hidden_dim=6144,
+    moe_inter_dim=768,
+    num_experts=128,
+    top_k=8,
+    max_seq_len=40960,
+    rope_theta=1_000_000.0,
+)
+_QWEN3_30B_BASE = replace(_QWEN3_30B, max_seq_len=32768)
+_QWEN3_30B_LONG = replace(
+    _QWEN3_30B,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+)
+_QWEN3_235B = Qwen3ConfigSpec(
+    dim=4096,
+    n_layers=94,
+    n_heads=64,
+    n_kv_heads=4,
+    head_dim=128,
+    hidden_dim=12288,
+    moe_inter_dim=1536,
+    num_experts=128,
+    top_k=8,
+    max_seq_len=40960,
+    rope_theta=1_000_000.0,
+)
+_QWEN3_235B_LONG = replace(
+    _QWEN3_235B,
+    max_seq_len=262144,
+    rope_theta=5_000_000.0,
+)
+_QWEN3_CODER_480B = Qwen3ConfigSpec(
+    dim=6144,
+    n_layers=62,
+    n_heads=96,
+    n_kv_heads=8,
+    head_dim=128,
+    hidden_dim=8192,
+    moe_inter_dim=2560,
+    num_experts=160,
+    top_k=8,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+    load_balance_coeff=0.0,
+)
+_QWEN3_NEXT_80B = Qwen3ConfigSpec(
+    dim=2048,
+    n_layers=8,
+    n_heads=16,
+    n_kv_heads=2,
+    head_dim=256,
+    hidden_dim=5120,
+    moe_inter_dim=512,
+    num_experts=512,
+    top_k=10,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+    num_shared_experts=1,
+    exact_backbone=False,
+)
+_QWEN3_CODER_NEXT = replace(_QWEN3_NEXT_80B, rope_theta=5_000_000.0)
+_QWEN35_35B = Qwen3ConfigSpec(
+    dim=2048,
+    n_layers=8,
+    n_heads=16,
+    n_kv_heads=2,
+    head_dim=256,
+    # Qwen3.5 has no dense intermediate_size. This field is unused by its
+    # all-MoE layer proxy, so use the routed/shared expert width.
+    hidden_dim=512,
+    moe_inter_dim=512,
+    num_experts=256,
+    top_k=8,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+    vocab_size=248320,
+    num_shared_experts=1,
+    exact_backbone=False,
+)
+_QWEN35_122B = Qwen3ConfigSpec(
+    dim=3072,
+    n_layers=8,
+    n_heads=32,
+    n_kv_heads=2,
+    head_dim=256,
+    hidden_dim=1024,
+    moe_inter_dim=1024,
+    num_experts=256,
+    top_k=8,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+    vocab_size=248320,
+    num_shared_experts=1,
+    exact_backbone=False,
+)
+_QWEN35_397B = Qwen3ConfigSpec(
+    dim=4096,
+    n_layers=8,
+    n_heads=32,
+    n_kv_heads=2,
+    head_dim=256,
+    hidden_dim=1024,
+    moe_inter_dim=1024,
+    num_experts=512,
+    top_k=10,
+    max_seq_len=262144,
+    rope_theta=10_000_000.0,
+    vocab_size=248320,
+    num_shared_experts=1,
+    exact_backbone=False,
+)
+
+# Synthetic development presets and non-quantized checkpoints from Qwen's
+# official model collections all use this one registry and construction path.
+# Quantized releases reuse these same architecture shapes and are not separate
+# presets.
+QWEN3_CONFIG_SPECS = {
+    "9M": Qwen3ConfigSpec(
+        vocab_size=2048,
+        dim=256,
+        n_layers=4,
+        n_heads=8,
+        n_kv_heads=4,
+        head_dim=32,
+        hidden_dim=512,
+        max_seq_len=2048,
+        rope_theta=1_000_000.0,
+        moe_inter_dim=128,
+        num_experts=8,
+        top_k=2,
+        route_norm=False,
+        load_balance_coeff=None,
+    ),
+    "1B": Qwen3ConfigSpec(
+        dim=1024,
+        n_layers=4,
+        n_heads=16,
+        n_kv_heads=8,
+        head_dim=64,
+        hidden_dim=3584,
+        max_seq_len=2048,
+        rope_theta=1_000_000.0,
+        moe_inter_dim=3584,
+        num_experts=4,
+        top_k=2,
+        route_norm=False,
+        load_balance_coeff=None,
+    ),
+    "9B": Qwen3ConfigSpec(
+        dim=2048,
+        n_layers=4,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=64,
+        hidden_dim=7168,
+        max_seq_len=2048,
+        rope_theta=1_000_000.0,
+        moe_inter_dim=7168,
+        num_experts=8,
+        top_k=2,
+        route_norm=False,
+        load_balance_coeff=None,
+    ),
+    "48B": Qwen3ConfigSpec(
+        dim=4096,
+        n_layers=4,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+        hidden_dim=14336,
+        max_seq_len=131072,
+        rope_theta=1_000_000.0,
+        moe_inter_dim=14336,
+        num_experts=8,
+        top_k=2,
+        route_norm=False,
+        load_balance_coeff=None,
+    ),
+    "30B-A3B-half": Qwen3ConfigSpec(
+        dim=2048,
+        n_layers=24,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        hidden_dim=6144,
+        max_seq_len=262144,
+        rope_theta=1_000_000.0,
+        moe_inter_dim=768,
+        num_experts=64,
+        top_k=8,
+        load_balance_coeff=None,
+    ),
+    "72B": Qwen3ConfigSpec(
+        vocab_size=152064,
+        dim=8192,
+        n_layers=4,  # Full model has 80 layers; keep the local reduced preset.
+        n_heads=64,
+        n_kv_heads=8,
+        head_dim=128,
+        hidden_dim=29568,
+        norm_eps=1e-5,
+        max_seq_len=131072,
+        rope_theta=1_000_000.0,
+    ),
+    "Qwen3-30B-A3B": _QWEN3_30B,
+    "Qwen3-30B-A3B-Base": _QWEN3_30B_BASE,
+    "Qwen3-30B-A3B-Instruct-2507": _QWEN3_30B_LONG,
+    "Qwen3-30B-A3B-Thinking-2507": _QWEN3_30B_LONG,
+    "Qwen3-235B-A22B": _QWEN3_235B,
+    "Qwen3-235B-A22B-Instruct-2507": _QWEN3_235B_LONG,
+    "Qwen3-235B-A22B-Thinking-2507": _QWEN3_235B_LONG,
+    "Qwen3-Coder-30B-A3B-Instruct": _QWEN3_30B_LONG,
+    "Qwen3-Coder-480B-A35B-Instruct": _QWEN3_CODER_480B,
+    "Qwen3-Next-80B-A3B-Instruct": _QWEN3_NEXT_80B,
+    "Qwen3-Next-80B-A3B-Thinking": _QWEN3_NEXT_80B,
+    "Qwen3-Coder-Next": _QWEN3_CODER_NEXT,
+    "Qwen3-Coder-Next-Base": _QWEN3_CODER_NEXT,
+    "Qwen3.5-35B-A3B": _QWEN35_35B,
+    "Qwen3.5-35B-A3B-Base": _QWEN35_35B,
+    "Qwen3.5-122B-A10B": _QWEN35_122B,
+    "Qwen3.5-397B-A17B": _QWEN35_397B,
+    "Qwen3.6-35B-A3B": _QWEN35_35B,
+    "Qwen-AgentWorld-35B-A3B": _QWEN35_35B,
+}
+
+QWEN_MODEL_NAMES = tuple(QWEN3_CONFIG_SPECS)
+
+
 def create_qwen3_config(name: str) -> Qwen3ModelArgs:
-    """Create Qwen3 model config based on name."""
-    match name:
-        case '9M':
-            return Qwen3ModelArgs(
-                vocab_size=2048,
-                dim=256,
-                n_layers=4,
-                n_heads=8,
-                n_kv_heads=4,
-                head_dim=32,
-                hidden_dim=512,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=2048,
-                rope_theta=1000000.0,
-                depth_init=True,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=128,
-                moe_args=MoEArgs(
-                    num_experts=8,
-                    top_k=2,
-                    use_grouped_mm=True,
-                    num_expert_groups=None,
-                    num_limited_groups=None,
-                    score_func="softmax",
-                    route_norm=False,
-                    route_scale=1.0,
-                    gate_bias=False,
-                    score_before_experts=False,
-                    num_shared_experts=0,
-                    load_balance_coeff=None,
-                    _debug_force_load_balance=False,
-                ),
-            )
-        case '1B':
-            return Qwen3ModelArgs(
-                vocab_size=151936,
-                dim=1024,
-                n_layers=16,
-                n_heads=16,
-                n_kv_heads=8,
-                head_dim=64,
-                hidden_dim=3584,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=2048,
-                rope_theta=1000000.0,
-                depth_init=True,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=3584,
-                moe_args=MoEArgs(
-                    num_experts=4,
-                    top_k=2,
-                    use_grouped_mm=True,
-                    num_expert_groups=None,
-                    num_limited_groups=None,
-                    score_func="softmax",
-                    route_norm=False,
-                    route_scale=1.0,
-                    gate_bias=False,
-                    score_before_experts=False,
-                    num_shared_experts=0,
-                    load_balance_coeff=None,
-                    _debug_force_load_balance=False,
-                ),
-            )
-        case '9B':
-            return Qwen3ModelArgs(
-                vocab_size=151936,
-                dim=2048,
-                n_layers=24,
-                n_heads=32,
-                n_kv_heads=8,
-                head_dim=64,
-                hidden_dim=7168,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=2048,
-                rope_theta=1000000.0,
-                depth_init=True,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=7168,
-                moe_args=MoEArgs(
-                    num_experts=8,
-                    top_k=2,
-                    use_grouped_mm=True,
-                    num_expert_groups=None,
-                    num_limited_groups=None,
-                    score_func="softmax",
-                    route_norm=False,
-                    route_scale=1.0,
-                    gate_bias=False,
-                    score_before_experts=False,
-                    num_shared_experts=0,
-                    load_balance_coeff=None,
-                    _debug_force_load_balance=False,
-                ),
-            )
-        case '48B':
-            return Qwen3ModelArgs(
-                vocab_size=151936,
-                dim=4096,
-                n_layers=32,
-                n_heads=32,
-                n_kv_heads=8,
-                head_dim=128,
-                hidden_dim=14336,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=2048,
-                rope_theta=1000000.0,
-                depth_init=True,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=14336,
-                moe_args=MoEArgs(
-                    num_experts=8,
-                    top_k=2,
-                    use_grouped_mm=True,
-                    num_expert_groups=None,
-                    num_limited_groups=None,
-                    score_func="softmax",
-                    route_norm=False,
-                    route_scale=1.0,
-                    gate_bias=False,
-                    score_before_experts=False,
-                    num_shared_experts=0,
-                    load_balance_coeff=None,
-                    _debug_force_load_balance=False,
-                ),
-            )
-        case '30B-A3B':
-            return Qwen3ModelArgs(
-                vocab_size=151936,
-                dim=2048,
-                n_layers=48,
-                n_heads=32,
-                n_kv_heads=4,
-                head_dim=128,
-                hidden_dim=6144,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=262144,
-                rope_theta=1000000.0,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=768,
-                moe_args=MoEArgs(
-                    num_experts=128,
-                    num_shared_experts=0,
-                    top_k=8,
-                    score_func="softmax",
-                    route_norm=True,
-                    route_scale=1.0,
-                    score_before_experts=False,
-                    load_balance_coeff=None,
-                ),
-            )
-        case '30B-A3B-half':
-            return Qwen3ModelArgs(
-                vocab_size=151936,
-                dim=2048,
-                n_layers=24,
-                n_heads=32,
-                n_kv_heads=4,
-                head_dim=128,
-                hidden_dim=6144,
-                norm_eps=1e-6,
-                qk_norm=True,
-                max_seq_len=262144,
-                rope_theta=1000000.0,
-                enable_weight_tying=False,
-                moe_enabled=True,
-                moe_inter_dim=768,
-                moe_args=MoEArgs(
-                    num_experts=64,
-                    num_shared_experts=0,
-                    top_k=8,
-                    score_func="softmax",
-                    route_norm=True,
-                    route_scale=1.0,
-                    score_before_experts=False,
-                    load_balance_coeff=None,
-                ),
-            )
-        case '72B':
-            return Qwen3ModelArgs(
-                vocab_size=152064,
-                dim=8192,
-                n_layers=4, #80,
-                n_heads=64,
-                n_kv_heads=8,
-                head_dim=128,
-                hidden_dim=29568,
-                norm_eps=1e-5,
-                qk_norm=True,
-                max_seq_len=131072,
-                rope_theta=1000000.0,
-                depth_init=True,
-                enable_weight_tying=False,
-                moe_enabled=False,
-            )
-        case _:
-            raise ValueError(f"Unknown model config: {name}")
+    """Create a Qwen3 model config from the unified preset registry."""
+    try:
+        spec = QWEN3_CONFIG_SPECS[name]
+    except KeyError:
+        raise ValueError(f"Unknown model config: {name}") from None
+
+    if not spec.exact_backbone:
+        warnings.warn(
+            f"{name} uses hybrid linear/full attention; Piper's Qwen3 model "
+            "uses full attention while preserving the checkpoint's model and "
+            "MoE tensor shapes.",
+            stacklevel=2,
+        )
+
+    model_kwargs = dict(
+        vocab_size=spec.vocab_size,
+        dim=spec.dim,
+        n_layers=spec.n_layers,
+        n_heads=spec.n_heads,
+        n_kv_heads=spec.n_kv_heads,
+        head_dim=spec.head_dim,
+        hidden_dim=spec.hidden_dim,
+        norm_eps=spec.norm_eps,
+        qk_norm=spec.qk_norm,
+        max_seq_len=spec.max_seq_len,
+        rope_theta=spec.rope_theta,
+        depth_init=spec.depth_init,
+        enable_weight_tying=spec.enable_weight_tying,
+        moe_enabled=spec.moe_inter_dim is not None,
+    )
+    if spec.moe_inter_dim is not None:
+        model_kwargs.update(
+            moe_inter_dim=spec.moe_inter_dim,
+            moe_args=MoEArgs(
+                num_experts=spec.num_experts,
+                num_shared_experts=spec.num_shared_experts,
+                top_k=spec.top_k,
+                use_grouped_mm=spec.use_grouped_mm,
+                num_expert_groups=None,
+                num_limited_groups=None,
+                score_func=spec.score_func,
+                route_norm=spec.route_norm,
+                route_scale=spec.route_scale,
+                gate_bias=spec.gate_bias,
+                score_before_experts=spec.score_before_experts,
+                load_balance_coeff=spec.load_balance_coeff,
+                _debug_force_load_balance=False,
+            ),
+        )
+    return Qwen3ModelArgs(**model_kwargs)
+
 
 class AnnotatedMoE(MoE):
     def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):

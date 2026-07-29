@@ -289,8 +289,13 @@ class ComputeExecutor:
 
     @staticmethod
     def grad_with_param_layout(weight: Parameter, grad: torch.Tensor) -> torch.Tensor:
+        grad_dtype = (
+            weight.grad_dtype
+            if getattr(weight, "grad_dtype", None) is not None
+            else weight.dtype
+        )
         if (
-            grad.dtype == weight.dtype
+            grad.dtype == grad_dtype
             and grad.device == weight.device
             and grad.layout == weight.layout
             and tuple(grad.stride()) == tuple(weight.stride())
@@ -301,7 +306,7 @@ class ComputeExecutor:
         out = torch.empty_strided(
             tuple(weight.shape),
             tuple(weight.stride()),
-            dtype=weight.dtype,
+            dtype=grad_dtype,
             device=weight.device,
         )
         out.copy_(grad)
@@ -325,8 +330,13 @@ class ComputeExecutor:
             if w.grad is None:
                 w.grad = dw
             else:
+                grad_dtype = (
+                    w.grad_dtype
+                    if getattr(w, "grad_dtype", None) is not None
+                    else w.dtype
+                )
                 if (
-                    w.grad.dtype != w.dtype
+                    w.grad.dtype != grad_dtype
                     or w.grad.device != w.device
                     or w.grad.layout != w.layout
                     or tuple(w.grad.stride()) != tuple(w.stride())
@@ -616,10 +626,10 @@ class DagExecutor:
 
         ``stream_override`` receives ``(node, logical_cuda_stream)`` and must
         return the physical CUDA stream on which that node should execute.  It
-        is called for every node so profiling policies can preserve or replace
-        P2P streams independently from their non-P2P policy.  SEND/RECV still
-        select their existing lo-to-hi or hi-to-lo NCCL process group inside
-        :class:`CommunicationExecutor`.
+        is called for every node so ordinary execution and profiling policies
+        can map P2P directions independently from non-P2P work.  SEND/RECV
+        still select their existing lo-to-hi or hi-to-lo NCCL process group
+        inside :class:`CommunicationExecutor`.
         """
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
@@ -653,9 +663,9 @@ class DagExecutor:
         zero_evt = torch.cuda.Event()
         zero_evt.record(default_stream)
 
-        # An override may return streams not registered in RuntimeState (for
-        # example dedicated directional P2P streams in profiling mode).  Gate
-        # each distinct physical stream on the prologue too.
+        # An override may return streams not registered in RuntimeState.streams
+        # (for example dedicated directional P2P streams). Gate each distinct
+        # physical stream on the prologue too.
         initial_streams = [
             *self.runtime.streams.values(),
             *physical_stream_by_uid.values(),

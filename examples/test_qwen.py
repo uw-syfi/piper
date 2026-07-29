@@ -16,7 +16,7 @@ from src.profiling import ProfileConfig
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
 
-from models.qwen3 import PiperQwen3Model, create_qwen3_config
+from models.qwen3 import PiperQwen3Model, QWEN_MODEL_NAMES, create_qwen3_config
 from torchtitan.models.qwen3.model.model import precompute_rope_cache
 
 logger = create_logger("test_qwen", LOG_LEVEL)
@@ -177,8 +177,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Test JSON-driven Qwen TrainingDAG execution"
     )
-    parser.add_argument('--model', choices=['9M', '1B', '9B', '48B', '30B-A3B', '30-A3B-half', '72B'], default='9M',
-                        help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, 30-A3B-half, or 72B (default: 9M)')
+    parser.add_argument(
+        "--model",
+        choices=QWEN_MODEL_NAMES,
+        default="9M",
+        help="Model configuration (default: 9M)",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=5)
@@ -202,10 +206,9 @@ def parse_args(argv=None):
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Use PP as the outer placement dim (one pipeline stage per node, "
-            "all DP replicas for that stage colocated). Makes per-stage EP/DP "
-            "collectives intra-node at the cost of inter-node PP P2P. "
-            "Default: false (one DP replica per node, PP inner)."
+            "Use PP as the outer placement dim. Each PP rank's DP/EP group is "
+            "kept on one node when possible, or within one GB200 NVLink domain "
+            "when it spans nodes. Default: false (DP/EP outer, PP inner)."
         ),
     )
     parser.add_argument(
@@ -224,7 +227,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--pytorch-profiler-iters",
         type=int,
-        default=3,
+        default=1,
         help="Number of iterations to run under the PyTorch profiler.",
     )
     parser.add_argument(

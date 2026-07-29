@@ -23,6 +23,7 @@ _RELAXABLE_P2P_REASONS = {
     "same_stream_temporal",
     "cross_stream_temporal",
 }
+_P2P_DIRECTIONS = {"pp_lo_hi", "pp_hi_lo"}
 
 
 @dataclass(frozen=True)
@@ -55,26 +56,49 @@ def is_relaxable_p2p_ordering_dependency(
     node: object,
     dependency_reason: str,
 ) -> bool:
-    """Whether profiling/simulation may omit ordering between P2P operations.
+    """Whether execution/simulation may omit ordering between P2P operations.
 
     Schedule lowering can materialize logical ``pp_stream`` order as temporal
-    DAG edges in addition to the execution plan's stream-FIFO dependency.  In
-    profiling, P2P runs on dedicated NCCL streams; retaining either form of
-    serialization across physical streams can create a send/recv progress
-    cycle.  The simulator likewise must not impose a synthetic transaction
-    FIFO when SEND/RECV endpoints are collapsed into rendezvous operations.
-    Only ordering-only reasons are relaxable.  A data dependency (or any
-    future synchronization reason) is always preserved.
+    DAG edges in addition to the execution plan's stream-FIFO dependency.
+    P2P runs on dedicated directional NCCL streams in ordinary execution and
+    profiling; retaining either form of serialization across physical streams
+    can create a send/recv progress cycle.  The simulator likewise must not
+    impose a synthetic transaction FIFO when SEND/RECV endpoints are collapsed
+    into rendezvous operations.  Only ordering-only reasons are relaxable.  A
+    data dependency (or any future synchronization reason) is always preserved.
     """
     if (
         getattr(predecessor, "node_kind", None) not in _P2P_KINDS
         or getattr(node, "node_kind", None) not in _P2P_KINDS
     ):
         return False
+    predecessor_direction = (
+        getattr(predecessor, "node_meta", {}) or {}
+    ).get("comm_group_kind")
+    node_direction = (getattr(node, "node_meta", {}) or {}).get(
+        "comm_group_kind"
+    )
+    if (
+        predecessor_direction not in _P2P_DIRECTIONS
+        or node_direction not in _P2P_DIRECTIONS
+        or predecessor_direction == node_direction
+    ):
+        return False
     reason_components = set(str(dependency_reason).split("+"))
     if not reason_components or not reason_components <= _RELAXABLE_P2P_REASONS:
         return False
     return True
+
+
+def _execution_stream_key(node: object) -> str:
+    """Return the FIFO domain used by the ordinary CUDA executor."""
+    if getattr(node, "node_kind", None) in _P2P_KINDS:
+        direction = (getattr(node, "node_meta", {}) or {}).get(
+            "comm_group_kind"
+        )
+        if direction in _P2P_DIRECTIONS:
+            return str(direction)
+    return str(getattr(node, "stream", None) or "default_stream")
 
 
 def _validated_dispatch_order(
@@ -128,9 +152,9 @@ def build_execution_plan(
     * all backward/reduction completions relevant to an update operation.
 
     Same-stream DAG edges are also retained as reasons.  They are redundant
-    with FIFO for ordinary execution, but distinguish a real DAG constraint
-    from FIFO when profiling deliberately maps the two P2P directions onto
-    separate physical streams.
+    with FIFO when the logical and physical stream assignments match, but
+    distinguish a real DAG constraint from FIFO when the two P2P directions
+    are mapped onto separate physical streams.
     """
     order = _validated_dispatch_order(dag, dispatch_order)
     dispatch_index = {uid: index for index, uid in enumerate(order)}
@@ -141,7 +165,11 @@ def build_execution_plan(
     for edge in dag.edges:
         src = dag.nodes[edge.src_uid]
         dst = dag.nodes[edge.dst_uid]
-        locality = "cross_stream" if src.stream != dst.stream else "same_stream"
+        locality = (
+            "cross_stream"
+            if _execution_stream_key(src) != _execution_stream_key(dst)
+            else "same_stream"
+        )
         incoming_edges[edge.dst_uid].append(
             (edge.src_uid, f"{locality}_{edge.dep_kind}")
         )
@@ -155,7 +183,7 @@ def build_execution_plan(
 
     for index, uid in enumerate(order):
         node = dag.nodes[uid]
-        logical_stream = str(node.stream or "default_stream")
+        logical_stream = _execution_stream_key(node)
         reasons_by_predecessor: dict[str, list[str]] = {}
 
         def add_dependency(predecessor_uid: str | None, reason: str) -> None:

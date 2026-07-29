@@ -213,7 +213,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--pytorch-profiler-iters",
         type=int,
-        default=3,
+        default=1,
         help="Number of iterations to run under the PyTorch profiler.",
     )
     parser.add_argument(

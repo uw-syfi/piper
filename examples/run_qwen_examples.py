@@ -9,8 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from models.qwen3 import QWEN_MODEL_NAMES
 
-QWEN_MODELS = ("9M", "1B", "9B", "48B", "30B-A3B", "30-A3B-half", "72B")
+
+QWEN_MODELS = QWEN_MODEL_NAMES
 
 # name, base schedule, generated schedule, pp ranks, microbatches
 RUNS = (

@@ -599,6 +599,7 @@ def _bucket_matched_fwd_nodes(
         if fwd_uid not in dag.nodes:
             continue
         fwd_node = dag.nodes[fwd_uid]
+        base_bucket_key = fwd_node.node_meta.get("bucket_key", fwd_uid)
         bwd_candidates = sorted(
             uid for uid, node in dag.nodes.items()
             if node.node_kind == "COMPUTE"
@@ -698,6 +699,7 @@ def _bucket_matched_fwd_nodes(
         for bi, (bgm, b_in, b_param, b_args) in enumerate(buckets):
             f_uid = f"{fwd_uid}.bucket{bi}"
             b_uid = f"{f_uid}.bwd"
+            bucket_key = f"{base_bucket_key}.bucket{bi}"
             fwd_bucket_uids.append(f_uid)
             bwd_bucket_uids.append(b_uid)
             dag.add_node(
@@ -720,7 +722,7 @@ def _bucket_matched_fwd_nodes(
                         "a2a_boundary_after": None,
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
-                        "bucket_key": f_uid,
+                        "bucket_key": bucket_key,
                     },
                 )
             )
@@ -736,7 +738,7 @@ def _bucket_matched_fwd_nodes(
                         "fwd_uid": f_uid,
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
-                        "bucket_key": f_uid,
+                        "bucket_key": bucket_key,
                         "compute_loss": bool(bwd_node.node_meta.get("compute_loss", False)) and bi == (len(buckets) - 1),
                     },
                 )
@@ -783,8 +785,15 @@ def _insert_reduce_comm_nodes(
     devices: list[int],
     comm_stream: str | None = None,
 ) -> None:
+    """Insert one all-reduce per bucket after all matched weight backwards."""
     reduce_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "REDUCE_COMM")
     expected = sorted(int(d) for d in devices)
+    if len(expected) <= 1:
+        # A singleton replica group is no-DP. Local autograd still accumulates
+        # gradients across microbatches, but there is nothing to synchronize.
+        return
+
+    candidates: list[TrainingDAGNode] = []
     for node in list(dag.nodes.values()):
         if node.node_kind != "COMPUTE" or not _is_backward_weight_subkind(node.compute_subkind):
             continue
@@ -801,33 +810,80 @@ def _insert_reduce_comm_nodes(
                 f"replicate device mismatch for node {node.uid}: "
                 f"expected devices={devices}, node_devices={node.device}"
             )
+        candidates.append(node)
+
+    by_bucket: dict[Any, list[TrainingDAGNode]] = {}
+    for node in candidates:
+        bucket_key = node.node_meta.get("bucket_key")
+        # Missing bucket metadata cannot safely alias another node.
+        group_key = (
+            ("bucket", bucket_key)
+            if bucket_key is not None
+            else ("uid", node.uid)
+        )
+        by_bucket.setdefault(group_key, []).append(node)
+    reduce_groups = list(by_bucket.values())
+
+    for group in reduce_groups:
+        anchor = group[-1]
+        common_tag_keys = set(anchor.tag)
+        for node in group[:-1]:
+            common_tag_keys.intersection_update(node.tag)
+        reduce_tag = {
+            key: anchor.tag[key]
+            for key in sorted(common_tag_keys)
+            if all(node.tag[key] == anchor.tag[key] for node in group)
+        }
         reduce_uid = f"reduce.{reduce_idx}"
         reduce_idx += 1
+        bucket_key = anchor.node_meta.get("bucket_key")
+        comm_key = (
+            bucket_key
+            if len(group) > 1 and bucket_key is not None
+            else anchor.uid
+        )
         reduce_node = TrainingDAGNode(
             uid=reduce_uid,
             node_kind="REDUCE_COMM",
             compute_subkind=None,
-            tag=dict(node.tag),
-            device=list(node.device),
+            # Drop tags such as MB/PASS that differ among the contributing
+            # backwards. This keeps order directives from assigning the
+            # accumulated collective to one particular microbatch slot.
+            tag=reduce_tag,
+            device=list(anchor.device),
             stream=comm_stream if comm_stream is not None else "default_stream",
             node_meta={
-                "bwd_uid": node.uid,
-                "bucket_key": node.node_meta.get("bucket_key"),
-                "comm_id": f"all_reduce:{node.uid}",
+                "bwd_uid": anchor.uid,
+                "bwd_uids": [node.uid for node in group],
+                "bucket_key": bucket_key,
+                "comm_id": f"all_reduce:{comm_key}",
                 "comm_group_kind": "dp",
-                "participants": sorted(int(rank) for rank in node.device),
+                "participants": sorted(int(rank) for rank in anchor.device),
             },
         )
         dag.add_node(reduce_node)
+        # Keep one data edge for the existing runtime payload/buffer contract.
+        # The remaining dependencies are temporal because the collective reads
+        # accumulated parameter grads, not task-output activation buffers.
         dag.add_edge(
             TrainingDAGEdge(
-                src_uid=node.uid,
+                src_uid=anchor.uid,
                 dst_uid=reduce_uid,
                 dep_kind="data",
                 tensor_name=None,
             )
         )
-        _rewire_bwd_successors_through_sync(dag, node.uid, reduce_uid)
+        for node in group[:-1]:
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=node.uid,
+                    dst_uid=reduce_uid,
+                    dep_kind="temporal",
+                    tensor_name=None,
+                )
+            )
+        for node in group:
+            _rewire_bwd_successors_through_sync(dag, node.uid, reduce_uid)
 
 
 def _node_has_trainable_params(dag: TrainingDAG, node: TrainingDAGNode) -> bool:
@@ -926,8 +982,22 @@ def _insert_reduce_scatter_comm_nodes(
     devices: list[int],
     comm_stream: str | None = None,
 ) -> None:
+    """Insert one reduce-scatter per bucket after all matched backwards.
+
+    Full gradients remain live across all microbatches and each backward adds
+    into the same flat buffer.  The reduce-scatter therefore has the same
+    gradient-accumulation dependency shape as an unsharded all-reduce: one data
+    predecessor preserves the runtime payload contract and every other
+    contributing backward is a temporal predecessor.
+
+    Parameter lifetime is independent of gradient synchronization.  In
+    particular, ``zero_free_full_params_after`` remains on every backward so
+    shard_params=True reshares parameters immediately unless the later ZeRO
+    lifetime-pruning pass proves that a longer full-parameter lifetime is safe.
+    """
     rs_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "REDUCE_SCATTER_COMM")
     expected = sorted(int(d) for d in devices)
+    candidates: list[TrainingDAGNode] = []
     for node in list(dag.nodes.values()):
         if node.node_kind != "COMPUTE" or not _is_backward_weight_subkind(node.compute_subkind):
             continue
@@ -946,36 +1016,74 @@ def _insert_reduce_scatter_comm_nodes(
                 f"replicate device mismatch for node {node.uid}: "
                 f"expected devices={devices}, node_devices={node.device}"
             )
+        candidates.append(node)
+
+    by_bucket: dict[Any, list[TrainingDAGNode]] = {}
+    for node in candidates:
+        bucket_key = node.node_meta.get("bucket_key")
+        group_key = (
+            ("bucket", bucket_key)
+            if bucket_key is not None
+            else ("uid", node.uid)
+        )
+        by_bucket.setdefault(group_key, []).append(node)
+
+    for group in by_bucket.values():
+        anchor = group[-1]
+        common_tag_keys = set(anchor.tag)
+        for node in group[:-1]:
+            common_tag_keys.intersection_update(node.tag)
+        reduce_tag = {
+            key: anchor.tag[key]
+            for key in sorted(common_tag_keys)
+            if all(node.tag[key] == anchor.tag[key] for node in group)
+        }
         rs_uid = f"reduce_scatter.{rs_idx}"
         rs_idx += 1
+        bucket_key = anchor.node_meta.get("bucket_key")
+        comm_key = (
+            bucket_key
+            if len(group) > 1 and bucket_key is not None
+            else anchor.uid
+        )
         rs_node = TrainingDAGNode(
             uid=rs_uid,
             node_kind="REDUCE_SCATTER_COMM",
             compute_subkind=None,
-            tag=dict(node.tag),
-            device=list(node.device),
+            tag=reduce_tag,
+            device=list(anchor.device),
             stream=comm_stream if comm_stream is not None else "default_stream",
             node_meta={
-                "bwd_uid": node.uid,
-                "bucket_key": node.node_meta.get("bucket_key"),
-                "comm_id": f"reduce_scatter:{node.uid}",
+                "bwd_uid": anchor.uid,
+                "bwd_uids": [node.uid for node in group],
+                "bucket_key": bucket_key,
+                "comm_id": f"reduce_scatter:{comm_key}",
                 "comm_group_kind": "dp",
-                "participants": sorted(int(rank) for rank in node.device),
+                "participants": sorted(int(rank) for rank in anchor.device),
             },
         )
-        node.node_meta["zero_alloc_full_grads_before"] = True
-        if node.node_meta.pop("zero_free_full_params_after", None) is not None:
-            rs_node.node_meta["zero_free_full_params_after"] = True
+        for node in group:
+            node.node_meta["zero_alloc_full_grads_before"] = True
         dag.add_node(rs_node)
         dag.add_edge(
             TrainingDAGEdge(
-                src_uid=node.uid,
+                src_uid=anchor.uid,
                 dst_uid=rs_uid,
                 dep_kind="data",
                 tensor_name=None,
             )
         )
-        _rewire_bwd_successors_through_sync(dag, node.uid, rs_uid)
+        for node in group[:-1]:
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=node.uid,
+                    dst_uid=rs_uid,
+                    dep_kind="temporal",
+                    tensor_name=None,
+                )
+            )
+        for node in group:
+            _rewire_bwd_successors_through_sync(dag, node.uid, rs_uid)
 
 
 def _insert_shard_a2a_comm_nodes(
@@ -1054,6 +1162,23 @@ def _insert_shard_a2a_comm_nodes(
         for comm_uid in sorted(removable_comm_uids):
             if comm_uid not in dag.nodes:
                 continue
+            comm_node = dag.nodes[comm_uid]
+            if comm_node.node_kind == "REDUCE_SCATTER_COMM":
+                # A reduce-scatter can represent every microbatch contributing
+                # to one accumulated gradient bucket while only its final
+                # contributor carries the data edge.  Removing that collective
+                # for expert sharding must clear the ZeRO grad-allocation
+                # marker from every contributor, including temporal-only ones.
+                contributor_uids = comm_node.node_meta.get(
+                    "bwd_uids",
+                    [comm_node.node_meta.get("bwd_uid")],
+                )
+                for contributor_uid in contributor_uids:
+                    if contributor_uid in dag.nodes:
+                        dag.nodes[contributor_uid].node_meta.pop(
+                            "zero_alloc_full_grads_before",
+                            None,
+                        )
             # Bypass removed sync-comm nodes so dataflow remains connected:
             # pred -> COMM -> succ  ==>  pred -> succ
             in_comm = [e for e in list(dag.edges) if e.dep_kind == "data" and e.dst_uid == comm_uid]
@@ -1248,7 +1373,12 @@ def _apply_split_directive(
 
     # Tag originals as microbatch 0.
     for uid in matched:
-        dag.nodes[uid].tag[dim_name] = 0
+        node = dag.nodes[uid]
+        node.tag[dim_name] = 0
+        # Split copies of one logical compute bucket must share runtime
+        # parameters and gradient storage even when a synthetic/input DAG did
+        # not provide the builder's usual bucket_key metadata.
+        node.node_meta.setdefault("bucket_key", uid)
 
     # Create copies for microbatches 1..N-1.
     copy_uid: dict[tuple[str, int], str] = {}
@@ -1659,7 +1789,12 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
             elif shard_grads:
                 _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
             else:
-                _insert_reduce_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
+                _insert_reduce_comm_nodes(
+                    training_dag,
+                    filters,
+                    devices,
+                    comm_stream=reduce_stream,
+                )
         elif op == "shard":
             _insert_shard_a2a_comm_nodes(training_dag, filters, devices, comm_stream=stream)
         else:
