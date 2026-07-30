@@ -87,6 +87,13 @@ def test_split_gm_by_annotations_handles_nested_annotation_segments() -> None:
         {"PP": 1},
     ]
     assert [segment.stage_id for segment in segments] == [0, 0, 1]
+    assert segments[0].input_idxs == [0]
+    runtime_placeholder = next(
+        node
+        for node in gm.graph.nodes
+        if node.op == "placeholder" and not node.name.startswith("l_self_")
+    )
+    assert segments[0].placeholders[0].name == runtime_placeholder.name
     assert [segment.a2a_boundary_after["from_tag"] for segment in segments[:-1]] == [
         {"PP": 0},
         {"PP": 0, "EP": 0},

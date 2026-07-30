@@ -397,14 +397,19 @@ def _example_value(node: fx.Node) -> Any:
 
 
 def _placeholder_is_runtime_input(node: fx.Node) -> bool:
+    """Return whether a Dynamo placeholder must be supplied for every run.
+
+    Dynamo marks user inputs with ``grapharg`` metadata too, so that marker
+    cannot distinguish lifted module state from runtime inputs.  Lifted
+    parameters and buffers use the ``l_self_`` prefix; every other tensor
+    placeholder is a user input, including inputs that require gradients.
+    """
     ex = _example_value(node)
     if not isinstance(ex, torch.Tensor):
         return False
     if isinstance(ex, torch.nn.Parameter):
         return False
-    if bool(getattr(ex, "requires_grad", False)):
-        return False
-    if "self" in node.name or "grapharg" in node.meta:
+    if node.name.startswith("l_self_"):
         return False
     return True
 
