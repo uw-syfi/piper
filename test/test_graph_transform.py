@@ -3,8 +3,20 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 
-from src.piper import _reset_annotation_state, annotate
-from src.fx import split_gm_by_annotations
+from src.piper import (
+    _reset_annotation_state,
+    annotate,
+    mark_combine_payload,
+    mark_dispatch_counts,
+    mark_dispatch_payload,
+)
+from src.fx import (
+    EP_COMBINE_PAYLOAD,
+    EP_DISPATCH_COUNTS,
+    EP_DISPATCH_PAYLOAD,
+    PIPER_EP_BOUNDARY_META_KEY,
+    split_gm_by_annotations,
+)
 
 
 class _AnnotatedNet(nn.Module):
@@ -17,13 +29,18 @@ class _AnnotatedNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with annotate("PP"):
             x = torch.relu(self.fc1(x))
+            counts = torch.ones((1,), dtype=torch.int64, device=x.device)
+            x = mark_dispatch_payload(x)
+            counts = mark_dispatch_counts(counts)
             with annotate("EP"):
                 x = torch.relu(self.fc2(x))
+                scale = counts.sum().to(x.dtype) * 0 + 1
+                x = mark_combine_payload(x * scale)
         with annotate("PP"):
             return self.fc3(x)
 
 
-def _capture_gm(model: nn.Module, x: torch.Tensor):
+def _capture_gm(model: nn.Module, *inputs: torch.Tensor):
     captured: dict = {}
 
     def _backend(gm, example_inputs):
@@ -34,7 +51,7 @@ def _capture_gm(model: nn.Module, x: torch.Tensor):
     _reset_annotation_state()
     compiled = torch.compile(model, backend=_backend, fullgraph=True)
     with torch.no_grad():
-        ref = compiled(x).detach().clone()
+        ref = compiled(*inputs).detach().clone()
 
     return captured["gm"], captured["inputs"], ref
 
@@ -122,4 +139,109 @@ def test_split_gm_by_annotations_rejects_mixed_annotated_and_unannotated_compute
     first_compute.meta.pop("custom", None)
 
     with pytest.raises(ValueError, match="without Piper annotations"):
+        split_gm_by_annotations(gm)
+
+
+class _AnnotatedExpertNet(nn.Module):
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        with annotate("PP"):
+            x = x + 1
+            x = mark_dispatch_payload(x)
+            num_tokens_per_expert = mark_dispatch_counts(
+                num_tokens_per_expert
+            )
+            with annotate("EP"):
+                scale = num_tokens_per_expert.sum().to(x.dtype) * 0 + 1
+                x = x * scale
+                x = mark_combine_payload(x)
+        with annotate("PP"):
+            return x - 1
+
+
+def test_split_gm_uses_explicit_ep_tensor_boundaries() -> None:
+    x = torch.randn(8, 4)
+    counts = torch.tensor([1, 3, 2, 2], dtype=torch.int64)
+    gm, example_inputs, ref = _capture_gm(_AnnotatedExpertNet(), x, counts)
+
+    _, segments = split_gm_by_annotations(gm)
+
+    boundary = segments[0].a2a_boundary_after
+    assert boundary is not None
+    assert boundary["routing_counts_idx"] != boundary["tensor_idx"]
+
+    first_output = segments[0].gm(*example_inputs)
+    assert isinstance(first_output, tuple)
+    routed_counts = first_output[boundary["routing_counts_idx"]]
+    assert routed_counts.dtype == torch.int64
+    assert tuple(routed_counts.shape) == (4,)
+
+    result = _run_segments(segments, _placeholder_values(gm, example_inputs))
+    assert torch.allclose(ref, result, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("role", "api_name"),
+    [
+        (EP_DISPATCH_PAYLOAD, "mark_dispatch_payload"),
+        (EP_DISPATCH_COUNTS, "mark_dispatch_counts"),
+        (EP_COMBINE_PAYLOAD, "mark_combine_payload"),
+    ],
+)
+def test_split_gm_requires_each_explicit_ep_tensor_boundary(
+    role: str,
+    api_name: str,
+) -> None:
+    gm, _, _ = _capture_gm(
+        _AnnotatedExpertNet(),
+        torch.randn(8, 4),
+        torch.tensor([1, 3, 2, 2], dtype=torch.int64),
+    )
+    marker = next(
+        node
+        for node in gm.graph.nodes
+        if (node.meta.get("custom") or {}).get(PIPER_EP_BOUNDARY_META_KEY)
+        == role
+    )
+    marker.meta["custom"].pop(PIPER_EP_BOUNDARY_META_KEY)
+
+    with pytest.raises(ValueError, match=api_name):
+        split_gm_by_annotations(gm)
+
+
+class _DuplicateDispatchPayloadNet(_AnnotatedExpertNet):
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        with annotate("PP"):
+            x = x + 1
+            first_payload = mark_dispatch_payload(x)
+            second_payload = mark_dispatch_payload(x)
+            num_tokens_per_expert = mark_dispatch_counts(
+                num_tokens_per_expert
+            )
+            with annotate("EP"):
+                scale = num_tokens_per_expert.sum().to(x.dtype) * 0 + 1
+                x = (first_payload + second_payload) * scale
+                x = mark_combine_payload(x)
+        with annotate("PP"):
+            return x - 1
+
+
+def test_split_gm_rejects_duplicate_ep_tensor_boundary_role() -> None:
+    gm, _, _ = _capture_gm(
+        _DuplicateDispatchPayloadNet(),
+        torch.randn(8, 4),
+        torch.tensor([1, 3, 2, 2], dtype=torch.int64),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"exactly one mark_dispatch_payload\(\.\.\.\) tensor, found 2",
+    ):
         split_gm_by_annotations(gm)

@@ -205,6 +205,29 @@ Then pass the head address to the harness with
 The `tag` is a non-empty string naming a schedulable dimension of the model, such as `PP` for pipeline regions or `EP` for expert regions.
 For each tag name, Piper assigns integer indices in trace order, so repeated `piper.annotate("PP")` scopes become `PP=0`, `PP=1`, and so on.
 
+An `EP` region must explicitly identify the three tensors used by expert
+dispatch and combine:
+
+```python
+from src.piper import (
+    annotate,
+    mark_combine_payload,
+    mark_dispatch_counts,
+    mark_dispatch_payload,
+)
+
+payload = mark_dispatch_payload(payload)
+counts = mark_dispatch_counts(counts)
+with annotate("EP"):
+    expert_output = experts(payload, counts)
+    expert_output = mark_combine_payload(expert_output)
+```
+
+These functions are trace-preserved tensor identities. They let Piper insert
+uneven all-to-all communication without inferring tensor roles from shapes,
+dtypes, or model-specific operator patterns. Each EP region requires exactly
+one marker of each kind.
+
 The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
 For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
 See the blog walkthrough section on [annotating a Qwen3 MoE model](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#annotating-a-qwen3-moe-model) for an example and further details.

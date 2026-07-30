@@ -5,10 +5,18 @@ from dataclasses import dataclass, replace
 from typing import Iterator, Mapping, Sequence
 
 import ray
+import torch
 import torch.fx as fx
 from torch._dynamo.backends.registry import register_backend
 
-from .fx import PIPER_ANNOTATIONS_META_KEY, split_gm_by_annotations
+from .fx import (
+    EP_COMBINE_PAYLOAD,
+    EP_DISPATCH_COUNTS,
+    EP_DISPATCH_PAYLOAD,
+    PIPER_ANNOTATIONS_META_KEY,
+    PIPER_EP_BOUNDARY_META_KEY,
+    split_gm_by_annotations,
+)
 from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
@@ -99,6 +107,29 @@ def annotate(name: str) -> Iterator[dict[str, int]]:
         if popped is not annotation:
             raise RuntimeError("piper.annotate stack corrupted during tracing")
 
+
+def _mark_ep_boundary(tensor: torch.Tensor, role: str) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(
+            f"Piper EP boundary markers require a torch.Tensor, got {type(tensor)!r}"
+        )
+    with fx.traceback.annotate({PIPER_EP_BOUNDARY_META_KEY: role}):
+        return torch.ops.aten.alias.default(tensor)
+
+
+def mark_dispatch_payload(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the routed activation entering a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_DISPATCH_PAYLOAD)
+
+
+def mark_dispatch_counts(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the per-expert token counts entering a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_DISPATCH_COUNTS)
+
+
+def mark_combine_payload(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the expert activation leaving a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_COMBINE_PAYLOAD)
 
 
 def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[TrainingDAG]:

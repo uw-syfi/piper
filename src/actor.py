@@ -526,7 +526,16 @@ class PiperActor:
             if self.use_inductor:
                 compiled_gms = []
                 for subgraph_idx, gm in enumerate(gms):
-                    compiled_gm = torch.compile(gm)
+                    is_expert = bool(bd.get("is_expert"))
+                    # EP changes the token dimension entering the expert
+                    # segment. Compile that segment dynamically from its
+                    # first invocation, matching TorchTitan's expert compiler
+                    # wrapper and avoiding one specialization per routing load.
+                    compiled_gm = torch.compile(
+                        gm,
+                        fullgraph=is_expert,
+                        dynamic=True if is_expert else None,
+                    )
                     compiled_gms.append(compiled_gm)
                     self.logger.debug(
                         f"[load_stage_compile] rank={self.runtime.global_rank} stage={stage_id} "
@@ -763,6 +772,7 @@ class PiperActor:
 
         # Clear any prior module state before loading a new training DAG.
         self.stages.clear_loaded_modules()
+        self.dag_executor.expert_a2a_states.clear()
 
         stage_to_modules: dict[int, list[dict]] = defaultdict(list)
 
@@ -821,6 +831,7 @@ class PiperActor:
                 "ac_num_subgraphs": 1,
                 "ac_requested_subgraphs": 1,
                 "apply_zero": bool(meta.get("apply_zero", True)),
+                "is_expert": "EP" in getattr(node, "tag", {}),
                 "training_dag_uid": getattr(node, "uid", None),
                 "triton_constant_args": dict(meta.get("triton_constant_args", {})),
             }
