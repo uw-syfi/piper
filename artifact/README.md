@@ -75,7 +75,6 @@ If containers are already running, omit `--aws-start-containers`. AWS mode uses
 python artifact/e2e_eval.py --dry-run
 python artifact/e2e_eval.py --backend local --sweeps local --local-cuda-visible-devices 0
 python artifact/e2e_eval.py --backend local --sweeps local --local-torchtitan-assets-path /path/to/assets/hf
-python artifact/e2e_eval.py --backend local --sweeps local --no-torchtitan-use-bmm-experts
 python artifact/e2e_eval.py --backend local --sweeps local --piper-use-inductor --torchtitan-compile
 python artifact/e2e_eval.py --systems piper torchtitan --sweeps schedule
 python artifact/e2e_eval.py --sweeps zero --bucket-size-mb 25

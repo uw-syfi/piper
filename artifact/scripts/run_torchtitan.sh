@@ -10,7 +10,6 @@ MODULE=qwen3
 CONFIG=qwen3_9b
 LOG_RANK=0
 NSIGHT=false
-USE_BMM_EXPERTS=false
 TRAIN_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -24,7 +23,6 @@ while [[ $# -gt 0 ]]; do
         --config) CONFIG="$2"; shift 2 ;;
         --log-rank) LOG_RANK="$2"; shift 2 ;;
         --nsight) NSIGHT=true; shift ;;
-        --use-bmm-experts) USE_BMM_EXPERTS=true; shift ;;
         --) shift; TRAIN_ARGS=("$@"); break ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -53,8 +51,6 @@ fi
 
 cd /workspace/torchtitan
 exec conda run -n torchtitan env \
-    PYTHONPATH="/workspace/artifact:${PYTHONPATH:-}" \
-    TORCHTITAN_USE_BMM_EXPERTS="$($USE_BMM_EXPERTS && echo 1 || echo 0)" \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
     TORCHFT_LIGHTHOUSE=http://localhost:29510 \
     NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}" \

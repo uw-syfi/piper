@@ -11,10 +11,10 @@ their device release.
 
 The synthetic compute kernels use the public Qwen3.5-397B tensor dimensions:
 D=4096, routed expert width=1024, 512 experts, top-k=10.  They intentionally do
-not instantiate Piper's padded BmmExperts proxy.  The expert backward instead
-uses production-style packed gate/up and down batched matmuls, compiled through
-TorchInductor.  Attention-projection profiles include the production hybrid
-backbone's exact Gated-DeltaNet and gated-full-attention projection shapes.  A
+not instantiate the full training model. The expert backward instead uses
+production-style packed gate/up and down batched matmuls, compiled through
+TorchInductor. Attention-projection profiles include the production hybrid
+backbone's exact Gated-DeltaNet and gated-full-attention projection shapes. A
 legacy ``linear_projection`` profile keeps the fused QKV+Z stress surrogate
 used by the first experiment set and labels it as a surrogate in its metadata.
 """

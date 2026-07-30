@@ -5,12 +5,16 @@ from typing import Optional
 import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from examples.models.qwen3_bmm_experts_patch import BmmExperts
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
 from torchtitan.models.qwen3.model.model import TransformerBlock
 from torchtitan.models.moe import MoE, MoEArgs
 from torchtitan.protocols.model import AttentionMasksType
-from src.piper import annotate
+from src.piper import (
+    annotate,
+    mark_combine_payload,
+    mark_dispatch_counts,
+    mark_dispatch_payload,
+)
 
 PP_TAG = "PP"
 EP_TAG = "EP"
@@ -335,13 +339,6 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
 
 
 class AnnotatedMoE(MoE):
-    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
-        super().__init__(moe_args, dim=dim, hidden_dim=hidden_dim)
-        # Replace the grouped-mm (Triton) experts with a batched-matmul variant.
-        self.experts = BmmExperts(
-            dim=dim, hidden_dim=hidden_dim, num_experts=moe_args.num_experts
-        )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
@@ -351,6 +348,11 @@ class AnnotatedMoE(MoE):
             selected_experts_indices,
             num_tokens_per_expert,
         ) = self.router(x, self.expert_bias)
+
+        # Match TorchTitan's default MoE bookkeeping. This count is distinct
+        # from the reordered count vector consumed by GroupedExperts below.
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
 
         (
             top_scores_experts_sorted,
@@ -367,9 +369,13 @@ class AnnotatedMoE(MoE):
                 * top_scores_experts_sorted.reshape(-1, 1)
             ).to(x.dtype)
 
+        routed_input = mark_dispatch_payload(routed_input)
+        num_tokens_per_expert = mark_dispatch_counts(num_tokens_per_expert)
+
         # expert component
         with annotate(EP_TAG):
             gathered_output = self.experts(routed_input, num_tokens_per_expert)
+            gathered_output = mark_combine_payload(gathered_output)
 
         gathered_output = gathered_output.reshape(-1, dim)
         out = self.shared_experts(x) if self.shared_experts is not None else None

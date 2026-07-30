@@ -12,6 +12,20 @@ from .state import create_logger, LOG_LEVEL
 
 logger = create_logger("fx", LOG_LEVEL)
 PIPER_ANNOTATIONS_META_KEY = "piper_annotations"
+PIPER_EP_BOUNDARY_META_KEY = "piper_ep_boundary"
+EP_DISPATCH_PAYLOAD = "dispatch_payload"
+EP_DISPATCH_COUNTS = "dispatch_counts"
+EP_COMBINE_PAYLOAD = "combine_payload"
+_EP_BOUNDARY_ROLES = frozenset({
+    EP_DISPATCH_PAYLOAD,
+    EP_DISPATCH_COUNTS,
+    EP_COMBINE_PAYLOAD,
+})
+_EP_BOUNDARY_APIS = {
+    EP_DISPATCH_PAYLOAD: "mark_dispatch_payload",
+    EP_DISPATCH_COUNTS: "mark_dispatch_counts",
+    EP_COMBINE_PAYLOAD: "mark_combine_payload",
+}
 
 
 def _encode_arg(a):
@@ -483,24 +497,173 @@ def _tag_from_stack(stack: tuple[dict[str, int], ...]) -> dict[str, int]:
     return tag
 
 
-def _select_boundary_tensor_idx(nodes: list[fx.Node]) -> int | None:
-    best_idx = None
-    best_score = -1
+def _ep_boundary_role(node: fx.Node) -> str | None:
+    custom = node.meta.get("custom")
+    if not isinstance(custom, dict):
+        return None
+    role = custom.get(PIPER_EP_BOUNDARY_META_KEY)
+    if role is None:
+        return None
+    if role not in _EP_BOUNDARY_ROLES:
+        raise ValueError(
+            f"FX node {node.name!r} has invalid Piper EP boundary role {role!r}"
+        )
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.aten.alias.default
+    ):
+        raise ValueError(
+            f"Piper EP boundary role {role!r} must annotate an aten.alias node; "
+            f"got node {node.name!r} with op={node.op!r}, target={node.target!r}"
+        )
+    return role
+
+
+def _require_ep_boundary_roles(
+    nodes: list[fx.Node],
+    required_roles: tuple[str, ...],
+    *,
+    from_tag: dict[str, int],
+    to_tag: dict[str, int],
+) -> dict[str, int]:
+    marked: dict[str, list[tuple[int, str]]] = {}
     for idx, node in enumerate(nodes):
-        ex = _example_value(node)
-        if not isinstance(ex, torch.Tensor):
-            continue
-        score = 1
-        if ex.is_floating_point():
-            score += 2
-        if bool(getattr(ex, "requires_grad", False)):
-            score += 1
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-    if best_idx is not None:
-        return best_idx
-    return 0 if nodes else None
+        role = _ep_boundary_role(node)
+        if role is not None:
+            marked.setdefault(role, []).append((idx, node.name))
+
+    expected = set(required_roles)
+    unexpected = {
+        role: [name for _, name in entries]
+        for role, entries in marked.items()
+        if role not in expected
+    }
+    if unexpected:
+        raise ValueError(
+            f"EP boundary {from_tag}->{to_tag} has marker roles in the wrong "
+            f"location: {unexpected}"
+        )
+
+    indices: dict[str, int] = {}
+    for role in required_roles:
+        matches = marked.get(role, [])
+        if len(matches) != 1:
+            raise ValueError(
+                f"EP boundary {from_tag}->{to_tag} requires exactly one "
+                f"{_EP_BOUNDARY_APIS[role]}(...) tensor, found {len(matches)}"
+            )
+        indices[role] = matches[0][0]
+    return indices
+
+
+def _externalize_torchtitan_expert_dispatch(
+    gm: fx.GraphModule,
+    *,
+    routed_input_idx: int,
+    routing_counts_idx: int,
+) -> None:
+    """Make a split expert graph consume TorchTitan-dispatched tensors.
+
+    The unsharded model capture includes ``indices_padding_wrapper`` inside
+    ``GroupedExperts``. TorchTitan EP normally disables that wrapper because
+    ``ExpertParallel._token_dispatch`` has already permuted and padded the
+    local expert groups. Piper keeps dispatch as an explicit DAG node, so
+    remove the captured duplicate wrapper and leave the default grouped GEMM.
+
+    This is the split-graph equivalent of TorchTitan's DTensor EP branch:
+    counts drive grouped-MM offsets directly and the expert result flows
+    directly to the external combine node.
+    """
+
+    graph = gm.graph
+    placeholders = [node for node in graph.nodes if node.op == "placeholder"]
+    if (
+        routed_input_idx >= len(placeholders)
+        or routing_counts_idx >= len(placeholders)
+    ):
+        raise ValueError(
+            "EP boundary indices do not match expert graph placeholders: "
+            f"routed_input_idx={routed_input_idx}, "
+            f"routing_counts_idx={routing_counts_idx}, "
+            f"num_placeholders={len(placeholders)}"
+        )
+
+    routed_input = placeholders[routed_input_idx]
+    routing_counts = placeholders[routing_counts_idx]
+    grouped_mms = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target is torch._grouped_mm
+    ]
+    if not grouped_mms:
+        # The optional for-loop implementation has no grouped-mm padding path.
+        return
+    if len(grouped_mms) != 3:
+        raise ValueError(
+            "Expected TorchTitan SwiGLU experts to contain three grouped MM "
+            f"operations, found {len(grouped_mms)}"
+        )
+
+    offsets = grouped_mms[0].kwargs.get("offs")
+    input_cast = grouped_mms[0].args[0]
+    if (
+        not isinstance(offsets, fx.Node)
+        or offsets.op != "call_function"
+        or offsets.target is not torch.cumsum
+        or not isinstance(input_cast, fx.Node)
+        or input_cast.op != "call_method"
+        or not input_cast.args
+        or not isinstance(input_cast.args[0], fx.Node)
+    ):
+        raise ValueError("Unrecognized TorchTitan grouped-expert FX graph")
+
+    padded_input = input_cast.args[0]
+    padded_input.replace_all_uses_with(routed_input)
+    offsets.args = (routing_counts, *offsets.args[1:])
+
+    final_grouped_mm = grouped_mms[-1]
+    expert_outputs = [
+        user
+        for user in final_grouped_mm.users
+        if user.op == "call_method" and user.target == "type_as"
+    ]
+    combine_markers = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.aten.alias.default
+        and _ep_boundary_role(node) == EP_COMBINE_PAYLOAD
+    ]
+    if (
+        len(expert_outputs) != 1
+        or len(combine_markers) != 1
+        or not combine_markers[0].args
+        or not isinstance(combine_markers[0].args[0], fx.Node)
+    ):
+        raise ValueError(
+            "Could not connect TorchTitan grouped-expert output to "
+            "mark_combine_payload: "
+            f"grouped={len(expert_outputs)}, markers={len(combine_markers)}"
+        )
+    marked_output = combine_markers[0].args[0]
+    marked_output.replace_all_uses_with(expert_outputs[0])
+
+    # The captured Triton mutation is intentionally gone: the external
+    # dispatcher runs TorchTitan's generate_permute_indices kernel in its own
+    # strict compiled frame.
+    for node in list(graph.nodes):
+        if (
+            node.op == "call_function"
+            and (
+                "triton_kernel_wrapper_mutation" in str(node.target)
+                or node.target is operator.setitem
+                or node.target is torch._C._set_grad_enabled
+            )
+        ):
+            graph.erase_node(node)
+    graph.eliminate_dead_code()
+    graph.lint()
+    gm.recompile()
 
 
 def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
@@ -522,6 +685,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         stack = _validate_and_get_annotation_stack(node)
         if node in compute_nodes:
             node_stacks[node] = stack
+            _ep_boundary_role(node)
 
     annotated_compute = [node for node in compute_nodes if node_stacks.get(node)]
     if not annotated_compute:
@@ -673,13 +837,43 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         else:
             out_nodes = [remap[node] for node in seg_cross_in[seg + 1]]
             sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
+            from_tag = _tag_from_stack(segment_stacks[seg])
+            to_tag = _tag_from_stack(segment_stacks[seg + 1])
             boundary_after = {
-                "tensor_idx": _select_boundary_tensor_idx(seg_cross_in[seg + 1]),
                 "reshape_input": None,
                 "reshape_output": None,
-                "from_tag": _tag_from_stack(segment_stacks[seg]),
-                "to_tag": _tag_from_stack(segment_stacks[seg + 1]),
+                "from_tag": from_tag,
+                "to_tag": to_tag,
             }
+            enters_ep = "EP" not in from_tag and "EP" in to_tag
+            exits_ep = "EP" in from_tag and "EP" not in to_tag
+            crossing_nodes = seg_cross_in[seg + 1]
+            if enters_ep:
+                indices = _require_ep_boundary_roles(
+                    crossing_nodes,
+                    (EP_DISPATCH_PAYLOAD, EP_DISPATCH_COUNTS),
+                    from_tag=from_tag,
+                    to_tag=to_tag,
+                )
+                boundary_after["tensor_idx"] = indices[EP_DISPATCH_PAYLOAD]
+                boundary_after["routing_counts_idx"] = indices[
+                    EP_DISPATCH_COUNTS
+                ]
+            elif exits_ep:
+                indices = _require_ep_boundary_roles(
+                    crossing_nodes,
+                    (EP_COMBINE_PAYLOAD,),
+                    from_tag=from_tag,
+                    to_tag=to_tag,
+                )
+                boundary_after["tensor_idx"] = indices[EP_COMBINE_PAYLOAD]
+            else:
+                _require_ep_boundary_roles(
+                    crossing_nodes,
+                    (),
+                    from_tag=from_tag,
+                    to_tag=to_tag,
+                )
 
         sub_g.lint()
         seg_gm = fx.GraphModule(gm, sub_g)
@@ -697,6 +891,25 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 placeholders=placeholders,
                 a2a_boundary_after=boundary_after,
             )
+        )
+
+    for seg, segment in enumerate(segments):
+        if "EP" not in segment.tag:
+            continue
+        if seg == 0 or seg == len(segments) - 1:
+            raise ValueError(
+                f"EP segment {segment.tag} must have both dispatch and combine "
+                "boundaries"
+            )
+        incoming = segments[seg - 1].a2a_boundary_after
+        if not isinstance(incoming, dict):
+            raise ValueError(f"EP segment {segment.tag} is missing its dispatch boundary")
+        routed_input_idx = incoming["tensor_idx"]
+        routing_counts_idx = incoming["routing_counts_idx"]
+        _externalize_torchtitan_expert_dispatch(
+            segment.gm,
+            routed_input_idx=int(routed_input_idx),
+            routing_counts_idx=int(routing_counts_idx),
         )
 
     return gm, segments

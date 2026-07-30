@@ -1127,6 +1127,51 @@ def _insert_shard_a2a_comm_nodes(
             )
         return binfo
 
+    def _expert_fwd_uid(compute_node: TrainingDAGNode) -> str:
+        if compute_node.compute_subkind == "FWD":
+            return compute_node.uid
+        fwd_uid = compute_node.node_meta.get("fwd_uid")
+        if not isinstance(fwd_uid, str):
+            raise ValueError(
+                f"Expert backward node {compute_node.uid} is missing fwd_uid"
+            )
+        return fwd_uid
+
+    # Routed A2A is the expert-parallel contract. The forward incoming edge
+    # supplies token counts; the outgoing and backward nodes reuse the
+    # dispatch state keyed by the expert forward node.
+    routing_counts_by_fwd_uid: dict[str, int] = {}
+    for matched_uid in matched_uids:
+        matched_node = dag.nodes[matched_uid]
+        if matched_node.compute_subkind != "FWD":
+            continue
+        routing_count_indices: list[int] = []
+        for edge in list(dag.edges):
+            if edge.dep_kind != "data" or edge.dst_uid != matched_uid:
+                continue
+            src_node = dag.nodes[edge.src_uid]
+            if src_node.node_kind != "COMPUTE" or src_node.compute_subkind != "FWD":
+                continue
+            boundary_info = src_node.node_meta.get("a2a_boundary_after")
+            if (
+                isinstance(boundary_info, dict)
+                and boundary_info.get("routing_counts_idx") is not None
+            ):
+                routing_count_indices.append(
+                    int(boundary_info["routing_counts_idx"])
+                )
+        if len(routing_count_indices) > 1:
+            raise ValueError(
+                f"Expert node {matched_uid} has multiple routing-count "
+                f"boundaries: {routing_count_indices}"
+            )
+        if not routing_count_indices:
+            raise ValueError(
+                f"Expert node {matched_uid} requires a routing-count tensor on "
+                "its incoming A2A boundary"
+            )
+        routing_counts_by_fwd_uid[matched_uid] = routing_count_indices[0]
+
     for uid in matched_uids:
         if uid not in dag.nodes:
             continue
@@ -1258,8 +1303,23 @@ def _insert_shard_a2a_comm_nodes(
             src_node = dag.nodes[e.src_uid]
             binfo = _a2a_boundary_for_edge(src_node, node)
             a2a_tensor_idx = binfo["tensor_idx"]
+            expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = f"a2a.{a2a_idx}"
             a2a_idx += 1
+            comm_meta = {
+                "direction": "incoming",
+                "target_uid": uid,
+                "expert_fwd_uid": expert_fwd_uid,
+                "a2a_tensor_idx": a2a_tensor_idx,
+                "bucket_key": node.node_meta.get("bucket_key", src_node.node_meta.get("bucket_key")),
+                "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
+                "comm_group_kind": "ep",
+                "participants": sorted(int(rank) for rank in node.device),
+            }
+            if node.compute_subkind == "FWD":
+                comm_meta["routing_counts_idx"] = routing_counts_by_fwd_uid[
+                    expert_fwd_uid
+                ]
             comm_node = TrainingDAGNode(
                 uid=comm_uid,
                 node_kind="A2A_COMM",
@@ -1267,15 +1327,7 @@ def _insert_shard_a2a_comm_nodes(
                 tag=dict(node.tag),
                 device=list(node.device) if node.device is not None else None,
                 stream=comm_stream if comm_stream is not None else "default_stream",
-                node_meta={
-                    "direction": "incoming",
-                    "target_uid": uid,
-                    "a2a_tensor_idx": a2a_tensor_idx,
-                    "bucket_key": node.node_meta.get("bucket_key", src_node.node_meta.get("bucket_key")),
-                    "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
-                    "comm_group_kind": "ep",
-                    "participants": sorted(int(rank) for rank in node.device),
-                },
+                node_meta=comm_meta,
             )
             dag.add_node(comm_node)
             _remove_edge(dag, e)
@@ -1286,6 +1338,7 @@ def _insert_shard_a2a_comm_nodes(
             dst_node = dag.nodes[e.dst_uid]
             binfo = _a2a_boundary_for_edge(node, dst_node)
             a2a_tensor_idx = binfo["tensor_idx"]
+            expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = f"a2a.{a2a_idx}"
             a2a_idx += 1
             comm_node = TrainingDAGNode(
@@ -1298,6 +1351,7 @@ def _insert_shard_a2a_comm_nodes(
                 node_meta={
                     "direction": "outgoing",
                     "source_uid": uid,
+                    "expert_fwd_uid": expert_fwd_uid,
                     "a2a_tensor_idx": a2a_tensor_idx,
                     "bucket_key": node.node_meta.get("bucket_key", dst_node.node_meta.get("bucket_key")),
                     "comm_id": f"a2a:{uid}->{e.dst_uid}:{a2a_tensor_idx}",
