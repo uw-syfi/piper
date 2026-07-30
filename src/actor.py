@@ -1,7 +1,6 @@
 import ray
 import torch
 import os
-import re
 from typing import Any
 import gc
 from datetime import timedelta
@@ -16,6 +15,12 @@ from .state import (
     LOG_LEVEL,
 )
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
+from .model_state import (
+    DEFAULT_MODEL_SEED,
+    dynamo_buffer_name_to_state_dict_key,
+    dynamo_parameter_name_to_state_dict_key,
+    initialize_parameter_,
+)
 from .executors import CommunicationExecutor, ComputeExecutor, DagExecutor
 from .ordering import _serial_topological_order
 from .profiling import (
@@ -126,6 +131,7 @@ def _create_actors(
     temp_dir: str = None,
     use_inductor: bool = False,
     pp_outer: bool = False,
+    model_seed: int = DEFAULT_MODEL_SEED,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -199,6 +205,7 @@ def _create_actors(
             pp_degree=pp_degree,
             no_nvtx=no_nvtx,
             use_inductor=use_inductor,
+            model_seed=model_seed,
         )
         piper_metadata.actors[pp_rank] = actor
 
@@ -215,6 +222,7 @@ class PiperActor:
         pp_degree=1,
         no_nvtx: bool = False,
         use_inductor: bool = False,
+        model_seed: int = DEFAULT_MODEL_SEED,
     ):
         self.logger = create_logger("actor", LOG_LEVEL)
 
@@ -225,6 +233,7 @@ class PiperActor:
 
         self.optim_class = optim_class
         self.use_inductor = bool(use_inductor)
+        self.model_seed = int(model_seed)
         if self.use_inductor:
             _disable_functorch_donated_buffers()
         self.runtime = RuntimeState(
@@ -347,6 +356,86 @@ class PiperActor:
         the actor's device so ``_load_stage`` can copy them directly.
         """
         self.model_const_attrs = {k: v.to(self.runtime.device) for k, v in const_attrs.items()}
+
+    def export_model_parameter_state(self) -> dict[str, torch.Tensor]:
+        """Return this actor's current eager-compatible parameter state.
+
+        ZeRO-3 parameters are reconstructed collectively from the shards held
+        by the same PP rank in every DP replica. All DP workers must therefore
+        invoke this method in the same bucket order.
+        """
+        self.params.drain_pending_frees()
+        torch.cuda.synchronize()
+        state: dict[str, torch.Tensor] = {}
+        stream = self.runtime.default_stream()
+
+        for ubid, bucket in sorted(
+            self.stages.buckets.items(), key=lambda item: str(item[0])
+        ):
+            name_by_arg_idx = dict(zip(bucket.param_idxs, bucket.param_names))
+            if ubid in self.stages.param_sharded_ubids:
+                shard_param = bucket.shard_param
+                shard_info = bucket.param_shard_info
+                if shard_param is None or shard_info is None:
+                    raise RuntimeError(
+                        f"cannot export sharded parameters for bucket {ubid}: "
+                        "missing shard storage metadata"
+                    )
+                _shard_start, shard_size, orig_numel = shard_info
+                gathered = torch.empty(
+                    shard_size * self.runtime.dp_degree,
+                    dtype=shard_param.dtype,
+                    device=shard_param.device,
+                )
+                with torch.cuda.stream(stream):
+                    dist.all_gather_into_tensor(
+                        gathered, shard_param, group=self.runtime.dp_group
+                    )
+                stream.synchronize()
+                for arg_idx, (_param, offset, numel, shape) in zip(
+                    bucket.trainable_param_idxs, bucket.param_view_specs
+                ):
+                    if offset + numel > orig_numel:
+                        raise RuntimeError(
+                            f"parameter slice exceeds unpadded bucket {ubid}: "
+                            f"offset={offset} numel={numel} orig_numel={orig_numel}"
+                        )
+                    value = gathered[offset : offset + numel].view(shape)
+                    self._add_exported_parameter(
+                        state, name_by_arg_idx.get(arg_idx), value
+                    )
+                continue
+
+            for arg_idx in bucket.trainable_param_idxs:
+                value = bucket.forward_args[arg_idx]
+                if value is None:
+                    raise RuntimeError(
+                        f"cannot export parameter index {arg_idx} in bucket {ubid}: "
+                        "parameter storage is missing"
+                    )
+                self._add_exported_parameter(
+                    state, name_by_arg_idx.get(arg_idx), value
+                )
+
+        torch.cuda.synchronize()
+        return state
+
+    @staticmethod
+    def _add_exported_parameter(
+        state: dict[str, torch.Tensor],
+        dynamo_name: str | None,
+        value: torch.Tensor,
+    ) -> None:
+        if dynamo_name is None:
+            raise RuntimeError("parameter bucket is missing its Dynamo placeholder name")
+        state_key = dynamo_parameter_name_to_state_dict_key(dynamo_name)
+        if state_key is None:
+            raise RuntimeError(
+                f"cannot translate Dynamo parameter placeholder {dynamo_name!r}"
+            )
+        if state_key in state:
+            raise RuntimeError(f"duplicate exported model parameter {state_key!r}")
+        state[state_key] = value.detach().cpu().clone()
 
     def get_node_ip_and_free_port(self):
         import socket
@@ -510,9 +599,6 @@ class PiperActor:
             f"Loading stage {stage_id} ({len(modules_data)} module(s)) on actor {self.runtime.global_rank}"
         )
 
-        g = torch.Generator(device=self.runtime.device)
-        g.manual_seed(1000 * self.runtime.global_rank + stage_id)
-
         first_gm = None
 
         for b_idx, bd in enumerate(modules_data):
@@ -570,15 +656,34 @@ class PiperActor:
                     continue
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 if arg.requires_grad:
+                    ph_name = (
+                        shared_placeholder_names[i]
+                        if i < len(shared_placeholder_names)
+                        else ""
+                    )
+                    state_key = dynamo_parameter_name_to_state_dict_key(ph_name)
+                    if state_key is None:
+                        raise RuntimeError(
+                            "cannot deterministically initialize trainable "
+                            f"placeholder {ph_name!r}: unsupported Dynamo name"
+                        )
+                    initialize_parameter_(
+                        t,
+                        state_key,
+                        self.model_seed,
+                    )
                     t.requires_grad_(True)
-                    torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
-                    # Non-trainable slot: try to fill from const attrs (freqs_cis, mask, …)
-                    # before falling back to zeros.  Dynamo names direct model attrs as
-                    # "l_self_<attr_name>", so strip that prefix to get the bare name.
-                    ph_name = shared_placeholder_names[i] if i < len(shared_placeholder_names) else ""
-                    attr_name = re.sub(r'^l_self_', '', ph_name)
-                    const_val = self.model_const_attrs.get(attr_name)
+                    # Non-trainable slot: fill lifted model buffers (freqs_cis,
+                    # rope_cache, mask, ...) from the eager value supplied by
+                    # piper_setup before falling back to zeros.
+                    ph_name = (
+                        shared_placeholder_names[i]
+                        if i < len(shared_placeholder_names)
+                        else ""
+                    )
+                    buffer_key = dynamo_buffer_name_to_state_dict_key(ph_name)
+                    const_val = self.model_const_attrs.get(buffer_key)
                     if (
                         const_val is not None
                         and tuple(const_val.shape) == tuple(arg.shape)
