@@ -51,6 +51,49 @@ def test_backward_input_events_waits_for_recv_all_gather_and_a2a() -> None:
     assert events.a2a == {}
 
 
+def test_split_backward_input_consumes_local_downstream_grads() -> None:
+    local_pred = SimpleNamespace(uid="local_bwd", task_type=TaskType.BWD_I)
+    node = SimpleNamespace(data_preds=[local_pred])
+    output_a = torch.randn(2, 3, requires_grad=True)
+    output_b = torch.randn(2, 3, requires_grad=True)
+    detached_a = output_a.detach().requires_grad_(True)
+    nondifferentiable = torch.ones(2, dtype=torch.int64)
+    detached_b = output_b.detach().requires_grad_(True)
+    grad_a = torch.randn_like(output_a)
+    grad_b = torch.randn_like(output_b)
+    buffers = SimpleNamespace(
+        task={
+            local_pred.uid: {
+                "inp_grads": [grad_a, None, grad_b],
+            }
+        },
+        release=Mock(),
+    )
+    executor = DagExecutor(
+        runtime=None,
+        stages=None,
+        buffers=buffers,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+    )
+
+    outputs, output_grads = executor._consume_local_backward_output_grads(
+        node,
+        {"detached_outs": [detached_a, nondifferentiable, detached_b]},
+        [output_a, output_b],
+    )
+
+    assert outputs[0] is output_a
+    assert outputs[1] is output_b
+    assert output_grads is not None
+    assert output_grads[0] is grad_a
+    assert output_grads[1] is grad_b
+    buffers.release.assert_called_once_with(local_pred.uid)
+
+
 def test_update_steps_sharded_and_regular_optimizers(monkeypatch) -> None:
     stream = Mock()
     all_reduce_evt = object()

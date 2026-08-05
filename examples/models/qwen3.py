@@ -419,7 +419,15 @@ class AnnotatedMoE(MoE):
 
         # shape (bs*slen*top_k, dim)
         routed_input = x[token_indices_experts_sorted // self.router.top_k]
-
+        routed_expert_indices = selected_experts_indices.reshape(-1)[
+            token_indices_experts_sorted
+        ]
+        # Carry expert IDs through Piper's tensor all-to-all. Base-256 digits
+        # remain exact in bfloat16 for the largest Qwen presets in this file.
+        expert_id_low = torch.remainder(routed_expert_indices, 256)
+        expert_id_high = torch.div(
+            routed_expert_indices, 256, rounding_mode="floor"
+        )
         if self.score_before_experts:
             routed_input = (
                 routed_input.to(torch.float32)

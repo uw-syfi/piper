@@ -602,6 +602,46 @@ class DagExecutor:
 
         return recv_pred, a2a_pred
 
+    def _consume_local_backward_output_grads(
+        self,
+        node: Any,
+        fwd_out: dict,
+        stage_outputs: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+        """Consume gradients from a downstream compute node on this actor."""
+        local_bwd_pred = next(
+            (
+                pred
+                for pred in node.data_preds
+                if pred.task_type in (TaskType.BWD, TaskType.BWD_I)
+            ),
+            None,
+        )
+        if local_bwd_pred is None:
+            return stage_outputs, None
+
+        local_buf = self.buffers.task[local_bwd_pred.uid]
+        detached_outs = fwd_out["detached_outs"]
+        output_grads_full = [
+            local_buf["inp_grads"][i]
+            for i, tensor in enumerate(detached_outs)
+            if (
+                tensor is not None
+                and isinstance(tensor, torch.Tensor)
+                and tensor.requires_grad
+            )
+        ]
+        pairs = [
+            (output, grad)
+            for output, grad in zip(stage_outputs, output_grads_full)
+            if grad is not None
+        ]
+        self.buffers.release(local_bwd_pred.uid)
+        return (
+            [output for output, _grad in pairs],
+            [grad for _output, grad in pairs],
+        )
+
     def _all_to_all_ep_boundary(
         self,
         node: Any,
@@ -884,6 +924,7 @@ class DagExecutor:
                 stream.wait_event(zero_evt)
         completion_events: dict[str, torch.cuda.Event] = {}
         completion_streams: dict[str, torch.cuda.Stream] = {}
+        update_result = None
 
         self.buffers.init_refcounts(dag)
 
@@ -1113,7 +1154,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
-                            outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], labels)
+                            outputs_or_loss = [loss]
+                            loss_buffer.append(loss.detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -1203,7 +1246,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
-                            stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], labels)
+                            stage_outputs_or_loss = [loss]
+                            loss_buffer.append(loss.detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
@@ -1235,6 +1280,20 @@ class DagExecutor:
                         stage_outputs_or_loss = [p[0] for p in pairs]
                         output_grads = [p[1] for p in pairs]
                         self.buffers.release(bwd_a2a_pred.uid)
+                    elif (
+                        not self._node_meta(node).get("compute_loss", False)
+                        and recv_pred is None
+                    ):
+                        (
+                            stage_outputs_or_loss,
+                            local_output_grads,
+                        ) = self._consume_local_backward_output_grads(
+                            node,
+                            fwd_out,
+                            stage_outputs_or_loss,
+                        )
+                        if local_output_grads is not None:
+                            output_grads = local_output_grads
 
                     input_values = fwd_out.get("inp_with_grad") or []
                     weights = self.stages.bucket(ubid).weights()
@@ -1297,7 +1356,7 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(
+                    update_result = self._update(
                         node_stream,
                         loss_buffer,
                         wait_for_dependencies=False,
@@ -1322,6 +1381,7 @@ class DagExecutor:
             # per-node sync can deadlock rendezvous communication.
             torch.cuda.synchronize()
             timing_recorder.finish()
+        return update_result
 
     def _update(
         self,
@@ -1354,7 +1414,7 @@ class DagExecutor:
             with torch.cuda.stream(stream):
                 bucket.optimizer.step()
 
-        losses = loss_buffer
+        losses = list(loss_buffer)
         loss_buffer.clear()
 
         if synchronize:
