@@ -557,6 +557,30 @@ class ParamStorage:
                 shard_optim.step()
             shard_param.grad = None
 
+        # ZeRO-2 keeps full parameter storage resident but optimizes only the
+        # local shard. Rebuild every full buffer from the newly updated shards
+        # before the next forward. Without this gather, each replica would use
+        # stale values for all shards owned by its peers.
+        zero2_ubids = (
+            self.stages.grad_sharded_ubids - self.stages.param_sharded_ubids
+        )
+        for ubid in sorted(zero2_ubids, key=str):
+            bucket = self.stages.bucket(ubid)
+            if bucket.shard_optimizer is None:
+                continue
+            flat_params = bucket.flat_params
+            shard_param = bucket.shard_param
+            if flat_params is None or shard_param is None:
+                raise RuntimeError(
+                    f"ZeRO-2 bucket {ubid} is missing full or sharded parameters"
+                )
+            with torch.cuda.stream(stream):
+                gathered = torch.empty_like(flat_params)
+                dist.all_gather_into_tensor(
+                    gathered, shard_param, group=self.runtime.dp_group
+                )
+                flat_params.copy_(gathered)
+
         for ubid in self.stages.param_sharded_ubids:
             bucket = self.stages.bucket(ubid)
             for param, *_ in bucket.param_view_specs:
