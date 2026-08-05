@@ -9,6 +9,7 @@ from src.compile import piper_setup
 from src.piper import (
     piper_exec_dag,
     piper_measure_dags,
+    piper_measure_profile_modes,
     piper_profile_dags,
     simulate_profiled_modes,
 )
@@ -117,6 +118,22 @@ def main(args, pg):
 
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
     metrics["peak_memory_samples_by_rank"] = peak_memory_samples_by_rank
+
+    if args.measure_profile_modes_only:
+        mode_samples = piper_measure_profile_modes(
+            loss_fn,
+            warmup_iters=args.profile_warmup_iters,
+            repeat_iters=args.profile_iters,
+            block_iters=args.profile_mode_block_iters,
+            profile_modes=("interference_free", "normal"),
+        )
+        metrics["uninstrumented_normal_step_time_samples_s"] = [
+            sample / 1_000_000.0 for sample in mode_samples["normal"]
+        ]
+        metrics["uninstrumented_interference_free_step_time_samples_s"] = [
+            sample / 1_000_000.0
+            for sample in mode_samples["interference_free"]
+        ]
 
     if args.profile_and_simulate:
         profile_config = ProfileConfig(
@@ -239,6 +256,15 @@ def parse_args(argv=None):
     )
     parser.add_argument("--profile-warmup-iters", type=int, default=5)
     parser.add_argument("--profile-iters", type=int, default=30)
+    parser.add_argument(
+        "--measure-profile-modes-only",
+        action="store_true",
+        help=(
+            "Measure normal and interference-free stream policies without "
+            "per-node CUDA-event instrumentation."
+        ),
+    )
+    parser.add_argument("--profile-mode-block-iters", type=int, default=1)
     parser.add_argument("--step-time-profile-output", default="")
     return parser.parse_args(argv)
 
@@ -271,10 +297,51 @@ def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
     metrics["predicted_interference_reduction_pct"] = (
         comparison.predicted_interference_reduction_pct
     )
+    metrics["dependency_replay_interference_reduction_pct"] = (
+        comparison.dependency_replay_interference_reduction_pct
+    )
+    metrics["instrumented_policy_reduction_pct"] = (
+        comparison.instrumented_policy_reduction_pct
+    )
     metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
+    metrics["mode_profile_event_overhead_pct"] = (
+        comparison.mode_profile_event_overhead_pct
+    )
+    metrics["observed_interference_reduction_pct"] = (
+        comparison.observed_interference_reduction_pct
+    )
+    metrics["envelope_modeled_interference_reduction_pct"] = (
+        comparison.envelope_modeled_interference_reduction_pct
+    )
+    metrics["normal_dependency_replay_excess_pct"] = (
+        comparison.normal_dependency_replay_excess_pct
+    )
+    metrics["observed_normal_envelope_step_time_samples_s"] = [
+        sample / 1_000_000.0
+        for sample in comparison.observed_normal_envelope_samples_us
+    ]
+    if comparison.instrumented_normal_replay_error is not None:
+        metrics["instrumented_normal_replay_error_pct"] = (
+            comparison.instrumented_normal_replay_error.signed_pct
+        )
+    if comparison.instrumented_interference_free_replay_error is not None:
+        metrics["instrumented_interference_free_replay_error_pct"] = (
+            comparison.instrumented_interference_free_replay_error.signed_pct
+        )
     instrumented = plan.profile_metadata.get(
         "instrumented_global_step_samples_us_by_mode", {}
     ).get("normal", ())
     metrics["instrumented_normal_profile_step_time_samples_s"] = [
         float(sample) / 1_000_000.0 for sample in instrumented
+    ]
+    uninstrumented = plan.profile_metadata.get(
+        "uninstrumented_global_step_samples_us_by_mode", {}
+    )
+    metrics["uninstrumented_normal_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0
+        for sample in uninstrumented.get("normal", ())
+    ]
+    metrics["uninstrumented_interference_free_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0
+        for sample in uninstrumented.get("interference_free", ())
     ]
