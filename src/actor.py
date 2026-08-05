@@ -2,6 +2,7 @@ import ray
 import torch
 import os
 import re
+import time
 from typing import Any
 import gc
 from datetime import timedelta
@@ -43,7 +44,12 @@ logger = create_logger("actor", LOG_LEVEL)
 class _CudaEventTimingRecorder:
     """Collect one CUDA-event sample for every dispatched DAG node."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        coordinator_clock_offset_ns: int = 0,
+        clock_sync_uncertainty_ns: int = 0,
+    ) -> None:
         self._node_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         self._active_node_starts: dict[str, torch.cuda.Event] = {}
         self._prologue_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
@@ -51,6 +57,10 @@ class _CudaEventTimingRecorder:
         self.node_samples_us: dict[str, float] = {}
         self.node_start_offsets_us: dict[str, float] = {}
         self.prologue_sample_us: float | None = None
+        self.timeline_origin_us: float | None = None
+        self.timeline_origin_uncertainty_us: float | None = None
+        self._coordinator_clock_offset_ns = int(coordinator_clock_offset_ns)
+        self._clock_sync_uncertainty_ns = int(clock_sync_uncertainty_ns)
 
     @staticmethod
     def _event() -> torch.cuda.Event:
@@ -58,7 +68,21 @@ class _CudaEventTimingRecorder:
 
     def before_prologue(self, stream: torch.cuda.Stream) -> None:
         start = self._event()
+        host_before_ns = time.monotonic_ns()
         start.record(stream)
+        # Profiling starts from an idle device.  Synchronizing this one anchor
+        # event maps the actor-local CUDA timeline to the coordinator's
+        # calibrated monotonic clock without synchronizing any timed node.
+        start.synchronize()
+        host_after_ns = time.monotonic_ns()
+        host_midpoint_ns = (host_before_ns + host_after_ns) // 2
+        self.timeline_origin_us = (
+            host_midpoint_ns + self._coordinator_clock_offset_ns
+        ) / 1000.0
+        self.timeline_origin_uncertainty_us = (
+            (host_after_ns - host_before_ns) / 2.0
+            + self._clock_sync_uncertainty_ns
+        ) / 1000.0
         self._prologue_start = start
 
     def after_prologue(self, stream: torch.cuda.Stream) -> None:
@@ -152,6 +176,8 @@ def _create_actors(
                 "CPLUS_INCLUDE_PATH",
                 "LIBRARY_PATH",
                 "TRITON_CACHE_DIR",
+                "PYTORCH_ALLOC_CONF",
+                "PYTORCH_CUDA_ALLOC_CONF",
                 "NCCL_CUMEM_ENABLE",
                 "NCCL_DEBUG",
                 "NCCL_DEBUG_FILE",
@@ -259,6 +285,12 @@ class PiperActor:
             str, dict[str, list[float]]
         ] = {}
         self._profile_prologue_samples: dict[str, list[float]] = {}
+        self._profile_timeline_origins_us: dict[str, list[float]] = {}
+        self._profile_timeline_origin_uncertainties_us: dict[
+            str, list[float]
+        ] = {}
+        self._profile_coordinator_clock_offset_ns = 0
+        self._profile_clock_sync_uncertainty_ns = 0
 
         self.buffers = BufferStore()
         self.events = EventStore()
@@ -925,11 +957,43 @@ class PiperActor:
 
         mode = normalize_profile_mode(profile_mode)
         self._profile_node_samples[mode] = defaultdict(list)
-        if mode == "normal":
-            self._profile_node_start_offsets[mode] = defaultdict(list)
-        else:
-            self._profile_node_start_offsets.pop(mode, None)
+        self._profile_node_start_offsets[mode] = defaultdict(list)
         self._profile_prologue_samples[mode] = []
+        self._profile_timeline_origins_us[mode] = []
+        self._profile_timeline_origin_uncertainties_us[mode] = []
+
+    def calibrate_profile_clock(self, clock_actor: Any, samples: int = 9) -> dict:
+        """Calibrate this actor's monotonic clock to one Ray coordinator.
+
+        This is the standard midpoint/round-trip estimator used by NTP.  The
+        minimum-RTT exchange minimizes queueing asymmetry; half its RTT is
+        retained as a conservative alignment uncertainty.
+        """
+
+        if int(samples) <= 0:
+            raise ValueError("clock calibration requires at least one sample")
+        candidates: list[tuple[int, int]] = []
+        for _ in range(int(samples)):
+            local_before_ns = time.monotonic_ns()
+            coordinator_ns = int(ray.get(clock_actor.monotonic_time_ns.remote()))
+            local_after_ns = time.monotonic_ns()
+            round_trip_ns = local_after_ns - local_before_ns
+            local_midpoint_ns = (local_before_ns + local_after_ns) // 2
+            candidates.append(
+                (round_trip_ns, coordinator_ns - local_midpoint_ns)
+            )
+        best_round_trip_ns, best_offset_ns = min(candidates)
+        self._profile_coordinator_clock_offset_ns = best_offset_ns
+        self._profile_clock_sync_uncertainty_ns = (
+            best_round_trip_ns + 1
+        ) // 2
+        return {
+            "method": "ray_ntp_midpoint_min_rtt",
+            "samples": int(samples),
+            "coordinator_clock_offset_ns": int(best_offset_ns),
+            "round_trip_ns": int(best_round_trip_ns),
+            "uncertainty_ns": int(self._profile_clock_sync_uncertainty_ns),
+        }
 
     def _profile_stream_override(
         self,
@@ -949,6 +1013,8 @@ class PiperActor:
         loss_fn=None,
         *,
         record: bool = True,
+        synchronize_before: bool = True,
+        synchronize: bool = False,
         profile_mode: str = "interference_free",
     ) -> None:
         """Run one timed iteration using interference-free or normal streams.
@@ -963,8 +1029,20 @@ class PiperActor:
             raise RuntimeError(
                 f"{mode} profiling cannot run while torch.profiler is active"
             )
-        torch.cuda.synchronize(self.runtime.device)
-        recorder = _CudaEventTimingRecorder() if record else None
+        if synchronize_before:
+            torch.cuda.synchronize(self.runtime.device)
+        recorder = (
+            _CudaEventTimingRecorder(
+                coordinator_clock_offset_ns=getattr(
+                    self, "_profile_coordinator_clock_offset_ns", 0
+                ),
+                clock_sync_uncertainty_ns=getattr(
+                    self, "_profile_clock_sync_uncertainty_ns", 0
+                ),
+            )
+            if record
+            else None
+        )
         self._execute_dag(
             loss_fn=loss_fn,
             stream_override=lambda node, logical_stream: self._profile_stream_override(
@@ -976,6 +1054,8 @@ class PiperActor:
             iteration_label=f"profile_{mode}_iter",
         )
         if recorder is None:
+            if synchronize:
+                torch.cuda.synchronize(self.runtime.device)
             return
         missing = set(self.dag.nodes) - set(recorder.node_samples_us)
         if missing:
@@ -985,16 +1065,49 @@ class PiperActor:
         node_samples = self._profile_node_samples.setdefault(mode, defaultdict(list))
         for uid, sample_us in recorder.node_samples_us.items():
             node_samples[uid].append(sample_us)
-        if mode == "normal":
-            node_start_offsets = self._profile_node_start_offsets.setdefault(
-                mode, defaultdict(list)
+        node_start_offsets = self._profile_node_start_offsets.setdefault(
+            mode, defaultdict(list)
+        )
+        for uid, offset_us in recorder.node_start_offsets_us.items():
+            node_start_offsets[uid].append(offset_us)
+        timeline_origins = getattr(
+            self, "_profile_timeline_origins_us", None
+        )
+        if timeline_origins is None:
+            timeline_origins = {}
+            self._profile_timeline_origins_us = timeline_origins
+        timeline_uncertainties = getattr(
+            self, "_profile_timeline_origin_uncertainties_us", None
+        )
+        if timeline_uncertainties is None:
+            timeline_uncertainties = {}
+            self._profile_timeline_origin_uncertainties_us = timeline_uncertainties
+        if getattr(recorder, "timeline_origin_us", None) is not None:
+            timeline_origins.setdefault(mode, []).append(
+                recorder.timeline_origin_us
             )
-            for uid, offset_us in recorder.node_start_offsets_us.items():
-                node_start_offsets[uid].append(offset_us)
+            timeline_uncertainties.setdefault(mode, []).append(
+                float(
+                    getattr(recorder, "timeline_origin_uncertainty_us", 0.0)
+                    or 0.0
+                )
+            )
         if recorder.prologue_sample_us is not None:
             self._profile_prologue_samples.setdefault(mode, []).append(
                 recorder.prologue_sample_us
             )
+
+    def synchronize_device(self) -> None:
+        """Wait for all work on this actor's CUDA device."""
+
+        torch.cuda.synchronize(self.runtime.device)
+
+    def clear_profile_allocator_cache(self) -> None:
+        """Release unused cached blocks before a recorded profile series."""
+
+        torch.cuda.synchronize(self.runtime.device)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def get_profile_result(
         self,
@@ -1068,4 +1181,14 @@ class PiperActor:
             },
             node_profiles=node_profiles,
             prologue_profile=prologue_profile,
+            timeline_origin_samples_us=tuple(
+                getattr(self, "_profile_timeline_origins_us", {}).get(mode, ())
+            ),
+            timeline_origin_uncertainty_samples_us=tuple(
+                getattr(
+                    self,
+                    "_profile_timeline_origin_uncertainties_us",
+                    {},
+                ).get(mode, ())
+            ),
         )

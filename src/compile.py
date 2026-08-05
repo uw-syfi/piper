@@ -59,6 +59,11 @@ class _CompiledDataStore:
     def get_training_dag_data(self) -> dict:
         return self._training_dag_data
 
+    def monotonic_time_ns(self) -> int:
+        """Return the coordinator's monotonic clock for actor calibration."""
+
+        return time.monotonic_ns()
+
     def begin_profile_generation(self) -> int:
         """Start a fresh distributed profile collection and return its id."""
         self._profile_generation += 1

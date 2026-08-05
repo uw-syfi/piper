@@ -169,11 +169,68 @@ _QWEN35_397B = Qwen3ConfigSpec(
     exact_backbone=False,
 )
 
+# Synthetic H100 NVLink workload whose aggregate training expert GEMMs and
+# dispatch/combine A2A payloads have approximately equal roofline times.  The
+# depth-scaled variants preserve that per-layer ratio exactly.
+_QWEN3_COMM_1TO1 = Qwen3ConfigSpec(
+    vocab_size=4096,
+    dim=256,
+    n_layers=4,
+    n_heads=8,
+    n_kv_heads=4,
+    head_dim=32,
+    hidden_dim=512,
+    max_seq_len=8192,
+    rope_theta=1_000_000.0,
+    moe_inter_dim=864,
+    num_experts=8,
+    top_k=8,
+    route_norm=False,
+    load_balance_coeff=None,
+)
+
 # Synthetic development presets and non-quantized checkpoints from Qwen's
 # official model collections all use this one registry and construction path.
 # Quantized releases reuse these same architecture shapes and are not separate
 # presets.
 QWEN3_CONFIG_SPECS = {
+    "comm-1to1-L4": _QWEN3_COMM_1TO1,
+    # Preserve Qwen3-30B-A3B's architecture and change only the routed expert
+    # width from 768 to the H100-NVLink 1:1 roofline width of 864.  The local
+    # proxy uses eight layers; the other variants bracket H100 capacity.
+    "Qwen3-30B-A3B-comm1to1-L8": replace(
+        _QWEN3_30B, moe_inter_dim=864
+    ),
+    "Qwen3-30B-A3B-comm1to1-L20": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=20
+    ),
+    "Qwen3-30B-A3B-comm1to1-L22": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=22
+    ),
+    "Qwen3-30B-A3B-comm1to1-L23": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=23
+    ),
+    "Qwen3-30B-A3B-comm1to1-L24": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=24
+    ),
+    # Empirically calibrated from the normal PyTorch trace: the roofline width
+    # of 864 measured about 0.645:1 for the full expert region, so use the
+    # aligned width round(864 / 0.645) = 1344 and re-bracket capacity.
+    "Qwen3-30B-A3B-empirical1to1-L4": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=4
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L12": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=12
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L15": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=15
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L16": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=16
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L17": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=17
+    ),
     "9M": Qwen3ConfigSpec(
         vocab_size=2048,
         dim=256,
@@ -182,7 +239,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=4,
         head_dim=32,
         hidden_dim=512,
-        max_seq_len=2048,
+        max_seq_len=393216,
         rope_theta=1_000_000.0,
         moe_inter_dim=128,
         num_experts=8,
@@ -197,7 +254,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=8,
         head_dim=64,
         hidden_dim=3584,
-        max_seq_len=2048,
+        max_seq_len=32768,
         rope_theta=1_000_000.0,
         moe_inter_dim=3584,
         num_experts=4,
@@ -212,7 +269,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=8,
         head_dim=64,
         hidden_dim=7168,
-        max_seq_len=2048,
+        max_seq_len=8192,
         rope_theta=1_000_000.0,
         moe_inter_dim=7168,
         num_experts=8,
