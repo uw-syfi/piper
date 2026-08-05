@@ -382,8 +382,6 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
         ]
         if args.nsight:
             command.append("--nsight")
-        if args.torchtitan_use_bmm_experts:
-            command.append("--use-bmm-experts")
         command.extend(["--", *tt_args])
         return command
 
@@ -957,7 +955,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--piper-iteration-sleep", type=float, default=0.0)
     parser.add_argument("--piper-use-inductor", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torchtitan-compile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torchtitan-use-bmm-experts", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--piper-ray-port", type=int, default=6379)
     parser.add_argument("--baseline-steps", type=int, default=8)
     parser.add_argument("--max-log-ranks", type=int, default=8)

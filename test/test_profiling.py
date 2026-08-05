@@ -193,6 +193,40 @@ def test_merge_actor_profiles_keeps_interference_free_and_normal_datasets() -> N
     assert plan.config_for_mode("normal").repeat_iters == 2
 
 
+def test_merge_actor_profiles_aligns_cuda_offsets_across_actor_clocks() -> None:
+    dag = _two_node_dag(device=[0, 2])
+    fingerprint = finalized_dag_fingerprint(dag)
+
+    def _result(rank: int, origin_us: float) -> ActorProfileResult:
+        return ActorProfileResult(
+            graph_fingerprint=fingerprint,
+            global_rank=rank,
+            pp_rank=0,
+            profile_mode=NORMAL_PROFILE_MODE,
+            node_profiles={
+                "a": NodeProfile.from_samples(
+                    (3.0,), start_offset_samples_us=(5.0,)
+                ),
+                "b": NodeProfile.from_samples(
+                    (4.0,), start_offset_samples_us=(9.0,)
+                ),
+            },
+            timeline_origin_samples_us=(origin_us,),
+            timeline_origin_uncertainty_samples_us=(2.0,),
+        )
+
+    plan = merge_actor_profiles(
+        [dag], [_result(0, 1000.0), _result(2, 1012.0)]
+    )
+
+    profiles = get_node_profile_times(dag.nodes["a"], NORMAL_PROFILE_MODE)
+    assert profiles[0].start_offset_samples_us == pytest.approx((5.0,))
+    assert profiles[2].start_offset_samples_us == pytest.approx((17.0,))
+    alignment = plan.profile_metadata["timeline_alignment"]
+    assert alignment["method"] == "ray_ntp_midpoint_plus_cuda_anchor"
+    assert alignment["modes"][NORMAL_PROFILE_MODE]["max_origin_uncertainty_us"] == 2.0
+
+
 def test_merge_actor_profiles_fails_closed_on_missing_node_or_fingerprint() -> None:
     dag = _two_node_dag()
     with pytest.raises(ValueError, match="node coverage mismatch"):

@@ -152,3 +152,72 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
     assert grad.dtype == torch.float32
     weight.grad = grad
+
+
+def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
+    def fake_permute(tensor, counts, ep_degree, num_local_experts):
+        assert ep_degree == 1
+        assert num_local_experts == counts.numel()
+        return (
+            tensor.shape,
+            tensor + 1,
+            torch.arange(tensor.shape[0]),
+            counts + 2,
+        )
+
+    monkeypatch.setattr(executors, "_permute", fake_permute)
+    monkeypatch.setattr(
+        executors,
+        "_unpermute",
+        lambda tensor, _shape, _indices: tensor + 3,
+    )
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+
+    executor = DagExecutor(
+        runtime=SimpleNamespace(ep_group="ep", global_rank=3),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=Mock(),
+        compute=None,
+        logger=None,
+    )
+    incoming = SimpleNamespace(
+        uid="incoming",
+        task_type=TaskType.FWD_A2A,
+        node_meta={
+            "direction": "incoming",
+            "expert_fwd_uid": "expert",
+            "participants": [3],
+        },
+    )
+    outgoing = SimpleNamespace(
+        uid="outgoing",
+        task_type=TaskType.FWD_A2A,
+        node_meta={
+            "direction": "outgoing",
+            "expert_fwd_uid": "expert",
+            "participants": [3],
+        },
+    )
+    tensor = torch.ones(4, 2)
+    counts = torch.tensor([1, 1, 1, 1])
+
+    dispatched, local_counts = executor._all_to_all_ep_boundary(
+        incoming,
+        tensor,
+        stream=object(),
+        routing_counts=counts,
+    )
+    combined = executor._all_to_all_ep_boundary(
+        outgoing,
+        dispatched,
+        stream=object(),
+    )
+
+    assert torch.equal(dispatched, tensor + 1)
+    assert torch.equal(local_counts, counts + 2)
+    assert torch.equal(combined, tensor + 4)
+    state = executor.expert_a2a_states["expert"]
+    assert (state.ep_rank, state.ep_degree) == (0, 1)

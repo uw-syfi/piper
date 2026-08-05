@@ -5,10 +5,18 @@ from dataclasses import dataclass, replace
 from typing import Iterator, Mapping, Sequence
 
 import ray
+import torch
 import torch.fx as fx
 from torch._dynamo.backends.registry import register_backend
 
-from .fx import PIPER_ANNOTATIONS_META_KEY, split_gm_by_annotations
+from .fx import (
+    EP_COMBINE_PAYLOAD,
+    EP_DISPATCH_COUNTS,
+    EP_DISPATCH_PAYLOAD,
+    PIPER_ANNOTATIONS_META_KEY,
+    PIPER_EP_BOUNDARY_META_KEY,
+    split_gm_by_annotations,
+)
 from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
@@ -99,6 +107,29 @@ def annotate(name: str) -> Iterator[dict[str, int]]:
         if popped is not annotation:
             raise RuntimeError("piper.annotate stack corrupted during tracing")
 
+
+def _mark_ep_boundary(tensor: torch.Tensor, role: str) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(
+            f"Piper EP boundary markers require a torch.Tensor, got {type(tensor)!r}"
+        )
+    with fx.traceback.annotate({PIPER_EP_BOUNDARY_META_KEY: role}):
+        return torch.ops.aten.alias.default(tensor)
+
+
+def mark_dispatch_payload(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the routed activation entering a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_DISPATCH_PAYLOAD)
+
+
+def mark_dispatch_counts(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the per-expert token counts entering a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_DISPATCH_COUNTS)
+
+
+def mark_combine_payload(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark the expert activation leaving a Piper EP region."""
+    return _mark_ep_boundary(tensor, EP_COMBINE_PAYLOAD)
 
 
 def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[TrainingDAG]:
@@ -337,6 +368,7 @@ def piper_profile_dags(
     profile_modes: Sequence[str] | None = None,
     profile_configs: Mapping[str, ProfileConfig] | None = None,
     output_path: str | None = None,
+    measure_uninstrumented_modes: bool = False,
 ) -> ProfiledTrainingPlan:
     """Collect and merge one or more timing modes across every actor.
 
@@ -399,6 +431,12 @@ def piper_profile_dags(
     local_step_samples_us: dict[str, list[float]] = {}
     for mode in requested_modes:
         mode_config = configs[mode]
+        # Give every actor a mapping to the same coordinator-owned monotonic
+        # clock before collecting CUDA timeline origins for this mode.
+        ray.get([
+            actor.calibrate_profile_clock.remote(store)
+            for actor in actors.values()
+        ])
         ray.get([
             actor.reset_profile_samples.remote(profile_mode=mode)
             for actor in actors.values()
@@ -412,6 +450,14 @@ def piper_profile_dags(
                 )
                 for actor in actors.values()
             ])
+
+        # Memory-tight workloads can leave large, fragmented cached regions
+        # after warmup.  Release only unused blocks before starting the timed
+        # series; this call is outside every measured interval.
+        ray.get([
+            actor.clear_profile_allocator_cache.remote()
+            for actor in actors.values()
+        ])
 
         step_samples_us: list[float] = []
         for _ in range(mode_config.repeat_iters):
@@ -437,6 +483,61 @@ def piper_profile_dags(
             ])
         )
 
+    # CUDA events around every node perturb launch timing and can materially
+    # change overlap.  When requested, measure the two stream policies again
+    # without per-node events.  Alternate their order on every sample so
+    # allocator/cache drift is balanced instead of being attributed to one
+    # mode.  Actor-side synchronization makes each driver wall sample cover
+    # the work just launched rather than the preceding asynchronous step.
+    local_uninstrumented_step_samples_us: dict[str, list[float]] = {}
+    if measure_uninstrumented_modes:
+        local_uninstrumented_step_samples_us = {
+            mode: [] for mode in requested_modes
+        }
+        max_warmups = max(configs[mode].warmup_iters for mode in requested_modes)
+        for warmup_index in range(max_warmups):
+            order = (
+                requested_modes
+                if warmup_index % 2 == 0
+                else tuple(reversed(requested_modes))
+            )
+            for mode in order:
+                if warmup_index >= configs[mode].warmup_iters:
+                    continue
+                ray.get([
+                    actor.profile_run_dag.remote(
+                        loss_fn=loss_fn,
+                        record=False,
+                        synchronize=True,
+                        profile_mode=mode,
+                    )
+                    for actor in actors.values()
+                ])
+
+        max_repeats = max(configs[mode].repeat_iters for mode in requested_modes)
+        for sample_index in range(max_repeats):
+            order = (
+                requested_modes
+                if sample_index % 2 == 0
+                else tuple(reversed(requested_modes))
+            )
+            for mode in order:
+                if sample_index >= configs[mode].repeat_iters:
+                    continue
+                started = time.perf_counter()
+                ray.get([
+                    actor.profile_run_dag.remote(
+                        loss_fn=loss_fn,
+                        record=False,
+                        synchronize=True,
+                        profile_mode=mode,
+                    )
+                    for actor in actors.values()
+                ])
+                local_uninstrumented_step_samples_us[mode].append(
+                    (time.perf_counter() - started) * 1_000_000.0
+                )
+
     ray.get(
         store.publish_profile_shard.remote(
             generation,
@@ -444,6 +545,9 @@ def piper_profile_dags(
             {
                 "results": local_results,
                 "step_samples_us": local_step_samples_us,
+                "uninstrumented_step_samples_us": (
+                    local_uninstrumented_step_samples_us
+                ),
             },
         )
     )
@@ -494,10 +598,114 @@ def piper_profile_dags(
         ]
         for mode, per_dp in step_samples_by_mode_by_dp.items()
     }
+    if measure_uninstrumented_modes:
+        uninstrumented_by_mode_by_dp = {
+            mode: {
+                str(shard_rank): list(
+                    shards[shard_rank]["uninstrumented_step_samples_us"][mode]
+                )
+                for shard_rank in sorted(shards)
+            }
+            for mode in requested_modes
+        }
+        plan.profile_metadata[
+            "uninstrumented_step_samples_us_by_mode_by_dp"
+        ] = uninstrumented_by_mode_by_dp
+        plan.profile_metadata[
+            "uninstrumented_global_step_samples_us_by_mode"
+        ] = {
+            mode: [
+                max(
+                    float(per_dp[str(dp)][sample_index])
+                    for dp in sorted(shards)
+                )
+                for sample_index in range(
+                    min(len(per_dp[str(dp)]) for dp in sorted(shards))
+                )
+            ]
+            for mode, per_dp in uninstrumented_by_mode_by_dp.items()
+        }
     piper_metadata.profiled_training_plan = plan
     if output_path is not None and dp_rank == 0:
         plan.save_json(output_path)
     return plan
+
+
+def piper_measure_profile_modes(
+    loss_fn,
+    *,
+    warmup_iters: int,
+    repeat_iters: int,
+    block_iters: int = 1,
+    profile_modes: Sequence[str] = (
+        INTERFERENCE_FREE_PROFILE_MODE,
+        NORMAL_PROFILE_MODE,
+    ),
+) -> dict[str, tuple[float, ...]]:
+    """Measure stream policies without per-node CUDA-event instrumentation.
+
+    Every DP worker must call this function with the same modes and iteration
+    counts.  Mode order alternates so temporal/cache drift is balanced.  Each
+    returned sample is local driver wall time in microseconds; callers combine
+    aligned DP samples with a maximum to obtain global step time.
+    """
+
+    if int(warmup_iters) < 0:
+        raise ValueError("warmup_iters must be non-negative")
+    if int(repeat_iters) <= 0:
+        raise ValueError("repeat_iters must be positive")
+    if int(block_iters) <= 0:
+        raise ValueError("block_iters must be positive")
+    modes = tuple(normalize_profile_mode(mode) for mode in profile_modes)
+    if not modes or len(set(modes)) != len(modes):
+        raise ValueError(f"invalid profile modes: {modes!r}")
+    actors = piper_metadata.actors
+    if not actors:
+        raise RuntimeError("piper_setup() must create actors before mode timing")
+
+    for mode in modes:
+        ray.get([actor.synchronize_device.remote() for actor in actors.values()])
+        for _ in range(int(warmup_iters)):
+            ray.get([
+                actor.profile_run_dag.remote(
+                    loss_fn=loss_fn,
+                    record=False,
+                    synchronize_before=False,
+                    synchronize=False,
+                    profile_mode=mode,
+                )
+                for actor in actors.values()
+            ])
+        ray.get([actor.synchronize_device.remote() for actor in actors.values()])
+
+    samples: dict[str, list[float]] = {mode: [] for mode in modes}
+    for iteration in range(int(repeat_iters)):
+        order = modes if iteration % 2 == 0 else tuple(reversed(modes))
+        for mode in order:
+            ray.get([
+                actor.synchronize_device.remote() for actor in actors.values()
+            ])
+            started = time.perf_counter()
+            for _ in range(int(block_iters)):
+                ray.get([
+                    actor.profile_run_dag.remote(
+                        loss_fn=loss_fn,
+                        record=False,
+                        synchronize_before=False,
+                        synchronize=False,
+                        profile_mode=mode,
+                    )
+                    for actor in actors.values()
+                ])
+            ray.get([
+                actor.synchronize_device.remote() for actor in actors.values()
+            ])
+            samples[mode].append(
+                (time.perf_counter() - started)
+                * 1_000_000.0
+                / int(block_iters)
+            )
+    return {mode: tuple(values) for mode, values in samples.items()}
 
 
 def simulate_profiled_dags(
