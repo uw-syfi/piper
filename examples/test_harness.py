@@ -51,6 +51,8 @@ _RAY_FORWARDED_ENV_VARS = (
     "CPLUS_INCLUDE_PATH",
     "LIBRARY_PATH",
     "TRITON_CACHE_DIR",
+    "PYTORCH_ALLOC_CONF",
+    "PYTORCH_CUDA_ALLOC_CONF",
     "NCCL_CUMEM_ENABLE",
     "NCCL_DEBUG",
     "NCCL_DEBUG_FILE",
@@ -140,6 +142,20 @@ def main() -> None:
         help="Profile and simulate both normal and interference-free step times.",
     )
     parser.add_argument(
+        "--measure-profile-modes-only",
+        action="store_true",
+        help=(
+            "Measure normal and interference-free stream policies without "
+            "per-node CUDA-event instrumentation."
+        ),
+    )
+    parser.add_argument(
+        "--profile-mode-block-iters",
+        type=int,
+        default=1,
+        help="Consecutive steps per uninstrumented timing block.",
+    )
+    parser.add_argument(
         "--profile-warmup-iters",
         type=int,
         default=5,
@@ -213,6 +229,18 @@ def main() -> None:
                 str(step_time_profile_path),
             ]
         )
+    elif args.measure_profile_modes_only:
+        forwarded_args.extend(
+            [
+                "--measure-profile-modes-only",
+                "--profile-warmup-iters",
+                str(args.profile_warmup_iters),
+                "--profile-iters",
+                str(args.profile_iters),
+                "--profile-mode-block-iters",
+                str(args.profile_mode_block_iters),
+            ]
+        )
 
     profile_dir: Path | None = None
     if args.pytorch_profiler and not args.dry_run:
@@ -254,6 +282,10 @@ def main() -> None:
         forwarded_args.append("--pytorch-profiler")
     dp_metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
     if dp_metrics:
+        (run_dir / "raw_metrics.json").write_text(
+            json.dumps(dp_metrics, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
         rows = _metrics_rows(dp_metrics)
         results_csv = run_dir / "results.csv"
         _write_results_csv(results_csv, rows)
@@ -672,6 +704,21 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
                 "instrumented_normal_profile_step_time_samples_s",
                 None,
             ),
+            (
+                "uninstrumented_normal_step_time",
+                "uninstrumented_normal_step_time_samples_s",
+                None,
+            ),
+            (
+                "uninstrumented_interference_free_step_time",
+                "uninstrumented_interference_free_step_time_samples_s",
+                None,
+            ),
+            (
+                "observed_normal_envelope_step_time",
+                "observed_normal_envelope_step_time_samples_s",
+                None,
+            ),
         ):
             statistic_samples = m.get(samples_key) or []
             if statistic_samples:
@@ -687,7 +734,15 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
             "simulated_normal_prediction_error_pct",
             "simulated_normal_absolute_error_pct",
             "predicted_interference_reduction_pct",
+            "dependency_replay_interference_reduction_pct",
+            "instrumented_policy_reduction_pct",
+            "observed_interference_reduction_pct",
+            "envelope_modeled_interference_reduction_pct",
+            "normal_dependency_replay_excess_pct",
             "profile_event_overhead_pct",
+            "mode_profile_event_overhead_pct",
+            "instrumented_normal_replay_error_pct",
+            "instrumented_interference_free_replay_error_pct",
         ):
             if m.get(key) is not None:
                 row[key] = float(m[key])
