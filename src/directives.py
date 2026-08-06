@@ -746,6 +746,15 @@ def _bucket_matched_fwd_nodes(
 
         first_fwd = fwd_bucket_uids[0]
         last_fwd = fwd_bucket_uids[-1]
+        # A routed EP boundary belongs to the value produced after the whole
+        # original segment. Preserve it on the final bucket; otherwise a later
+        # shard directive cannot find the dispatch-count output once this node
+        # has been replaced by bucket nodes.
+        boundary_after = fwd_node.node_meta.get("a2a_boundary_after")
+        if isinstance(boundary_after, dict):
+            dag.nodes[last_fwd].node_meta["a2a_boundary_after"] = dict(
+                boundary_after
+            )
         # Mirror backward bucket chain in reverse order.
         first_bwd = bwd_bucket_uids[-1]
         last_bwd = bwd_bucket_uids[0]
