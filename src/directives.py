@@ -12,7 +12,9 @@ from .dag import (
     _has_path,
     _iter_data_edges,
     _remove_edge,
+    _remove_edges,
     _remove_node_and_incident_edges,
+    _remove_nodes_and_incident_edges,
     _topological_order,
     _with_pass_tag,
 )
@@ -56,6 +58,32 @@ def _match_filter(tag: dict[str, int | None], flt: dict[str, Any]) -> bool:
     return True
 
 
+def _matching_uids(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+    *,
+    exclude_node_kinds: set[str] | None = None,
+) -> list[str]:
+    if not filters:
+        return []
+    if len(filters) == 1:
+        return dag.matching_uids(
+            filters[0],
+            wildcard_value=_ANY_TAG_INDEX,
+            exclude_node_kinds=exclude_node_kinds,
+        )
+    matched: set[str] = set()
+    for tag_filter in filters:
+        matched.update(
+            dag.matching_uids(
+                tag_filter,
+                wildcard_value=_ANY_TAG_INDEX,
+                exclude_node_kinds=exclude_node_kinds,
+            )
+        )
+    return sorted(matched, key=dag._node_order.__getitem__)
+
+
 def _apply_split_backward_stencil(
     dag: TrainingDAG,
     split_base_keys: set[tuple[tuple[str, Any], ...]],
@@ -82,7 +110,10 @@ def _split_fused_bwd_node(dag: TrainingDAG, bwd_uid: str) -> None:
         raise ValueError(f"duplicate BWD_W uid while splitting {bwd_uid}: {bwd_w_uid}")
 
     bwd_i.compute_subkind = "BWD_I"
-    bwd_i.tag = _with_pass_tag(bwd_i.tag, _BWD_INPUT_PASS)
+    dag.update_node_tag(
+        bwd_uid,
+        _with_pass_tag(bwd_i.tag, _BWD_INPUT_PASS),
+    )
 
     bwd_w_meta = dict(bwd_i.node_meta)
     bwd_w_meta["compute_loss"] = False
@@ -99,10 +130,8 @@ def _split_fused_bwd_node(dag: TrainingDAG, bwd_uid: str) -> None:
     )
 
     for edge in [
-        e for e in list(dag.edges)
-        if e.dep_kind == "temporal"
-        and e.src_uid == bwd_uid
-        and dag.nodes[e.dst_uid].node_kind == "UPD"
+        e for e in dag.outgoing_edges(bwd_uid, dep_kind="temporal")
+        if dag.nodes[e.dst_uid].node_kind == "UPD"
     ]:
         _remove_edge(dag, edge)
         dag.add_edge(
@@ -413,6 +442,7 @@ def _device_to_physical_pp_rank(dag: TrainingDAG) -> dict[tuple[int, ...], int]:
 
 def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = None) -> None:
     data_edges = _iter_data_edges(dag)
+    replaced_edges: list[TrainingDAGEdge] = []
     device_to_pp_rank = _device_to_physical_pp_rank(dag)
     send_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "SEND_COMM")
     recv_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "RECV_COMM")
@@ -473,16 +503,17 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
         )
         dag.add_node(send_node)
         dag.add_node(recv_node)
-        _remove_edge(dag, edge)
+        replaced_edges.append(edge)
         dag.add_edge(TrainingDAGEdge(src_uid=src.uid, dst_uid=send_uid, dep_kind="data", tensor_name=edge.tensor_name))
         dag.add_edge(TrainingDAGEdge(src_uid=recv_uid, dst_uid=dst.uid, dep_kind="data", tensor_name=edge.tensor_name))
+    _remove_edges(dag, replaced_edges)
 
 
 def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
     """Replicate UPD nodes per upstream device set so split components stay homogeneous."""
     upd_nodes = [n for n in list(dag.nodes.values()) if n.node_kind == "UPD" and ".rep" not in n.uid]
     for upd in upd_nodes:
-        in_edges = [e for e in list(dag.edges) if e.dep_kind == "temporal" and e.dst_uid == upd.uid]
+        in_edges = dag.incoming_edges(upd.uid, dep_kind="temporal")
         by_dev: dict[tuple[int, ...], list[TrainingDAGEdge]] = {}
         for e in in_edges:
             src = dag.nodes[e.src_uid]
@@ -495,6 +526,7 @@ def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
                 upd.device = list(next(iter(by_dev.keys())))
             continue
         created_uids: list[str] = []
+        rewired_edges: list[tuple[TrainingDAGEdge, str]] = []
         for i_upd, (dev_key, dev_edges) in enumerate(sorted(by_dev.items(), key=lambda kv: kv[0])):
             nu = upd.uid if i_upd == 0 else f"{upd.uid}.rep{i_upd}"
             if i_upd == 0:
@@ -517,17 +549,19 @@ def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
                 )
             created_uids.append(nu)
             for e in dev_edges:
-                _remove_edge(dag, e)
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=e.src_uid,
-                        dst_uid=nu,
-                        dep_kind=e.dep_kind,
-                        tensor_name=e.tensor_name,
-                    )
+                rewired_edges.append((e, nu))
+        _remove_edges(dag, [edge for edge, _dst_uid in rewired_edges])
+        for edge, dst_uid in rewired_edges:
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=edge.src_uid,
+                    dst_uid=dst_uid,
+                    dep_kind=edge.dep_kind,
+                    tensor_name=edge.tensor_name,
                 )
+            )
         # Duplicate outgoing edges of the original UPD to all replicas.
-        out_edges = [e for e in list(dag.edges) if e.dep_kind == "temporal" and e.src_uid == upd.uid]
+        out_edges = dag.outgoing_edges(upd.uid, dep_kind="temporal")
         if out_edges:
             for e in out_edges:
                 for nu in created_uids[1:]:
@@ -556,10 +590,8 @@ def _rewire_bwd_successors_through_sync(
     update waits for gradient synchronization as well as the BWD compute.
     """
     upd_temporal_outs = [
-        e for e in list(dag.edges)
-        if e.dep_kind == "temporal"
-        and e.src_uid == bwd_uid
-        and dag.nodes[e.dst_uid].node_kind == "UPD"
+        e for e in dag.outgoing_edges(bwd_uid, dep_kind="temporal")
+        if dag.nodes[e.dst_uid].node_kind == "UPD"
     ]
     for e in upd_temporal_outs:
         dag.add_edge(
@@ -572,6 +604,23 @@ def _rewire_bwd_successors_through_sync(
         )
 
 
+def _reserve_comm_uid(
+    dag: TrainingDAG,
+    *,
+    node_kind: str,
+    prefix: str,
+) -> str:
+    """Reserve a stable legacy-style communication-node UID."""
+
+    index = dag._next_comm_index_by_kind.get(node_kind)
+    if index is None:
+        index = sum(
+            1 for node in dag.nodes.values() if node.node_kind == node_kind
+        )
+    dag._next_comm_index_by_kind[node_kind] = index + 1
+    return f"{prefix}.{index}"
+
+
 def _bucket_matched_fwd_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -582,10 +631,10 @@ def _bucket_matched_fwd_nodes(
     bucket_size_bytes = int(bucket_size_mb) * 1024 * 1024
 
     fwd_targets = [
-        uid for uid, node in dag.nodes.items()
-        if node.node_kind == "COMPUTE"
-        and node.compute_subkind == "FWD"
-        and any(_match_filter(node.tag, flt) for flt in filters)
+        uid
+        for uid in _matching_uids(dag, filters)
+        if dag.nodes[uid].node_kind == "COMPUTE"
+        and dag.nodes[uid].compute_subkind == "FWD"
     ]
 
     # Deterministic rewrite order.
@@ -686,10 +735,10 @@ def _bucket_matched_fwd_nodes(
             )
 
         # Snapshot old incident edges before rewrite.
-        in_fwd = [e for e in dag.edges if e.dst_uid == fwd_uid]
-        out_fwd = [e for e in dag.edges if e.src_uid == fwd_uid]
-        in_bwd = [e for e in dag.edges if e.dst_uid == bwd_uid]
-        out_bwd = [e for e in dag.edges if e.src_uid == bwd_uid]
+        in_fwd = dag.incoming_edges(fwd_uid)
+        out_fwd = dag.outgoing_edges(fwd_uid)
+        in_bwd = dag.incoming_edges(bwd_uid)
+        out_bwd = dag.outgoing_edges(bwd_uid)
 
         orig_stage = int(fwd_node.node_meta.get("stage_id", -1))
         orig_seg = int(fwd_node.node_meta.get("segment_id", -1))
@@ -746,6 +795,15 @@ def _bucket_matched_fwd_nodes(
 
         first_fwd = fwd_bucket_uids[0]
         last_fwd = fwd_bucket_uids[-1]
+        # A routed EP boundary belongs to the value produced after the whole
+        # original segment. Preserve it on the final bucket; otherwise a later
+        # shard directive cannot find the dispatch-count output once this node
+        # has been replaced by bucket nodes.
+        boundary_after = fwd_node.node_meta.get("a2a_boundary_after")
+        if isinstance(boundary_after, dict):
+            dag.nodes[last_fwd].node_meta["a2a_boundary_after"] = dict(
+                boundary_after
+            )
         # Mirror backward bucket chain in reverse order.
         first_bwd = bwd_bucket_uids[-1]
         last_bwd = bwd_bucket_uids[0]
@@ -786,7 +844,6 @@ def _insert_reduce_comm_nodes(
     comm_stream: str | None = None,
 ) -> None:
     """Insert one all-reduce per bucket after all matched weight backwards."""
-    reduce_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "REDUCE_COMM")
     expected = sorted(int(d) for d in devices)
     if len(expected) <= 1:
         # A singleton replica group is no-DP. Local autograd still accumulates
@@ -794,10 +851,9 @@ def _insert_reduce_comm_nodes(
         return
 
     candidates: list[TrainingDAGNode] = []
-    for node in list(dag.nodes.values()):
+    for uid in _matching_uids(dag, filters):
+        node = dag.nodes[uid]
         if node.node_kind != "COMPUTE" or not _is_backward_weight_subkind(node.compute_subkind):
-            continue
-        if not any(_match_filter(node.tag, flt) for flt in filters):
             continue
         if node.device is None:
             raise ValueError(
@@ -834,8 +890,11 @@ def _insert_reduce_comm_nodes(
             for key in sorted(common_tag_keys)
             if all(node.tag[key] == anchor.tag[key] for node in group)
         }
-        reduce_uid = f"reduce.{reduce_idx}"
-        reduce_idx += 1
+        reduce_uid = _reserve_comm_uid(
+            dag,
+            node_kind="REDUCE_COMM",
+            prefix="reduce",
+        )
         bucket_key = anchor.node_meta.get("bucket_key")
         comm_key = (
             bucket_key
@@ -910,15 +969,13 @@ def _insert_all_gather_comm_nodes(
     devices: list[int],
     comm_stream: str | None = None,
 ) -> None:
-    ag_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "ALL_GATHER_COMM")
     expected = sorted(int(d) for d in devices)
-    for node in list(dag.nodes.values()):
+    for uid in _matching_uids(dag, filters):
+        node = dag.nodes[uid]
         if (
             node.node_kind != "COMPUTE"
             or node.compute_subkind not in ("FWD", "BWD", "BWD_I", "BWD_W")
         ):
-            continue
-        if not any(_match_filter(node.tag, flt) for flt in filters):
             continue
         if not _node_has_trainable_params(dag, node):
             continue
@@ -933,8 +990,11 @@ def _insert_all_gather_comm_nodes(
                 f"replicate device mismatch for node {node.uid}: "
                 f"expected devices={devices}, node_devices={node.device}"
             )
-        ag_uid = f"all_gather.{ag_idx}"
-        ag_idx += 1
+        ag_uid = _reserve_comm_uid(
+            dag,
+            node_kind="ALL_GATHER_COMM",
+            prefix="all_gather",
+        )
         ag_tag = dict(node.tag)
         ag_node = TrainingDAGNode(
             uid=ag_uid,
@@ -995,13 +1055,11 @@ def _insert_reduce_scatter_comm_nodes(
     shard_params=True reshares parameters immediately unless the later ZeRO
     lifetime-pruning pass proves that a longer full-parameter lifetime is safe.
     """
-    rs_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "REDUCE_SCATTER_COMM")
     expected = sorted(int(d) for d in devices)
     candidates: list[TrainingDAGNode] = []
-    for node in list(dag.nodes.values()):
+    for uid in _matching_uids(dag, filters):
+        node = dag.nodes[uid]
         if node.node_kind != "COMPUTE" or not _is_backward_weight_subkind(node.compute_subkind):
-            continue
-        if not any(_match_filter(node.tag, flt) for flt in filters):
             continue
         if not _node_has_trainable_params(dag, node):
             continue
@@ -1038,8 +1096,11 @@ def _insert_reduce_scatter_comm_nodes(
             for key in sorted(common_tag_keys)
             if all(node.tag[key] == anchor.tag[key] for node in group)
         }
-        rs_uid = f"reduce_scatter.{rs_idx}"
-        rs_idx += 1
+        rs_uid = _reserve_comm_uid(
+            dag,
+            node_kind="REDUCE_SCATTER_COMM",
+            prefix="reduce_scatter",
+        )
         bucket_key = anchor.node_meta.get("bucket_key")
         comm_key = (
             bucket_key
@@ -1093,12 +1154,16 @@ def _insert_shard_a2a_comm_nodes(
     comm_stream: str | None = None,
 ) -> None:
     expected = sorted(int(d) for d in devices)
-    a2a_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "A2A_COMM")
 
     matched_uids = [
-        uid for uid, node in dag.nodes.items()
-        if node.node_kind == "COMPUTE" and any(_match_filter(node.tag, flt) for flt in filters)
+        uid
+        for uid in _matching_uids(dag, filters)
+        if dag.nodes[uid].node_kind == "COMPUTE"
     ]
+    compute_edges_to_delete: list[TrainingDAGEdge] = []
+    compute_edge_keys_to_delete: set[
+        tuple[str, str, str, str | None]
+    ] = set()
 
     def _a2a_boundary_for_edge(src_node: TrainingDAGNode, dst_node: TrainingDAGNode) -> dict[str, Any]:
         # Backward data edges are reversed from the forward graph:
@@ -1199,16 +1264,16 @@ def _insert_shard_a2a_comm_nodes(
             return False
 
         incoming = [
-            e for e in list(dag.edges)
-            if e.dep_kind == "data"
-            and e.dst_uid == uid
-            and _is_a2a_compute_edge(e)
+            e for e in dag.incoming_edges(uid, dep_kind="data")
+            if _is_a2a_compute_edge(e)
+            and (e.src_uid, e.dst_uid, e.dep_kind, e.tensor_name)
+            not in compute_edge_keys_to_delete
         ]
         outgoing = [
-            e for e in list(dag.edges)
-            if e.dep_kind == "data"
-            and e.src_uid == uid
-            and _is_a2a_compute_edge(e)
+            e for e in dag.outgoing_edges(uid, dep_kind="data")
+            if _is_a2a_compute_edge(e)
+            and (e.src_uid, e.dst_uid, e.dep_kind, e.tensor_name)
+            not in compute_edge_keys_to_delete
         ]
 
         for e in incoming:
@@ -1238,13 +1303,25 @@ def _insert_shard_a2a_comm_nodes(
                     f"dst.PASS={dst.tag.get('PASS')}"
                 )
 
+        # Logically remove these edges now so a later matched endpoint does not
+        # create a duplicate A2A. Compact the canonical edge list once after all
+        # matched nodes have appended their legacy-ordered replacements.
+        for edge in incoming + outgoing:
+            compute_edges_to_delete.append(edge)
+            compute_edge_keys_to_delete.add(
+                (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
+            )
+
         for e in incoming:
             src_node = dag.nodes[e.src_uid]
             binfo = _a2a_boundary_for_edge(src_node, node)
             a2a_tensor_idx = binfo["tensor_idx"]
             expert_fwd_uid = _expert_fwd_uid(node)
-            comm_uid = f"a2a.{a2a_idx}"
-            a2a_idx += 1
+            comm_uid = _reserve_comm_uid(
+                dag,
+                node_kind="A2A_COMM",
+                prefix="a2a",
+            )
             comm_meta = {
                 "direction": "incoming",
                 "target_uid": uid,
@@ -1269,7 +1346,6 @@ def _insert_shard_a2a_comm_nodes(
                 node_meta=comm_meta,
             )
             dag.add_node(comm_node)
-            _remove_edge(dag, e)
             dag.add_edge(TrainingDAGEdge(src_uid=e.src_uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=uid, dep_kind="data", tensor_name=e.tensor_name))
 
@@ -1278,8 +1354,11 @@ def _insert_shard_a2a_comm_nodes(
             binfo = _a2a_boundary_for_edge(node, dst_node)
             a2a_tensor_idx = binfo["tensor_idx"]
             expert_fwd_uid = _expert_fwd_uid(node)
-            comm_uid = f"a2a.{a2a_idx}"
-            a2a_idx += 1
+            comm_uid = _reserve_comm_uid(
+                dag,
+                node_kind="A2A_COMM",
+                prefix="a2a",
+            )
             comm_node = TrainingDAGNode(
                 uid=comm_uid,
                 node_kind="A2A_COMM",
@@ -1299,9 +1378,10 @@ def _insert_shard_a2a_comm_nodes(
                 },
             )
             dag.add_node(comm_node)
-            _remove_edge(dag, e)
             dag.add_edge(TrainingDAGEdge(src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
+
+    _remove_edges(dag, compute_edges_to_delete)
 
 
 def _apply_split_directive(
@@ -1310,7 +1390,9 @@ def _apply_split_directive(
     dim_name: str,
     num_microbatches: int,
 ) -> None:
-    matched = {uid for uid, n in dag.nodes.items() if _match_filter(n.tag, flt)}
+    matched = set(
+        dag.matching_uids(flt, wildcard_value=_ANY_TAG_INDEX)
+    )
     if not matched:
         raise ValueError(f"split(filter={flt}) matched zero nodes")
 
@@ -1367,7 +1449,9 @@ def _apply_split_directive(
     # Tag originals as microbatch 0.
     for uid in matched:
         node = dag.nodes[uid]
-        node.tag[dim_name] = 0
+        updated_tag = dict(node.tag)
+        updated_tag[dim_name] = 0
+        dag.update_node_tag(uid, updated_tag)
         # Split copies of one logical compute bucket must share runtime
         # parameters and gradient storage even when a synthetic/input DAG did
         # not provide the builder's usual bucket_key metadata.
@@ -1457,99 +1541,95 @@ def _apply_split_directive(
             )
 
 
+def _reachable_uids(
+    starts: set[str],
+    adjacency: dict[str, set[str]],
+    *,
+    allowed: set[str] | None = None,
+) -> set[str]:
+    """Return the multi-source transitive closure over ``adjacency``."""
+
+    seen = set(starts)
+    stack = list(starts)
+    while stack:
+        uid = stack.pop()
+        for adjacent_uid in adjacency.get(uid, set()):
+            if adjacent_uid in seen:
+                continue
+            if allowed is not None and adjacent_uid not in allowed:
+                continue
+            seen.add(adjacent_uid)
+            stack.append(adjacent_uid)
+    return seen
+
+
 def _match_set_contiguous_subdag(
     dag: TrainingDAG,
     matched: set[str],
     *,
     context: str,
 ) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Validate an order-filter sub-DAG in linear graph-traversal time.
+
+    A non-matching node is interleaved exactly when it is both reachable from
+    the matched set and can reach the matched set.  Computing those two
+    multi-source closures replaces the legacy per-node forward/backward DFS.
+    Compute boundaries use the same technique within the matched induced
+    subgraph: seed immediately after/before every compute node, then traverse
+    once to find compute nodes with another compute ancestor/descendant.
+    """
+
     if not matched:
         raise ValueError(f"{context}: filter matched zero nodes")
-    # Contiguity should be dependency-based, not tied to one arbitrary
-    # topological ordering (which can interleave independent branches).
-    # A non-matching node is considered interleaving iff it is on some path
-    # between matched nodes: matched -> ... -> node -> ... -> matched.
-    interleaved: list[str] = []
-    for u in dag.nodes.keys():
-        if u in matched:
-            continue
-        # Has matched ancestor?
-        has_matched_ancestor = False
-        seen = {u}
-        stack = list(dag.preds.get(u, set()))
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if cur in matched:
-                has_matched_ancestor = True
-                break
-            stack.extend(dag.preds.get(cur, set()))
-        if not has_matched_ancestor:
-            continue
 
-        # Has matched descendant?
-        has_matched_descendant = False
-        seen = {u}
-        stack = list(dag.succs.get(u, set()))
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if cur in matched:
-                has_matched_descendant = True
-                break
-            stack.extend(dag.succs.get(cur, set()))
-        if has_matched_descendant:
-            interleaved.append(u)
-
+    interleaved = (
+        _reachable_uids(matched, dag.succs)
+        & _reachable_uids(matched, dag.preds)
+    ) - matched
     if interleaved:
         raise ValueError(
-            f"{context}: matched nodes are not contiguous; interleaved non-matching nodes: {interleaved[:8]}"
+            f"{context}: matched nodes are not contiguous; "
+            f"interleaved non-matching nodes: {sorted(interleaved)[:8]}"
         )
 
     sources = {
-        u for u in matched
-        if not any(pred in matched for pred in dag.preds.get(u, set()))
+        uid
+        for uid in matched
+        if not any(pred in matched for pred in dag.preds.get(uid, set()))
     }
     sinks = {
-        u for u in matched
-        if not any(succ in matched for succ in dag.succs.get(u, set()))
+        uid
+        for uid in matched
+        if not any(succ in matched for succ in dag.succs.get(uid, set()))
     }
     if not sources or not sinks:
         raise ValueError(f"{context}: failed to identify non-empty source/sink sets")
-    compute_nodes = {u for u in matched if dag.nodes[u].node_kind == "COMPUTE"}
 
-    def _has_upstream_compute(u: str) -> bool:
-        seen = {u}
-        stack = list(dag.preds.get(u, set()))
-        while stack:
-            cur = stack.pop()
-            if cur in seen or cur not in matched:
-                continue
-            seen.add(cur)
-            if dag.nodes[cur].node_kind == "COMPUTE":
-                return True
-            stack.extend(dag.preds.get(cur, set()))
-        return False
-
-    def _has_downstream_compute(u: str) -> bool:
-        seen = {u}
-        stack = list(dag.succs.get(u, set()))
-        while stack:
-            cur = stack.pop()
-            if cur in seen or cur not in matched:
-                continue
-            seen.add(cur)
-            if dag.nodes[cur].node_kind == "COMPUTE":
-                return True
-            stack.extend(dag.succs.get(cur, set()))
-        return False
-
-    compute_sources = {u for u in compute_nodes if not _has_upstream_compute(u)}
-    compute_sinks = {u for u in compute_nodes if not _has_downstream_compute(u)}
+    compute_nodes = {
+        uid for uid in matched if dag.nodes[uid].node_kind == "COMPUTE"
+    }
+    downstream_seeds = {
+        succ
+        for uid in compute_nodes
+        for succ in dag.succs.get(uid, set())
+        if succ in matched
+    }
+    compute_with_upstream_compute = (
+        _reachable_uids(downstream_seeds, dag.succs, allowed=matched)
+        & compute_nodes
+    )
+    upstream_seeds = {
+        pred
+        for uid in compute_nodes
+        for pred in dag.preds.get(uid, set())
+        if pred in matched
+    }
+    compute_with_downstream_compute = (
+        _reachable_uids(upstream_seeds, dag.preds, allowed=matched)
+        & compute_nodes
+    )
+    compute_sources = compute_nodes - compute_with_upstream_compute
+    compute_sinks = compute_nodes - compute_with_downstream_compute
     if not compute_sources or not compute_sinks:
         raise ValueError(f"{context}: failed to identify non-empty compute source/sink sets")
 
@@ -1663,10 +1743,13 @@ def _apply_order_directive(
         group_sinks: list[set[str]] = []
         grouped_uids: set[str] = set()
         for filter_idx, flt in enumerate(group):
-            matched = {
-                uid for uid, n in dag.nodes.items()
-                if n.node_kind != "ORDER_DUMMY" and _match_filter(n.tag, flt)
-            }
+            matched = set(
+                dag.matching_uids(
+                    flt,
+                    wildcard_value=_ANY_TAG_INDEX,
+                    exclude_node_kinds={"ORDER_DUMMY"},
+                )
+            )
             _srcs, _snks, csrcs, csnks = _match_set_contiguous_subdag(
                 dag,
                 matched,
@@ -1710,10 +1793,183 @@ def _apply_order_directive(
                 _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
-def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:
+def apply_order_directives(
+    training_dag: TrainingDAG,
+    directives: list[Any],
+    *,
+    skip_unmatched_directives: bool = False,
+) -> None:
+    """Apply the order portion of a schedule, optionally to one PP-rank DAG."""
+
+    for directive_idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") != "order":
+            continue
+        filter_groups = _parse_order_directive(raw)
+        if skip_unmatched_directives:
+            filter_specs = [
+                tag_filter
+                for group in filter_groups
+                for tag_filter in group
+            ]
+            if not any(_matching_uids(training_dag, [tag_filter]) for tag_filter in filter_specs):
+                continue
+        logger.debug(
+            "Applying directive[%d]: order(filters=%s)",
+            directive_idx,
+            filter_groups,
+        )
+        _apply_order_directive(
+            training_dag,
+            filter_groups,
+            directive_idx=directive_idx,
+        )
+
+
+def _apply_communication_directive(
+    training_dag: TrainingDAG,
+    raw: dict[str, Any],
+    *,
+    directive_idx: int,
+    bucket_already_lowered: bool,
+) -> bool:
+    (
+        op,
+        filters,
+        devices,
+        stream,
+        gather_stream,
+        reduce_stream,
+        shard_params,
+        shard_grads,
+        bucket_size,
+    ) = _normalize_filter_devices_directive(raw)
+    matched_nodes = [
+        uid
+        for uid in _matching_uids(training_dag, filters)
+        if training_dag.nodes[uid].node_kind == "COMPUTE"
+    ]
+    if not matched_nodes:
+        return False
+    logger.debug(
+        "Applying directive[%d]: %s(filters=%s, devices=%s, stream=%s, "
+        "gather_stream=%s, reduce_stream=%s, shard_params=%s, "
+        "shard_grads=%s, bucket_size=%s)",
+        directive_idx,
+        op,
+        filters,
+        devices,
+        stream,
+        gather_stream,
+        reduce_stream,
+        shard_params,
+        shard_grads,
+        bucket_size,
+    )
+    if op == "replicate":
+        if bucket_size is not None and not bucket_already_lowered:
+            _bucket_matched_fwd_nodes(training_dag, filters, int(bucket_size))
+        if shard_params:
+            _insert_all_gather_comm_nodes(
+                training_dag,
+                filters,
+                devices,
+                comm_stream=gather_stream,
+            )
+            _insert_reduce_scatter_comm_nodes(
+                training_dag,
+                filters,
+                devices,
+                comm_stream=reduce_stream,
+            )
+        elif shard_grads:
+            _insert_reduce_scatter_comm_nodes(
+                training_dag,
+                filters,
+                devices,
+                comm_stream=reduce_stream,
+            )
+        else:
+            _insert_reduce_comm_nodes(
+                training_dag,
+                filters,
+                devices,
+                comm_stream=reduce_stream,
+            )
+    elif op == "shard":
+        _insert_shard_a2a_comm_nodes(
+            training_dag,
+            filters,
+            devices,
+            comm_stream=stream,
+        )
+    else:
+        raise ValueError(f"Unsupported directive op after normalization: {op}")
+    return True
+
+
+def apply_communication_directives_to_rank_dags(
+    rank_dags: list[TrainingDAG],
+    directives: list[Any],
+) -> None:
+    """Lower device-local DP/EP communication after physical-PP splitting."""
+
+    shared_comm_indices: dict[str, int] = {}
+    for rank_dag in rank_dags:
+        rank_dag._next_comm_index_by_kind = shared_comm_indices
+
+    for directive_idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") in ("place", "split", "order"):
+            continue
+        matched_rank_count = 0
+        for rank_dag in rank_dags:
+            if _apply_communication_directive(
+                rank_dag,
+                raw,
+                directive_idx=directive_idx,
+                # Bucketing is always part of the pre-split structural phase.
+                bucket_already_lowered=True,
+            ):
+                matched_rank_count += 1
+        if matched_rank_count == 0:
+            raise ValueError(
+                f"communication directive[{directive_idx}] matched zero PP-rank DAGs: {raw}"
+            )
+
+
+def apply_schedule_directives(
+    training_dag: TrainingDAG,
+    directives: list[Any] | None,
+    *,
+    defer_order: bool = False,
+    defer_communication: bool = False,
+) -> None:
     if not directives:
         return
     split_backward_keys = _validate_split_backward_order_stencil(directives)
+
+    # Buckets partition the base FX graph and are shared by every microbatch.
+    # Lower them before split expansion so bucket_stage runs once per base
+    # segment and DualPipeV's later B -> BI/BW stencil operates on the copied
+    # bucket nodes. Trying to bucket after that stencil incorrectly assumes
+    # each copied FWD still has exactly one fused BWD partner.
+    bucketed_replicate_directives: set[int] = set()
+    for i, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") != "replicate":
+            continue
+        (
+            _op,
+            filters,
+            _devices,
+            _stream,
+            _gather_stream,
+            _reduce_stream,
+            _shard_params,
+            _shard_grads,
+            bucket_size,
+        ) = _normalize_filter_devices_directive(raw)
+        if bucket_size is not None:
+            _bucket_matched_fwd_nodes(training_dag, filters, int(bucket_size))
+            bucketed_replicate_directives.add(i)
 
     # Microbatch expansion must run before split-backward lowering so schedules
     # can mix fused B and split BI/BW for the same bucket on different MBs.
@@ -1738,12 +1994,12 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
             i, op, filters, devices, stream, shard_params, shard_grads, bucket_size
         )
         matched_nodes = 0
-        for node in training_dag.nodes.values():
+        for uid in _matching_uids(training_dag, filters):
+            node = training_dag.nodes[uid]
             if node.node_kind not in ("COMPUTE", "UPD"):
                 continue
-            if any(_match_filter(node.tag, flt) for flt in filters):
-                node.device = list(devices)
-                matched_nodes += 1
+            node.device = list(devices)
+            matched_nodes += 1
         if matched_nodes == 0:
             raise ValueError(f"place directive[{i}] matched zero nodes: {raw}")
         if stream is not None:
@@ -1758,45 +2014,19 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
     _replicate_update_nodes_by_device(training_dag)
     _insert_send_recv_comm_nodes(training_dag, comm_stream=place_stream)
 
+    if defer_communication:
+        return
+
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
             continue
-        op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
-        logger.debug(
-            "Applying directive[%d]: %s(filters=%s, devices=%s, stream=%s, gather_stream=%s, reduce_stream=%s, shard_params=%s, shard_grads=%s, bucket_size=%s)",
-            i, op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size
-        )
-        matched_nodes = [
-            uid for uid, node in training_dag.nodes.items()
-            if node.node_kind == "COMPUTE"
-            and any(_match_filter(node.tag, flt) for flt in filters)
-        ]
-        if not matched_nodes:
-            raise ValueError(f"{op} directive[{i}] matched zero compute nodes: {raw}")
-        if op == "replicate":
-            if bucket_size is not None:
-                _bucket_matched_fwd_nodes(training_dag, filters, int(bucket_size))
-            if shard_params:
-                _insert_all_gather_comm_nodes(training_dag, filters, devices, comm_stream=gather_stream)
-                _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
-            elif shard_grads:
-                _insert_reduce_scatter_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
-            else:
-                _insert_reduce_comm_nodes(
-                    training_dag,
-                    filters,
-                    devices,
-                    comm_stream=reduce_stream,
-                )
-        elif op == "shard":
-            _insert_shard_a2a_comm_nodes(training_dag, filters, devices, comm_stream=stream)
-        else:
-            raise ValueError(f"Unsupported directive op after normalization: {op}")
+        if not _apply_communication_directive(
+            training_dag,
+            raw,
+            directive_idx=i,
+            bucket_already_lowered=i in bucketed_replicate_directives,
+        ):
+            raise ValueError(f"communication directive[{i}] matched zero compute nodes: {raw}")
 
-    # Final pass for order directives (add temporal dependencies across sub-DAGs).
-    for i, raw in enumerate(directives):
-        if not isinstance(raw, dict) or raw.get("op") != "order":
-            continue
-        filter_groups = _parse_order_directive(raw)
-        logger.debug("Applying directive[%d]: order(filters=%s)", i, filter_groups)
-        _apply_order_directive(training_dag, filter_groups, directive_idx=i)
+    if not defer_order:
+        apply_order_directives(training_dag, directives)

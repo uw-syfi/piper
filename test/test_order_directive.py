@@ -17,6 +17,7 @@ from src.piper import (
     _validate_split_backward_order_stencil,
 )
 import src.directives as directives
+from src.dag import _remove_edge, _remove_nodes_and_incident_edges
 from src.zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
 
 
@@ -105,6 +106,66 @@ def _weight_backward_uids(dag: TrainingDAG) -> set[str]:
         if node.node_kind == "COMPUTE"
         and node.compute_subkind in ("BWD", "BWD_W")
     }
+
+
+def test_indexed_edge_removal_preserves_parallel_edge_adjacency() -> None:
+    dag = TrainingDAG()
+    for uid in ("a", "b", "c"):
+        dag.add_node(_compute(uid, {"name": uid}))
+    data_edge = TrainingDAGEdge("a", "b", "data", "activation")
+    temporal_edge = TrainingDAGEdge("a", "b", "temporal")
+    retained_edge = TrainingDAGEdge("a", "c", "data")
+    for edge in (data_edge, temporal_edge, retained_edge):
+        dag.add_edge(edge)
+
+    assert dag.outgoing_edges("a") == [data_edge, temporal_edge, retained_edge]
+    assert dag.incoming_edges("b", dep_kind="data") == [data_edge]
+    _remove_edge(dag, data_edge)
+
+    assert dag.succs["a"] == {"b", "c"}
+    assert dag.preds["b"] == {"a"}
+    assert dag.incoming_edges("b") == [temporal_edge]
+
+    _remove_nodes_and_incident_edges(dag, {"b"})
+
+    assert set(dag.nodes) == {"a", "c"}
+    assert dag.edges == [retained_edge]
+    assert dag.succs == {"a": {"c"}, "c": set()}
+    assert dag.preds == {"a": set(), "c": {"a"}}
+
+
+def test_tag_index_matches_legacy_filter_semantics_and_node_order() -> None:
+    dag = TrainingDAG()
+    for uid, tag in (
+        ("first", {"PP": 0, "EP": None, "PASS": "F"}),
+        ("second", {"PP": 0, "EP": 3, "PASS": "F"}),
+        ("third", {"PP": 1, "EP": 3, "PASS": "B"}),
+    ):
+        dag.add_node(_compute(uid, tag))
+
+    filters = (
+        {},
+        {"PP": 0},
+        {"EP": directives._ANY_TAG_INDEX},
+        {"PP": 0, "EP": directives._ANY_TAG_INDEX},
+        {"PASS": "missing"},
+    )
+    for tag_filter in filters:
+        expected = [
+            uid
+            for uid, node in dag.nodes.items()
+            if directives._match_filter(node.tag, tag_filter)
+        ]
+        assert dag.matching_uids(
+            tag_filter,
+            wildcard_value=directives._ANY_TAG_INDEX,
+        ) == expected
+
+    dag.update_node_tag("first", {"PP": 1, "EP": 2, "PASS": "F"})
+    assert dag.matching_uids(
+        {"PP": 1},
+        wildcard_value=directives._ANY_TAG_INDEX,
+    ) == ["first", "third"]
 
 
 def test_unsharded_dp_accumulates_before_one_all_reduce_per_bucket() -> None:
@@ -494,6 +555,52 @@ def test_bucket_rewrite_resolves_split_microbatch_bwd_by_metadata(monkeypatch) -
     ]
     assert len(reductions) == 2
     assert sorted(len(node.node_meta["bwd_uids"]) for node in reductions) == [2, 2]
+
+
+def test_apply_schedule_buckets_base_graph_before_microbatch_split(monkeypatch) -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+    dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
+    dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
+    calls: list[tuple[list[str], list[dict], int]] = []
+
+    def record_bucket_call(actual_dag, filters, bucket_size):
+        assert all("MB" not in node.tag for node in actual_dag.nodes.values())
+        calls.append((list(actual_dag.nodes), filters, bucket_size))
+
+    monkeypatch.setattr(
+        directives,
+        "_bucket_matched_fwd_nodes",
+        record_bucket_call,
+    )
+
+    directives.apply_schedule_directives(
+        dag,
+        [
+            {
+                "op": "place",
+                "filter": {"PP": 0},
+                "devices": [0],
+                "stream": "pp_stream",
+            },
+            {
+                "op": "replicate",
+                "filter": {"PP": 0},
+                "devices": [0],
+                "reduce_stream": "dp_stream",
+                "bucket_size": 16,
+            },
+            {
+                "op": "split",
+                "filter": {},
+                "dim_name": "MB",
+                "num_microbatches": 2,
+            },
+        ],
+    )
+
+    assert calls == [(["fwd", "bwd"], [{"PP": 0}], 16)]
+    assert {node.tag["MB"] for node in dag.nodes.values()} == {0, 1}
 
 
 def test_apply_order_directive_groups_nested_subdags_with_dummy_source_sink() -> None:

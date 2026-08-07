@@ -3,9 +3,9 @@ from typing import Any
 from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
-    _has_path,
-    _remove_edge,
-    _remove_node_and_incident_edges,
+    _ReachabilityIndex,
+    _remove_edges,
+    _remove_nodes_and_incident_edges,
     _topological_levels,
 )
 from .ordering import _serial_topological_order
@@ -45,14 +45,13 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
 
     def _has_direct_compute_dependency(src_uid: str, dst_uid: str) -> bool:
         return any(
-            e.src_uid == src_uid
-            and e.dst_uid == dst_uid
+            e.dst_uid == dst_uid
             and e.dep_kind in ("data", "temporal")
             and e.src_uid in dag.nodes
             and e.dst_uid in dag.nodes
             and _is_compute(e.src_uid)
             and _is_compute(e.dst_uid)
-            for e in dag.edges
+            for e in dag.outgoing_edges(src_uid)
         )
 
     def _build_chains(
@@ -72,16 +71,16 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
         for bucket, uids in sorted(by_bucket.items(), key=lambda item: str(item[0])):
             uid_set = set(uids)
             links: dict[str, set[str]] = {uid: set() for uid in uids}
-            for e in dag.edges:
-                if (
-                    e.dep_kind in ("data", "temporal")
-                    and e.src_uid in uid_set
-                    and e.dst_uid in uid_set
-                    and _is_compute(e.src_uid)
-                    and _is_compute(e.dst_uid)
-                ):
-                    links[e.src_uid].add(e.dst_uid)
-                    links[e.dst_uid].add(e.src_uid)
+            for src_uid in uids:
+                for e in dag.outgoing_edges(src_uid):
+                    if (
+                        e.dep_kind in ("data", "temporal")
+                        and e.dst_uid in uid_set
+                        and _is_compute(e.src_uid)
+                        and _is_compute(e.dst_uid)
+                    ):
+                        links[e.src_uid].add(e.dst_uid)
+                        links[e.dst_uid].add(e.src_uid)
 
             seen: set[str] = set()
             for uid in uids:
@@ -101,41 +100,35 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
         return chains
 
     def _data_preds(uid: str) -> list[TrainingDAGEdge]:
-        return [
-            e for e in list(dag.edges)
-            if e.dep_kind == "data" and e.dst_uid == uid
-        ]
+        return dag.incoming_edges(uid, dep_kind="data")
 
     def _data_succs(uid: str) -> list[TrainingDAGEdge]:
-        return [
-            e for e in list(dag.edges)
-            if e.dep_kind == "data" and e.src_uid == uid
-        ]
+        return dag.outgoing_edges(uid, dep_kind="data")
 
     def _all_gather_preds(uid: str) -> list[str]:
         return sorted(
             e.src_uid
-            for e in dag.edges
-            if e.dep_kind == "data"
-            and e.dst_uid == uid
-            and e.src_uid in dag.nodes
+            for e in dag.incoming_edges(uid, dep_kind="data")
+            if e.src_uid in dag.nodes
             and dag.nodes[e.src_uid].node_kind == "ALL_GATHER_COMM"
         )
 
     def _reduce_scatter_succs(uid: str) -> list[str]:
         return sorted(
             e.dst_uid
-            for e in dag.edges
-            if e.dep_kind == "data"
-            and e.src_uid == uid
-            and e.dst_uid in dag.nodes
+            for e in dag.outgoing_edges(uid, dep_kind="data")
+            if e.dst_uid in dag.nodes
             and dag.nodes[e.dst_uid].node_kind == "REDUCE_SCATTER_COMM"
         )
 
-    def _remove_all_gather(ag_uid: str, compute_uid: str, bucket: Any) -> None:
+    def _prepare_remove_all_gather(
+        ag_uid: str,
+        compute_uid: str,
+        bucket: Any,
+    ) -> str | None:
         del compute_uid, bucket
         if ag_uid not in dag.nodes:
-            return
+            return None
         in_ag = _data_preds(ag_uid)
         out_ag = _data_succs(ag_uid)
         for ie in in_ag:
@@ -148,7 +141,7 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                         tensor_name=(oe.tensor_name if oe.tensor_name is not None else ie.tensor_name),
                     )
                 )
-        _remove_node_and_incident_edges(dag, ag_uid)
+        return ag_uid
 
     has_grad_sync = any(
         n.node_kind in ("REDUCE_COMM", "REDUCE_SCATTER_COMM")
@@ -176,6 +169,8 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
             key=lambda node: topo_idx[node.uid],
         )
         covered_grad_uids: set[str] = set()
+        contribution_edges_to_remove: list[TrainingDAGEdge] = []
+        normalized_contribution_edges: list[TrainingDAGEdge] = []
         for rs_node in reduce_scatters:
             raw_contributors = rs_node.node_meta.get("bwd_uids")
             if raw_contributors is None:
@@ -218,19 +213,17 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
             contributor_set = set(chain)
             contribution_edges = [
                 edge
-                for edge in list(dag.edges)
+                for edge in dag.incoming_edges(rs_node.uid)
                 if edge.src_uid in contributor_set
-                and edge.dst_uid == rs_node.uid
                 and edge.dep_kind in ("data", "temporal")
             ]
             assert {edge.src_uid for edge in contribution_edges} == contributor_set, (
                 f"zero_lifetime_prune: reduce-scatter {rs_node.uid} dependencies "
                 f"do not cover contributors {chain}: {contribution_edges}"
             )
-            for edge in contribution_edges:
-                _remove_edge(dag, edge)
+            contribution_edges_to_remove.extend(contribution_edges)
             for uid in chain:
-                dag.add_edge(
+                normalized_contribution_edges.append(
                     TrainingDAGEdge(
                         src_uid=uid,
                         dst_uid=rs_node.uid,
@@ -250,6 +243,10 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                 chain[0],
                 chain[-1],
             )
+
+        _remove_edges(dag, contribution_edges_to_remove)
+        for edge in normalized_contribution_edges:
+            dag.add_edge(edge)
 
         marked_grad_uids = set(
             _compute_uids_with(
@@ -283,6 +280,7 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
             f"compute node to a chain; missing={sorted(set(candidates) - covered)}"
         )
 
+        all_gathers_to_remove: set[str] = set()
         for chain in param_chains:
             bucket = _chain_bucket(chain[0])
             assert all(_chain_bucket(uid) == bucket for uid in chain), (
@@ -292,8 +290,14 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
 
             for uid in chain[1:]:
                 for ag_uid in ag_by_compute[uid]:
-                    _remove_all_gather(ag_uid, uid, bucket)
+                    prepared_uid = _prepare_remove_all_gather(ag_uid, uid, bucket)
+                    if prepared_uid is not None:
+                        all_gathers_to_remove.add(prepared_uid)
 
+        _remove_nodes_and_incident_edges(dag, all_gathers_to_remove)
+
+        for chain in param_chains:
+            bucket = _chain_bucket(chain[0])
             tail = chain[-1]
             for uid in chain:
                 dag.nodes[uid].node_meta.pop("zero_free_full_params_after", None)
@@ -351,6 +355,7 @@ def _add_inter_chain_temporal_edges(
         return
 
     topo_levels = _topological_levels(dag)
+    reachability = _ReachabilityIndex(dag)
 
     def _chain_bucket(uid: str) -> Any:
         return dag.nodes[uid].node_meta.get("bucket_key")
@@ -358,29 +363,25 @@ def _add_inter_chain_temporal_edges(
     def _all_gather_preds(uid: str) -> list[str]:
         return sorted(
             e.src_uid
-            for e in dag.edges
-            if e.dep_kind == "data"
-            and e.dst_uid == uid
-            and e.src_uid in dag.nodes
+            for e in dag.incoming_edges(uid, dep_kind="data")
+            if e.src_uid in dag.nodes
             and dag.nodes[e.src_uid].node_kind == "ALL_GATHER_COMM"
         )
 
     def _reduce_scatter_succs(uid: str) -> list[str]:
         return sorted(
             e.dst_uid
-            for e in dag.edges
-            if e.dep_kind == "data"
-            and e.src_uid == uid
-            and e.dst_uid in dag.nodes
+            for e in dag.outgoing_edges(uid, dep_kind="data")
+            if e.dst_uid in dag.nodes
             and dag.nodes[e.dst_uid].node_kind == "REDUCE_SCATTER_COMM"
         )
 
     def _maybe_add_edge(src_uid: str, dst_uid: str) -> None:
         if topo_levels.get(src_uid, 0) < topo_levels.get(dst_uid, 0):
             return
-        if _has_path(dag, src_uid, dst_uid):
+        if reachability.has_path(src_uid, dst_uid):
             return
-        if _has_path(dag, dst_uid, src_uid):
+        if reachability.has_path(dst_uid, src_uid):
             return
         dag.add_edge(TrainingDAGEdge(
             src_uid=src_uid,
@@ -388,6 +389,7 @@ def _add_inter_chain_temporal_edges(
             dep_kind="temporal",
             tensor_name=None,
         ))
+        reachability.add_edge(src_uid, dst_uid)
 
     # Group chains by type and bucket, then add type-specific temporal edges
     # between consecutive same-bucket chains.

@@ -9,6 +9,18 @@ from .state import LOG_LEVEL, create_logger
 logger = create_logger("bucket", LOG_LEVEL)
 
 
+def _log_bucket_plan(label: str, buckets: list[tuple[int, int, list[fx.Node]]]) -> None:
+    """Log the final bucket partition without affecting the rewrite path."""
+    logger.debug(
+        "bucket plan %s: %s",
+        label,
+        [
+            {"first_node": first, "last_node": last, "parameters": len(params)}
+            for first, last, params in buckets
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # bucket_stage - stage-level parameter bucketing (placeholder params)
 # ---------------------------------------------------------------------------
