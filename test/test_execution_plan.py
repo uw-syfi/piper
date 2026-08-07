@@ -237,7 +237,7 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         node.task_type = TaskType.ORDER_DUMMY
         node.batches = [SimpleNamespace(mb_idx=0)]
     dag = _dag(first, second)
-    dag.add_edge(TrainingDAGEdge("first", "second", "temporal"))
+    dag.add_edge(TrainingDAGEdge("first", "second", "data"))
 
     class Recorder:
         def before_prologue(self, stream) -> None:
@@ -284,17 +284,30 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         override_calls.append(node.uid)
         return profile_compute if node.uid == "first" else profile_comm
 
-    executor.run(
+    prepared = executor.prepare(
         dag,
         [first, second],
+        stream_override=stream_override,
+    )
+    assert override_calls == ["first", "second"]
+    assert prepared.buffer_refcount_template == {"first": 1}
+    override_calls.clear()
+
+    def fail_if_plan_is_rebuilt(*_args, **_kwargs):
+        raise AssertionError("execution plan was rebuilt during run")
+
+    monkeypatch.setattr(executors, "build_execution_plan", fail_if_plan_is_rebuilt)
+
+    executor.run(
+        prepared,
         inputs=None,
         labels=None,
         loss_buffer=[],
-        stream_override=stream_override,
         timing_recorder=Recorder(),
     )
 
-    assert override_calls == ["first", "second"]
+    assert override_calls == []
+    buffers.init_refcounts.assert_called_once_with({"first": 1})
     first_completion = next(
         entry[1]
         for entry in trace
