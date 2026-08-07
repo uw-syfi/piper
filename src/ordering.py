@@ -1,7 +1,9 @@
+import heapq
+
 from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
-    _has_path,
+    _ReachabilityIndex,
     _topological_levels,
     _topological_order,
 )
@@ -50,19 +52,16 @@ def _serial_topological_order(
     )
 
 
-def _resolve_default_stream_order(dag: TrainingDAG) -> None:
-    """Create a total ordering over default-stream COMPUTE nodes.
+def _resolve_default_stream_order(
+    dag: TrainingDAG,
+    reachability: _ReachabilityIndex | None = None,
+) -> None:
+    """Serialize default-stream compute nodes with incremental graph indexes.
 
-    Whenever multiple default-stream compute nodes share a topological level,
-    chain them with temporal edges in descending order of downstream
-    dependencies (more downstream nodes -> earlier in the chain). Downstream
-    count is the size of each compute node's transitive successor set, which in
-    a well-formed training DAG terminates at UPD.
-
-    The new edges shift topological levels, so after each chain insertion we
-    recompute levels and rescan from the earliest level. The pass terminates
-    when every default-stream compute node sits at a unique level.
+    Conflicts are resolved by downstream-count ordering. Topological levels and
+    transitive reachability are updated incrementally as chain edges are added.
     """
+
     def _is_default_compute(uid: str) -> bool:
         node = dag.nodes[uid]
         return node.stream == _DEFAULT_STREAM and node.node_kind == "COMPUTE"
@@ -71,44 +70,73 @@ def _resolve_default_stream_order(dag: TrainingDAG) -> None:
     if len(compute_uids) < 2:
         return
 
-    def _downstream_count(uid: str) -> int:
-        seen: set[str] = set()
-        stack = list(dag.succs.get(uid, set()))
-        while stack:
-            v = stack.pop()
-            if v in seen:
+    if reachability is None:
+        reachability = _ReachabilityIndex(dag)
+
+    topo_levels = _topological_levels(dag)
+
+    def _propagate_level_increases(starts: set[str]) -> None:
+        pending = set(starts)
+        work_heap = [(topo_levels[uid], uid) for uid in pending]
+        heapq.heapify(work_heap)
+        while work_heap:
+            _level, uid = heapq.heappop(work_heap)
+            if uid not in pending:
                 continue
-            seen.add(v)
-            stack.extend(dag.succs.get(v, set()))
-        return len(seen)
+            pending.remove(uid)
+            pred_levels = [
+                topo_levels[pred_uid]
+                for pred_uid in dag.preds.get(uid, set())
+            ]
+            required_level = max(pred_levels) + 1 if pred_levels else 0
+            if required_level <= topo_levels[uid]:
+                continue
+            topo_levels[uid] = required_level
+            for succ_uid in dag.succs.get(uid, set()):
+                if succ_uid in pending:
+                    continue
+                pending.add(succ_uid)
+                heapq.heappush(
+                    work_heap,
+                    (topo_levels[succ_uid], succ_uid),
+                )
 
     while True:
-        topo_levels = _topological_levels(dag)
         by_level: dict[int, list[str]] = {}
         for uid in compute_uids:
             by_level.setdefault(topo_levels[uid], []).append(uid)
 
-        conflict_level: int | None = None
-        for level in sorted(by_level):
-            if len(by_level[level]) > 1:
-                conflict_level = level
-                break
+        conflict_level = next(
+            (
+                level
+                for level in sorted(by_level)
+                if len(by_level[level]) > 1
+            ),
+            None,
+        )
         if conflict_level is None:
             return
 
-        # Same-level nodes have no path between them, otherwise their levels
-        # would differ. Order by downstream count desc; break ties by uid.
         group = by_level[conflict_level]
-        ordered = sorted(group, key=lambda u: (-_downstream_count(u), u))
-        for src, dst in zip(ordered, ordered[1:]):
+        ordered = sorted(
+            group,
+            key=lambda uid: (-reachability.descendant_count(uid), uid),
+        )
+        changed_dsts: set[str] = set()
+        for src_uid, dst_uid in zip(ordered, ordered[1:]):
+            before = len(dag.edges)
             dag.add_edge(
                 TrainingDAGEdge(
-                    src_uid=src,
-                    dst_uid=dst,
+                    src_uid=src_uid,
+                    dst_uid=dst_uid,
                     dep_kind="temporal",
                     tensor_name=None,
                 )
             )
+            if len(dag.edges) != before:
+                reachability.add_edge(src_uid, dst_uid)
+                changed_dsts.add(dst_uid)
+        _propagate_level_increases(changed_dsts)
 
 
 def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
@@ -123,7 +151,8 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
     its latest predecessor, while a pure pre-compute operation (for example an
     all-gather) is anchored to its earliest default-stream successor.
     """
-    _resolve_default_stream_order(dag)
+    reachability = _ReachabilityIndex(dag)
+    _resolve_default_stream_order(dag, reachability)
 
     topo = _topological_order(dag)
     topo_idx = {uid: i for i, uid in enumerate(topo)}
@@ -187,12 +216,12 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
             )
             for next_uid in stream_uids:
                 if current_uid is not None and current_uid != next_uid:
-                    if _has_path(dag, next_uid, current_uid):
+                    if reachability.has_path(next_uid, current_uid):
                         raise ValueError(
                             "resolve_total_order_per_stream would create a cycle while ordering "
                             f"stream={stream}: {current_uid} -> {next_uid}"
                         )
-                    if not _has_path(dag, current_uid, next_uid):
+                    if not reachability.has_path(current_uid, next_uid):
                         dag.add_edge(
                             TrainingDAGEdge(
                                 src_uid=current_uid,
@@ -201,4 +230,5 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
                                 tensor_name=None,
                             )
                         )
+                        reachability.add_edge(current_uid, next_uid)
                 current_uid = next_uid

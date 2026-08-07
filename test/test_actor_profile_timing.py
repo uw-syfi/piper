@@ -66,6 +66,10 @@ def test_actor_only_retains_start_offsets_for_normal_profiles(monkeypatch) -> No
     actor._profile_node_samples = {}
     actor._profile_node_start_offsets = {}
     actor._profile_prologue_samples = {}
+    actor.profile_prepared_dag_executions = {
+        "interference_free": object(),
+        "normal": object(),
+    }
     actor._execute_dag = lambda **_kwargs: None
     monkeypatch.setattr(actor_module, "_CudaEventTimingRecorder", _Recorder)
     monkeypatch.setattr(actor_module.torch.cuda, "synchronize", lambda *_args: None)
@@ -83,13 +87,9 @@ def test_actor_only_retains_start_offsets_for_normal_profiles(monkeypatch) -> No
     }
 
 
-def test_actor_normal_run_uses_directional_execution_stream_policy() -> None:
+def test_actor_normal_run_uses_execution_prepared_during_setup() -> None:
     actor_class = PiperActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
-    directional_stream = object()
-    actor.runtime = SimpleNamespace(
-        execution_stream_for_task=lambda _node, _logical: directional_stream
-    )
     captured = {}
     expected_result = object()
 
@@ -102,10 +102,7 @@ def test_actor_normal_run_uses_directional_execution_stream_policy() -> None:
 
     assert actor.run_dag(loss_fn=loss_fn) is expected_result
     assert captured["loss_fn"] is loss_fn
-    assert (
-        captured["stream_override"](object(), object())
-        is directional_stream
-    )
+    assert "stream_override" not in captured
 
 
 def test_actor_result_keeps_normal_duration_and_offset_samples_paired(

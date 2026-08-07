@@ -54,6 +54,40 @@ class TrainingDAG:
     succs: dict[str, set[str]] = field(default_factory=dict)
     preds: dict[str, set[str]] = field(default_factory=dict)
     edge_keys: set[tuple[str, str, str, str | None]] = field(default_factory=set)
+    # Edge indexes retain the canonical ``edges`` list as the public/persisted
+    # representation while making incident-edge queries proportional to node
+    # degree.  ``compare=False`` keeps them as derived storage rather than part
+    # of TrainingDAG's semantic identity.
+    _out_edges_by_uid: dict[
+        str,
+        dict[tuple[str, str, str, str | None], TrainingDAGEdge],
+    ] = field(default_factory=dict, repr=False, compare=False)
+    _in_edges_by_uid: dict[
+        str,
+        dict[tuple[str, str, str, str | None], TrainingDAGEdge],
+    ] = field(default_factory=dict, repr=False, compare=False)
+    _edge_pair_counts: dict[tuple[str, str], int] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _next_comm_index_by_kind: dict[str, int] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _tag_uids_by_key_value: dict[tuple[str, Any], set[str]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _tag_uids_non_none_by_key: dict[str, set[str]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _node_order: dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+    _next_node_order: int = field(default=0, repr=False, compare=False)
     # Gradient-buffer initialization happens before the first scheduled node,
     # so it has no natural TrainingDAGNode to carry its profile.
     prologue_profile_times_by_mode: dict[str, dict[int, NodeProfile]] = field(
@@ -66,6 +100,11 @@ class TrainingDAG:
         self.nodes[node.uid] = node
         self.succs[node.uid] = set()
         self.preds[node.uid] = set()
+        self._out_edges_by_uid[node.uid] = {}
+        self._in_edges_by_uid[node.uid] = {}
+        self._node_order[node.uid] = self._next_node_order
+        self._next_node_order += 1
+        self._index_node_tag(node)
 
     def add_edge(self, edge: TrainingDAGEdge) -> None:
         if edge.src_uid not in self.nodes or edge.dst_uid not in self.nodes:
@@ -75,8 +114,129 @@ class TrainingDAG:
             return
         self.edge_keys.add(edge_key)
         self.edges.append(edge)
+        self._out_edges_by_uid.setdefault(edge.src_uid, {})[edge_key] = edge
+        self._in_edges_by_uid.setdefault(edge.dst_uid, {})[edge_key] = edge
+        pair_key = (edge.src_uid, edge.dst_uid)
+        self._edge_pair_counts[pair_key] = self._edge_pair_counts.get(pair_key, 0) + 1
         self.succs[edge.src_uid].add(edge.dst_uid)
         self.preds[edge.dst_uid].add(edge.src_uid)
+
+    def incoming_edges(
+        self,
+        uid: str,
+        *,
+        dep_kind: str | None = None,
+    ) -> list[TrainingDAGEdge]:
+        edges = self._in_edges_by_uid.get(uid, {}).values()
+        if dep_kind is None:
+            return list(edges)
+        return [edge for edge in edges if edge.dep_kind == dep_kind]
+
+    def outgoing_edges(
+        self,
+        uid: str,
+        *,
+        dep_kind: str | None = None,
+    ) -> list[TrainingDAGEdge]:
+        edges = self._out_edges_by_uid.get(uid, {}).values()
+        if dep_kind is None:
+            return list(edges)
+        return [edge for edge in edges if edge.dep_kind == dep_kind]
+
+    def _index_node_tag(self, node: TrainingDAGNode) -> None:
+        for key, value in node.tag.items():
+            self._tag_uids_by_key_value.setdefault((key, value), set()).add(node.uid)
+            if value is not None:
+                self._tag_uids_non_none_by_key.setdefault(key, set()).add(node.uid)
+
+    def _unindex_node_tag(self, node: TrainingDAGNode) -> None:
+        for key, value in node.tag.items():
+            exact = self._tag_uids_by_key_value.get((key, value))
+            if exact is not None:
+                exact.discard(node.uid)
+                if not exact:
+                    self._tag_uids_by_key_value.pop((key, value), None)
+            if value is not None:
+                non_none = self._tag_uids_non_none_by_key.get(key)
+                if non_none is not None:
+                    non_none.discard(node.uid)
+                    if not non_none:
+                        self._tag_uids_non_none_by_key.pop(key, None)
+
+    def update_node_tag(self, uid: str, tag: dict[str, Any]) -> None:
+        node = self.nodes[uid]
+        self._unindex_node_tag(node)
+        node.tag = tag
+        self._index_node_tag(node)
+
+    def matching_uids(
+        self,
+        tag_filter: dict[str, Any],
+        *,
+        wildcard_value: Any,
+        exclude_node_kinds: set[str] | None = None,
+    ) -> list[str]:
+        candidates: set[str] | None = None
+        for key, value in tag_filter.items():
+            if value == wildcard_value:
+                matching = self._tag_uids_non_none_by_key.get(key, set())
+            else:
+                matching = self._tag_uids_by_key_value.get((key, value), set())
+            candidates = set(matching) if candidates is None else candidates & matching
+            if not candidates:
+                return []
+        if candidates is None:
+            candidates = set(self.nodes)
+        if exclude_node_kinds:
+            candidates = {
+                uid
+                for uid in candidates
+                if self.nodes[uid].node_kind not in exclude_node_kinds
+            }
+        return sorted(candidates, key=self._node_order.__getitem__)
+
+    def _rebuild_tag_index(self) -> None:
+        self._tag_uids_by_key_value = {}
+        self._tag_uids_non_none_by_key = {}
+        self._node_order = {}
+        for order, node in enumerate(self.nodes.values()):
+            self._node_order[node.uid] = order
+            self._index_node_tag(node)
+        self._next_node_order = len(self.nodes)
+
+    def _rebuild_edge_indexes(self) -> None:
+        self.edge_keys = set()
+        self.succs = {uid: set() for uid in self.nodes}
+        self.preds = {uid: set() for uid in self.nodes}
+        self._out_edges_by_uid = {uid: {} for uid in self.nodes}
+        self._in_edges_by_uid = {uid: {} for uid in self.nodes}
+        self._edge_pair_counts = {}
+        if not hasattr(self, "_next_comm_index_by_kind"):
+            self._next_comm_index_by_kind = {}
+        deduplicated_edges: list[TrainingDAGEdge] = []
+        for edge in self.edges:
+            edge_key = (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
+            if edge_key in self.edge_keys:
+                continue
+            if edge.src_uid not in self.nodes or edge.dst_uid not in self.nodes:
+                raise ValueError(f"Edge references unknown node: {edge}")
+            self.edge_keys.add(edge_key)
+            deduplicated_edges.append(edge)
+            self._out_edges_by_uid[edge.src_uid][edge_key] = edge
+            self._in_edges_by_uid[edge.dst_uid][edge_key] = edge
+            pair_key = (edge.src_uid, edge.dst_uid)
+            self._edge_pair_counts[pair_key] = self._edge_pair_counts.get(pair_key, 0) + 1
+            self.succs[edge.src_uid].add(edge.dst_uid)
+            self.preds[edge.dst_uid].add(edge.src_uid)
+        self.edges = deduplicated_edges
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Older persistent DAGs predate the derived edge indexes.  Rebuilding
+        # here keeps those cache files loadable and also repairs adjacency for
+        # parallel data/temporal edges.
+        self.__dict__.update(state)
+        self._rebuild_edge_indexes()
+        self._rebuild_tag_index()
 
 
 
@@ -257,36 +417,73 @@ def _iter_data_edges(dag: TrainingDAG) -> list[TrainingDAGEdge]:
     return [e for e in dag.edges if e.dep_kind == "data"]
 
 
-def _remove_edge(dag: TrainingDAG, edge: TrainingDAGEdge) -> None:
-    edge_key = (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
-    if edge_key not in dag.edge_keys:
+def _edge_key(edge: TrainingDAGEdge) -> tuple[str, str, str, str | None]:
+    return (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
+
+
+def _remove_edges(dag: TrainingDAG, edges: list[TrainingDAGEdge]) -> None:
+    """Remove multiple edges with one canonical-edge-list compaction."""
+
+    remove_keys = {
+        _edge_key(edge)
+        for edge in edges
+        if _edge_key(edge) in dag.edge_keys
+    }
+    if not remove_keys:
         return
-    dag.edge_keys.remove(edge_key)
-    dag.edges = [
-        e for e in dag.edges
-        if not (
-            e.src_uid == edge.src_uid
-            and e.dst_uid == edge.dst_uid
-            and e.dep_kind == edge.dep_kind
-            and e.tensor_name == edge.tensor_name
-        )
-    ]
-    if edge.src_uid in dag.succs:
-        dag.succs[edge.src_uid].discard(edge.dst_uid)
-    if edge.dst_uid in dag.preds:
-        dag.preds[edge.dst_uid].discard(edge.src_uid)
+    removed = [edge for edge in dag.edges if _edge_key(edge) in remove_keys]
+    dag.edges = [edge for edge in dag.edges if _edge_key(edge) not in remove_keys]
+    for edge in removed:
+        edge_key = _edge_key(edge)
+        dag.edge_keys.remove(edge_key)
+        dag._out_edges_by_uid.get(edge.src_uid, {}).pop(edge_key, None)
+        dag._in_edges_by_uid.get(edge.dst_uid, {}).pop(edge_key, None)
+        pair_key = (edge.src_uid, edge.dst_uid)
+        remaining = dag._edge_pair_counts.get(pair_key, 0) - 1
+        if remaining > 0:
+            dag._edge_pair_counts[pair_key] = remaining
+            continue
+        dag._edge_pair_counts.pop(pair_key, None)
+        if edge.src_uid in dag.succs:
+            dag.succs[edge.src_uid].discard(edge.dst_uid)
+        if edge.dst_uid in dag.preds:
+            dag.preds[edge.dst_uid].discard(edge.src_uid)
+
+
+def _remove_edge(dag: TrainingDAG, edge: TrainingDAGEdge) -> None:
+    _remove_edges(dag, [edge])
 
 def _remove_node_and_incident_edges(dag: TrainingDAG, uid: str) -> None:
-    incident = [e for e in dag.edges if e.src_uid == uid or e.dst_uid == uid]
-    for e in incident:
-        _remove_edge(dag, e)
-    dag.nodes.pop(uid, None)
+    incident = dag.incoming_edges(uid) + dag.outgoing_edges(uid)
+    _remove_edges(dag, incident)
+    node = dag.nodes.pop(uid, None)
+    if node is not None:
+        dag._unindex_node_tag(node)
+    dag._node_order.pop(uid, None)
     dag.succs.pop(uid, None)
     dag.preds.pop(uid, None)
-    for s in dag.succs.values():
-        s.discard(uid)
-    for p in dag.preds.values():
-        p.discard(uid)
+    dag._out_edges_by_uid.pop(uid, None)
+    dag._in_edges_by_uid.pop(uid, None)
+
+
+def _remove_nodes_and_incident_edges(dag: TrainingDAG, uids: set[str]) -> None:
+    """Remove a node set and every incident edge in one bulk operation."""
+
+    existing = uids & dag.nodes.keys()
+    incident: list[TrainingDAGEdge] = []
+    for uid in existing:
+        incident.extend(dag.incoming_edges(uid))
+        incident.extend(dag.outgoing_edges(uid))
+    _remove_edges(dag, incident)
+    for uid in existing:
+        node = dag.nodes.pop(uid, None)
+        if node is not None:
+            dag._unindex_node_tag(node)
+        dag._node_order.pop(uid, None)
+        dag.succs.pop(uid, None)
+        dag.preds.pop(uid, None)
+        dag._out_edges_by_uid.pop(uid, None)
+        dag._in_edges_by_uid.pop(uid, None)
 
 def _topological_order(dag: TrainingDAG) -> list[str]:
     in_deg: dict[str, int] = {uid: 0 for uid in dag.nodes}
@@ -351,3 +548,45 @@ def _has_path(dag: TrainingDAG, src_uid: str, dst_uid: str) -> bool:
         seen.add(uid)
         stack.extend(dag.succs.get(uid, set()))
     return False
+
+
+class _ReachabilityIndex:
+    """Bitset reachability for a fixed node set with incremental edge adds."""
+
+    def __init__(self, dag: TrainingDAG) -> None:
+        topo = _topological_order(dag)
+        self._dag = dag
+        self._bit_by_uid = {
+            uid: 1 << index for index, uid in enumerate(topo)
+        }
+        self._reachable_by_uid: dict[str, int] = {}
+        for uid in reversed(topo):
+            reachable = self._bit_by_uid[uid]
+            for succ_uid in dag.succs.get(uid, set()):
+                reachable |= self._reachable_by_uid[succ_uid]
+            self._reachable_by_uid[uid] = reachable
+
+    def has_path(self, src_uid: str, dst_uid: str) -> bool:
+        return bool(
+            self._reachable_by_uid[src_uid]
+            & self._bit_by_uid[dst_uid]
+        )
+
+    def descendant_count(self, uid: str) -> int:
+        """Return the number of nodes reachable from ``uid``, excluding it."""
+
+        return self._reachable_by_uid[uid].bit_count() - 1
+
+    def add_edge(self, src_uid: str, dst_uid: str) -> None:
+        """Update closure after the caller adds ``src_uid -> dst_uid``."""
+
+        new_descendants = self._reachable_by_uid[dst_uid]
+        pending = [src_uid]
+        while pending:
+            uid = pending.pop()
+            previous = self._reachable_by_uid[uid]
+            updated = previous | new_descendants
+            if updated == previous:
+                continue
+            self._reachable_by_uid[uid] = updated
+            pending.extend(self._dag.preds.get(uid, set()))

@@ -16,13 +16,19 @@ from .state import (
     LOG_LEVEL,
 )
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
-from .executors import CommunicationExecutor, ComputeExecutor, DagExecutor
+from .executors import (
+    CommunicationExecutor,
+    ComputeExecutor,
+    DagExecutor,
+    PreparedDagExecution,
+)
 from .ordering import _serial_topological_order
 from .profiling import (
     ActorProfileResult,
     DEFAULT_NORMAL_SCOPE,
     DEFAULT_ISOLATION_SCOPE,
     NodeProfile,
+    PROFILE_MODES,
     finalized_dag_fingerprint,
     normalize_profile_mode,
 )
@@ -250,6 +256,10 @@ class PiperActor:
         # DAG execution state
         self.dag = None
         self.sorted_dag_nodes = None
+        self.prepared_dag_execution: PreparedDagExecution | None = None
+        self.profile_prepared_dag_executions: dict[
+            str, PreparedDagExecution
+        ] = {}
         # Interference-free and normal profiles must never be combined:
         # they answer different simulation questions from the same DAG.
         self._profile_node_samples: dict[
@@ -872,15 +882,46 @@ class PiperActor:
         self.sorted_dag_nodes = [
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
+        self.prepared_dag_execution = self.dag_executor.prepare(
+            training_dag,
+            self.sorted_dag_nodes,
+            stream_override=self.runtime.execution_stream_for_task,
+        )
+        # Normal profiling uses the ordinary physical-stream policy exactly;
+        # only interference-free profiling needs a remapped stream table.
+        self.profile_prepared_dag_executions = {
+            "normal": self.prepared_dag_execution,
+        }
+        for profile_mode in sorted(PROFILE_MODES - {"normal"}):
+            self.profile_prepared_dag_executions[profile_mode] = (
+                self.dag_executor.remap_streams(
+                    self.prepared_dag_execution,
+                    stream_override=(
+                        lambda node, logical_stream, mode=profile_mode: (
+                            self._profile_stream_override(
+                                node,
+                                logical_stream,
+                                profile_mode=mode,
+                            )
+                        )
+                    ),
+                )
+            )
 
     def _execute_dag(
         self,
         loss_fn=None,
         *,
-        stream_override=None,
+        prepared_execution: PreparedDagExecution | None = None,
         timing_recorder=None,
         iteration_label: str = "iter",
     ):
+        if prepared_execution is None:
+            prepared_execution = self.prepared_dag_execution
+        if prepared_execution is None:
+            raise RuntimeError(
+                "load_training_dag() must be called before DAG execution"
+            )
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
@@ -889,23 +930,18 @@ class PiperActor:
         )
         try:
             return self.dag_executor.run(
-                self.dag,
-                self.sorted_dag_nodes,
+                prepared_execution,
                 self.inputs,
                 self.labels,
                 self.loss,
                 loss_fn=loss_fn,
-                stream_override=stream_override,
                 timing_recorder=timing_recorder,
             )
         finally:
             self._nvtx_pop()
 
     def run_dag(self, loss_fn=None):
-        return self._execute_dag(
-            loss_fn=loss_fn,
-            stream_override=self.runtime.execution_stream_for_task,
-        )
+        return self._execute_dag(loss_fn=loss_fn)
 
     def reset_profile_samples(
         self, *, profile_mode: str = "interference_free"
@@ -956,11 +992,7 @@ class PiperActor:
         recorder = _CudaEventTimingRecorder() if record else None
         self._execute_dag(
             loss_fn=loss_fn,
-            stream_override=lambda node, logical_stream: self._profile_stream_override(
-                node,
-                logical_stream,
-                profile_mode=mode,
-            ),
+            prepared_execution=self.profile_prepared_dag_executions[mode],
             timing_recorder=recorder,
             iteration_label=f"profile_{mode}_iter",
         )

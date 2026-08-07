@@ -101,7 +101,11 @@ def annotate(name: str) -> Iterator[dict[str, int]]:
 
 
 
-def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[TrainingDAG]:
+def _split_global_training_dag_by_pp_rank(
+    training_dag: TrainingDAG,
+    *,
+    merge_same_device_components: bool = False,
+) -> list[TrainingDAG]:
     """Split the global DAG into per-device-set disconnected DAGs."""
     # SEND/RECV pairs intentionally have no edge between them, so cross-rank
     # placement dependencies separate into disconnected local components here.
@@ -141,7 +145,16 @@ def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[Tra
                 f"component[{ci}] is not device-homogeneous; device sets present: {sorted(device_keys)}"
             )
         comp_device_keys.append(next(iter(device_keys)))
-    if len(set(comp_device_keys)) != len(comp_device_keys):
+    if (
+        len(set(comp_device_keys)) != len(comp_device_keys)
+        and merge_same_device_components
+    ):
+        merged_by_device: dict[tuple[int, ...], set[str]] = {}
+        for comp, device_key in zip(components, comp_device_keys):
+            merged_by_device.setdefault(device_key, set()).update(comp)
+        components = list(merged_by_device.values())
+        comp_device_keys = list(merged_by_device)
+    elif len(set(comp_device_keys)) != len(comp_device_keys):
         raise ValueError(
             f"expected distinct device sets across split components, got {comp_device_keys}"
         )
@@ -154,7 +167,9 @@ def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[Tra
             mode: dict(profiles)
             for mode, profiles in training_dag.prologue_profile_times_by_mode.items()
         }
-        for uid in comp:
+        for uid in training_dag.nodes:
+            if uid not in comp:
+                continue
             n = training_dag.nodes[uid]
             sub.add_node(
                 TrainingDAGNode(

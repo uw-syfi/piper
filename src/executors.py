@@ -11,6 +11,7 @@ from torch.nn import Parameter
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
 from .execution_plan import (
+    PlannedOperation,
     build_execution_plan,
     is_relaxable_p2p_ordering_dependency,
 )
@@ -38,6 +39,25 @@ class TimingRecorder(Protocol):
 
 
 StreamOverride = Callable[[Any, torch.cuda.Stream], torch.cuda.Stream]
+
+
+@dataclass(frozen=True)
+class PreparedDagExecution:
+    """Invariant state needed to execute one loaded TrainingDAG.
+
+    Building the dependency plan and UID lookup tables is proportional to DAG
+    size.  Keep that setup work out of the per-iteration dispatch loop.  A
+    remapped execution shares the static plan and node order while retaining a
+    separate physical-stream table for its execution/profile policy.
+    """
+
+    dag: Any
+    sorted_dag_nodes: tuple[Any, ...]
+    execution_plan: tuple[PlannedOperation, ...]
+    planned_by_uid: dict[str, PlannedOperation]
+    physical_stream_by_uid: dict[str, torch.cuda.Stream]
+    initial_wait_streams: tuple[torch.cuda.Stream, ...]
+    buffer_refcount_template: dict[Any, int]
 
 
 @dataclass
@@ -610,35 +630,69 @@ class DagExecutor:
                 tensor = tensor.contiguous()
             return tensor
 
-    def run(
+    def prepare(
         self,
         dag: Any,
-        sorted_dag_nodes: list[Any],
-        inputs: Any,
-        labels: Any,
-        loss_buffer: list,
-        loss_fn=None,
+        sorted_dag_nodes: list[Any] | tuple[Any, ...],
         *,
         stream_override: StreamOverride | None = None,
-        timing_recorder: TimingRecorder | None = None,
-    ) -> None:
-        """Run one iteration of the loaded TrainingDAG.
+    ) -> PreparedDagExecution:
+        """Build immutable-per-DAG execution state once during actor setup."""
+        assert dag is not None, "cannot prepare a missing TrainingDAG"
+        assert sorted_dag_nodes is not None, "cannot prepare a missing node order"
 
-        ``stream_override`` receives ``(node, logical_cuda_stream)`` and must
-        return the physical CUDA stream on which that node should execute.  It
-        is called for every node so ordinary execution and profiling policies
-        can map P2P directions independently from non-P2P work.  SEND/RECV
-        still select their existing lo-to-hi or hi-to-lo NCCL process group
-        inside :class:`CommunicationExecutor`.
-        """
-        assert dag is not None, "load_training_dag() must be called before run_dag()"
-        assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
-
-        execution_plan = build_execution_plan(
-            dag,
-            [node.uid for node in sorted_dag_nodes],
+        nodes = tuple(sorted_dag_nodes)
+        execution_plan = tuple(
+            build_execution_plan(dag, [node.uid for node in nodes])
         )
-        planned_by_uid = {operation.uid: operation for operation in execution_plan}
+        planned_by_uid = {
+            operation.uid: operation for operation in execution_plan
+        }
+        physical_stream_by_uid = self._physical_streams(
+            nodes,
+            stream_override=stream_override,
+        )
+        return PreparedDagExecution(
+            dag=dag,
+            sorted_dag_nodes=nodes,
+            execution_plan=execution_plan,
+            planned_by_uid=planned_by_uid,
+            physical_stream_by_uid=physical_stream_by_uid,
+            initial_wait_streams=self._initial_wait_streams(
+                physical_stream_by_uid
+            ),
+            buffer_refcount_template=self._buffer_refcount_template(dag),
+        )
+
+    def remap_streams(
+        self,
+        prepared: PreparedDagExecution,
+        *,
+        stream_override: StreamOverride | None = None,
+    ) -> PreparedDagExecution:
+        """Prepare another stream policy without rebuilding the static plan."""
+        physical_stream_by_uid = self._physical_streams(
+            prepared.sorted_dag_nodes,
+            stream_override=stream_override,
+        )
+        return PreparedDagExecution(
+            dag=prepared.dag,
+            sorted_dag_nodes=prepared.sorted_dag_nodes,
+            execution_plan=prepared.execution_plan,
+            planned_by_uid=prepared.planned_by_uid,
+            physical_stream_by_uid=physical_stream_by_uid,
+            initial_wait_streams=self._initial_wait_streams(
+                physical_stream_by_uid
+            ),
+            buffer_refcount_template=prepared.buffer_refcount_template,
+        )
+
+    def _physical_streams(
+        self,
+        sorted_dag_nodes: tuple[Any, ...],
+        *,
+        stream_override: StreamOverride | None,
+    ) -> dict[str, torch.cuda.Stream]:
         physical_stream_by_uid: dict[str, torch.cuda.Stream] = {}
         for node in sorted_dag_nodes:
             logical_stream = self.runtime.stream_for_task(node)
@@ -647,6 +701,52 @@ class DagExecutor:
                 if stream_override is None
                 else stream_override(node, logical_stream)
             )
+        return physical_stream_by_uid
+
+    def _initial_wait_streams(
+        self,
+        physical_stream_by_uid: dict[str, torch.cuda.Stream],
+    ) -> tuple[torch.cuda.Stream, ...]:
+        """Deduplicate invariant prologue wait targets by object identity."""
+        default_stream = self.runtime.default_stream()
+        result: list[torch.cuda.Stream] = []
+        for stream in (
+            *self.runtime.streams.values(),
+            *physical_stream_by_uid.values(),
+        ):
+            if stream is default_stream:
+                continue
+            if any(stream is seen for seen in result):
+                continue
+            result.append(stream)
+        return tuple(result)
+
+    @staticmethod
+    def _buffer_refcount_template(dag: Any) -> dict[Any, int]:
+        result: dict[Any, int] = {}
+        for edge in dag.edges:
+            if edge.dep_kind == "data":
+                result[edge.src_uid] = result.get(edge.src_uid, 0) + 1
+        return result
+
+    def run(
+        self,
+        prepared: PreparedDagExecution,
+        inputs: Any,
+        labels: Any,
+        loss_buffer: list,
+        loss_fn=None,
+        *,
+        timing_recorder: TimingRecorder | None = None,
+    ) -> None:
+        """Run one iteration using state prepared outside the hot loop."""
+        assert prepared is not None, (
+            "load_training_dag() must prepare execution before run_dag()"
+        )
+        dag = prepared.dag
+        sorted_dag_nodes = prepared.sorted_dag_nodes
+        planned_by_uid = prepared.planned_by_uid
+        physical_stream_by_uid = prepared.physical_stream_by_uid
 
         self.params.drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
@@ -666,23 +766,12 @@ class DagExecutor:
         # An override may return streams not registered in RuntimeState.streams
         # (for example dedicated directional P2P streams). Gate each distinct
         # physical stream on the prologue too.
-        initial_streams = [
-            *self.runtime.streams.values(),
-            *physical_stream_by_uid.values(),
-        ]
-        seen_streams: list[torch.cuda.Stream] = []
-        for stream in initial_streams:
-            if stream is default_stream:
-                continue
-            if any(stream is seen for seen in seen_streams):
-                continue
-            seen_streams.append(stream)
-            if stream is not default_stream:
-                stream.wait_event(zero_evt)
+        for stream in prepared.initial_wait_streams:
+            stream.wait_event(zero_evt)
         completion_events: dict[str, torch.cuda.Event] = {}
         completion_streams: dict[str, torch.cuda.Stream] = {}
 
-        self.buffers.init_refcounts(dag)
+        self.buffers.init_refcounts(prepared.buffer_refcount_template)
 
         for node in sorted_dag_nodes:
             task_type = node.task_type
