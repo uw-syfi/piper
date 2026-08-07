@@ -21,13 +21,9 @@ class BufferStore:
         self.task.clear()
         self.refcounts.clear()
 
-    def init_refcounts(self, dag: Any) -> None:
-        nodes_iter = dag.nodes.values() if isinstance(dag.nodes, dict) else dag.nodes
-        self.refcounts = {
-            node.uid: len(node.data_succs)
-            for node in nodes_iter
-            if node.data_succs
-        }
+    def init_refcounts(self, template: dict[Any, int]) -> None:
+        """Restore mutable consumer counts from a setup-time DAG template."""
+        self.refcounts.update(template)
 
     def release(self, uid: Any) -> None:
         remaining = self.refcounts.get(uid)
