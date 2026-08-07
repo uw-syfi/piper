@@ -2,6 +2,7 @@ import ray
 import torch
 import os
 import re
+import time
 from typing import Any
 import gc
 from datetime import timedelta
@@ -16,6 +17,12 @@ from .state import (
     LOG_LEVEL,
 )
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
+from .model_state import (
+    DEFAULT_MODEL_SEED,
+    dynamo_buffer_name_to_state_dict_key,
+    dynamo_parameter_name_to_state_dict_key,
+    initialize_parameter_,
+)
 from .executors import (
     CommunicationExecutor,
     ComputeExecutor,
@@ -49,7 +56,12 @@ logger = create_logger("actor", LOG_LEVEL)
 class _CudaEventTimingRecorder:
     """Collect one CUDA-event sample for every dispatched DAG node."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        coordinator_clock_offset_ns: int = 0,
+        clock_sync_uncertainty_ns: int = 0,
+    ) -> None:
         self._node_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         self._active_node_starts: dict[str, torch.cuda.Event] = {}
         self._prologue_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
@@ -57,6 +69,10 @@ class _CudaEventTimingRecorder:
         self.node_samples_us: dict[str, float] = {}
         self.node_start_offsets_us: dict[str, float] = {}
         self.prologue_sample_us: float | None = None
+        self.timeline_origin_us: float | None = None
+        self.timeline_origin_uncertainty_us: float | None = None
+        self._coordinator_clock_offset_ns = int(coordinator_clock_offset_ns)
+        self._clock_sync_uncertainty_ns = int(clock_sync_uncertainty_ns)
 
     @staticmethod
     def _event() -> torch.cuda.Event:
@@ -64,7 +80,21 @@ class _CudaEventTimingRecorder:
 
     def before_prologue(self, stream: torch.cuda.Stream) -> None:
         start = self._event()
+        host_before_ns = time.monotonic_ns()
         start.record(stream)
+        # Profiling starts from an idle device.  Synchronizing this one anchor
+        # event maps the actor-local CUDA timeline to the coordinator's
+        # calibrated monotonic clock without synchronizing any timed node.
+        start.synchronize()
+        host_after_ns = time.monotonic_ns()
+        host_midpoint_ns = (host_before_ns + host_after_ns) // 2
+        self.timeline_origin_us = (
+            host_midpoint_ns + self._coordinator_clock_offset_ns
+        ) / 1000.0
+        self.timeline_origin_uncertainty_us = (
+            (host_after_ns - host_before_ns) / 2.0
+            + self._clock_sync_uncertainty_ns
+        ) / 1000.0
         self._prologue_start = start
 
     def after_prologue(self, stream: torch.cuda.Stream) -> None:
@@ -132,6 +162,7 @@ def _create_actors(
     temp_dir: str = None,
     use_inductor: bool = False,
     pp_outer: bool = False,
+    model_seed: int = DEFAULT_MODEL_SEED,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -158,6 +189,8 @@ def _create_actors(
                 "CPLUS_INCLUDE_PATH",
                 "LIBRARY_PATH",
                 "TRITON_CACHE_DIR",
+                "PYTORCH_ALLOC_CONF",
+                "PYTORCH_CUDA_ALLOC_CONF",
                 "NCCL_CUMEM_ENABLE",
                 "NCCL_DEBUG",
                 "NCCL_DEBUG_FILE",
@@ -205,6 +238,7 @@ def _create_actors(
             pp_degree=pp_degree,
             no_nvtx=no_nvtx,
             use_inductor=use_inductor,
+            model_seed=model_seed,
         )
         piper_metadata.actors[pp_rank] = actor
 
@@ -221,6 +255,7 @@ class PiperActor:
         pp_degree=1,
         no_nvtx: bool = False,
         use_inductor: bool = False,
+        model_seed: int = DEFAULT_MODEL_SEED,
     ):
         self.logger = create_logger("actor", LOG_LEVEL)
 
@@ -231,6 +266,7 @@ class PiperActor:
 
         self.optim_class = optim_class
         self.use_inductor = bool(use_inductor)
+        self.model_seed = int(model_seed)
         if self.use_inductor:
             _disable_functorch_donated_buffers()
         self.runtime = RuntimeState(
@@ -269,6 +305,12 @@ class PiperActor:
             str, dict[str, list[float]]
         ] = {}
         self._profile_prologue_samples: dict[str, list[float]] = {}
+        self._profile_timeline_origins_us: dict[str, list[float]] = {}
+        self._profile_timeline_origin_uncertainties_us: dict[
+            str, list[float]
+        ] = {}
+        self._profile_coordinator_clock_offset_ns = 0
+        self._profile_clock_sync_uncertainty_ns = 0
 
         self.buffers = BufferStore()
         self.events = EventStore()
@@ -357,6 +399,86 @@ class PiperActor:
         the actor's device so ``_load_stage`` can copy them directly.
         """
         self.model_const_attrs = {k: v.to(self.runtime.device) for k, v in const_attrs.items()}
+
+    def export_model_parameter_state(self) -> dict[str, torch.Tensor]:
+        """Return this actor's current eager-compatible parameter state.
+
+        ZeRO-3 parameters are reconstructed collectively from the shards held
+        by the same PP rank in every DP replica. All DP workers must therefore
+        invoke this method in the same bucket order.
+        """
+        self.params.drain_pending_frees()
+        torch.cuda.synchronize()
+        state: dict[str, torch.Tensor] = {}
+        stream = self.runtime.default_stream()
+
+        for ubid, bucket in sorted(
+            self.stages.buckets.items(), key=lambda item: str(item[0])
+        ):
+            name_by_arg_idx = dict(zip(bucket.param_idxs, bucket.param_names))
+            if ubid in self.stages.param_sharded_ubids:
+                shard_param = bucket.shard_param
+                shard_info = bucket.param_shard_info
+                if shard_param is None or shard_info is None:
+                    raise RuntimeError(
+                        f"cannot export sharded parameters for bucket {ubid}: "
+                        "missing shard storage metadata"
+                    )
+                _shard_start, shard_size, orig_numel = shard_info
+                gathered = torch.empty(
+                    shard_size * self.runtime.dp_degree,
+                    dtype=shard_param.dtype,
+                    device=shard_param.device,
+                )
+                with torch.cuda.stream(stream):
+                    dist.all_gather_into_tensor(
+                        gathered, shard_param, group=self.runtime.dp_group
+                    )
+                stream.synchronize()
+                for arg_idx, (_param, offset, numel, shape) in zip(
+                    bucket.trainable_param_idxs, bucket.param_view_specs
+                ):
+                    if offset + numel > orig_numel:
+                        raise RuntimeError(
+                            f"parameter slice exceeds unpadded bucket {ubid}: "
+                            f"offset={offset} numel={numel} orig_numel={orig_numel}"
+                        )
+                    value = gathered[offset : offset + numel].view(shape)
+                    self._add_exported_parameter(
+                        state, name_by_arg_idx.get(arg_idx), value
+                    )
+                continue
+
+            for arg_idx in bucket.trainable_param_idxs:
+                value = bucket.forward_args[arg_idx]
+                if value is None:
+                    raise RuntimeError(
+                        f"cannot export parameter index {arg_idx} in bucket {ubid}: "
+                        "parameter storage is missing"
+                    )
+                self._add_exported_parameter(
+                    state, name_by_arg_idx.get(arg_idx), value
+                )
+
+        torch.cuda.synchronize()
+        return state
+
+    @staticmethod
+    def _add_exported_parameter(
+        state: dict[str, torch.Tensor],
+        dynamo_name: str | None,
+        value: torch.Tensor,
+    ) -> None:
+        if dynamo_name is None:
+            raise RuntimeError("parameter bucket is missing its Dynamo placeholder name")
+        state_key = dynamo_parameter_name_to_state_dict_key(dynamo_name)
+        if state_key is None:
+            raise RuntimeError(
+                f"cannot translate Dynamo parameter placeholder {dynamo_name!r}"
+            )
+        if state_key in state:
+            raise RuntimeError(f"duplicate exported model parameter {state_key!r}")
+        state[state_key] = value.detach().cpu().clone()
 
     def get_node_ip_and_free_port(self):
         import socket
@@ -520,9 +642,6 @@ class PiperActor:
             f"Loading stage {stage_id} ({len(modules_data)} module(s)) on actor {self.runtime.global_rank}"
         )
 
-        g = torch.Generator(device=self.runtime.device)
-        g.manual_seed(1000 * self.runtime.global_rank + stage_id)
-
         first_gm = None
 
         for b_idx, bd in enumerate(modules_data):
@@ -536,7 +655,16 @@ class PiperActor:
             if self.use_inductor:
                 compiled_gms = []
                 for subgraph_idx, gm in enumerate(gms):
-                    compiled_gm = torch.compile(gm)
+                    is_expert = bool(bd.get("is_expert"))
+                    # EP changes the token dimension entering the expert
+                    # segment. Compile that segment dynamically from its
+                    # first invocation, matching TorchTitan's expert compiler
+                    # wrapper and avoiding one specialization per routing load.
+                    compiled_gm = torch.compile(
+                        gm,
+                        fullgraph=is_expert,
+                        dynamic=True if is_expert else None,
+                    )
                     compiled_gms.append(compiled_gm)
                     self.logger.debug(
                         f"[load_stage_compile] rank={self.runtime.global_rank} stage={stage_id} "
@@ -580,15 +708,34 @@ class PiperActor:
                     continue
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 if arg.requires_grad:
+                    ph_name = (
+                        shared_placeholder_names[i]
+                        if i < len(shared_placeholder_names)
+                        else ""
+                    )
+                    state_key = dynamo_parameter_name_to_state_dict_key(ph_name)
+                    if state_key is None:
+                        raise RuntimeError(
+                            "cannot deterministically initialize trainable "
+                            f"placeholder {ph_name!r}: unsupported Dynamo name"
+                        )
+                    initialize_parameter_(
+                        t,
+                        state_key,
+                        self.model_seed,
+                    )
                     t.requires_grad_(True)
-                    torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
-                    # Non-trainable slot: try to fill from const attrs (freqs_cis, mask, …)
-                    # before falling back to zeros.  Dynamo names direct model attrs as
-                    # "l_self_<attr_name>", so strip that prefix to get the bare name.
-                    ph_name = shared_placeholder_names[i] if i < len(shared_placeholder_names) else ""
-                    attr_name = re.sub(r'^l_self_', '', ph_name)
-                    const_val = self.model_const_attrs.get(attr_name)
+                    # Non-trainable slot: fill lifted model buffers (freqs_cis,
+                    # rope_cache, mask, ...) from the eager value supplied by
+                    # piper_setup before falling back to zeros.
+                    ph_name = (
+                        shared_placeholder_names[i]
+                        if i < len(shared_placeholder_names)
+                        else ""
+                    )
+                    buffer_key = dynamo_buffer_name_to_state_dict_key(ph_name)
+                    const_val = self.model_const_attrs.get(buffer_key)
                     if (
                         const_val is not None
                         and tuple(const_val.shape) == tuple(arg.shape)
@@ -773,6 +920,7 @@ class PiperActor:
 
         # Clear any prior module state before loading a new training DAG.
         self.stages.clear_loaded_modules()
+        self.dag_executor.expert_a2a_states.clear()
 
         stage_to_modules: dict[int, list[dict]] = defaultdict(list)
 
@@ -831,6 +979,7 @@ class PiperActor:
                 "ac_num_subgraphs": 1,
                 "ac_requested_subgraphs": 1,
                 "apply_zero": bool(meta.get("apply_zero", True)),
+                "is_expert": "EP" in getattr(node, "tag", {}),
                 "training_dag_uid": getattr(node, "uid", None),
                 "triton_constant_args": dict(meta.get("triton_constant_args", {})),
             }
@@ -950,11 +1099,43 @@ class PiperActor:
 
         mode = normalize_profile_mode(profile_mode)
         self._profile_node_samples[mode] = defaultdict(list)
-        if mode == "normal":
-            self._profile_node_start_offsets[mode] = defaultdict(list)
-        else:
-            self._profile_node_start_offsets.pop(mode, None)
+        self._profile_node_start_offsets[mode] = defaultdict(list)
         self._profile_prologue_samples[mode] = []
+        self._profile_timeline_origins_us[mode] = []
+        self._profile_timeline_origin_uncertainties_us[mode] = []
+
+    def calibrate_profile_clock(self, clock_actor: Any, samples: int = 9) -> dict:
+        """Calibrate this actor's monotonic clock to one Ray coordinator.
+
+        This is the standard midpoint/round-trip estimator used by NTP.  The
+        minimum-RTT exchange minimizes queueing asymmetry; half its RTT is
+        retained as a conservative alignment uncertainty.
+        """
+
+        if int(samples) <= 0:
+            raise ValueError("clock calibration requires at least one sample")
+        candidates: list[tuple[int, int]] = []
+        for _ in range(int(samples)):
+            local_before_ns = time.monotonic_ns()
+            coordinator_ns = int(ray.get(clock_actor.monotonic_time_ns.remote()))
+            local_after_ns = time.monotonic_ns()
+            round_trip_ns = local_after_ns - local_before_ns
+            local_midpoint_ns = (local_before_ns + local_after_ns) // 2
+            candidates.append(
+                (round_trip_ns, coordinator_ns - local_midpoint_ns)
+            )
+        best_round_trip_ns, best_offset_ns = min(candidates)
+        self._profile_coordinator_clock_offset_ns = best_offset_ns
+        self._profile_clock_sync_uncertainty_ns = (
+            best_round_trip_ns + 1
+        ) // 2
+        return {
+            "method": "ray_ntp_midpoint_min_rtt",
+            "samples": int(samples),
+            "coordinator_clock_offset_ns": int(best_offset_ns),
+            "round_trip_ns": int(best_round_trip_ns),
+            "uncertainty_ns": int(self._profile_clock_sync_uncertainty_ns),
+        }
 
     def _profile_stream_override(
         self,
@@ -974,6 +1155,8 @@ class PiperActor:
         loss_fn=None,
         *,
         record: bool = True,
+        synchronize_before: bool = True,
+        synchronize: bool = False,
         profile_mode: str = "interference_free",
     ) -> None:
         """Run one timed iteration using interference-free or normal streams.
@@ -988,8 +1171,20 @@ class PiperActor:
             raise RuntimeError(
                 f"{mode} profiling cannot run while torch.profiler is active"
             )
-        torch.cuda.synchronize(self.runtime.device)
-        recorder = _CudaEventTimingRecorder() if record else None
+        if synchronize_before:
+            torch.cuda.synchronize(self.runtime.device)
+        recorder = (
+            _CudaEventTimingRecorder(
+                coordinator_clock_offset_ns=getattr(
+                    self, "_profile_coordinator_clock_offset_ns", 0
+                ),
+                clock_sync_uncertainty_ns=getattr(
+                    self, "_profile_clock_sync_uncertainty_ns", 0
+                ),
+            )
+            if record
+            else None
+        )
         self._execute_dag(
             loss_fn=loss_fn,
             prepared_execution=self.profile_prepared_dag_executions[mode],
@@ -997,6 +1192,8 @@ class PiperActor:
             iteration_label=f"profile_{mode}_iter",
         )
         if recorder is None:
+            if synchronize:
+                torch.cuda.synchronize(self.runtime.device)
             return
         missing = set(self.dag.nodes) - set(recorder.node_samples_us)
         if missing:
@@ -1006,16 +1203,49 @@ class PiperActor:
         node_samples = self._profile_node_samples.setdefault(mode, defaultdict(list))
         for uid, sample_us in recorder.node_samples_us.items():
             node_samples[uid].append(sample_us)
-        if mode == "normal":
-            node_start_offsets = self._profile_node_start_offsets.setdefault(
-                mode, defaultdict(list)
+        node_start_offsets = self._profile_node_start_offsets.setdefault(
+            mode, defaultdict(list)
+        )
+        for uid, offset_us in recorder.node_start_offsets_us.items():
+            node_start_offsets[uid].append(offset_us)
+        timeline_origins = getattr(
+            self, "_profile_timeline_origins_us", None
+        )
+        if timeline_origins is None:
+            timeline_origins = {}
+            self._profile_timeline_origins_us = timeline_origins
+        timeline_uncertainties = getattr(
+            self, "_profile_timeline_origin_uncertainties_us", None
+        )
+        if timeline_uncertainties is None:
+            timeline_uncertainties = {}
+            self._profile_timeline_origin_uncertainties_us = timeline_uncertainties
+        if getattr(recorder, "timeline_origin_us", None) is not None:
+            timeline_origins.setdefault(mode, []).append(
+                recorder.timeline_origin_us
             )
-            for uid, offset_us in recorder.node_start_offsets_us.items():
-                node_start_offsets[uid].append(offset_us)
+            timeline_uncertainties.setdefault(mode, []).append(
+                float(
+                    getattr(recorder, "timeline_origin_uncertainty_us", 0.0)
+                    or 0.0
+                )
+            )
         if recorder.prologue_sample_us is not None:
             self._profile_prologue_samples.setdefault(mode, []).append(
                 recorder.prologue_sample_us
             )
+
+    def synchronize_device(self) -> None:
+        """Wait for all work on this actor's CUDA device."""
+
+        torch.cuda.synchronize(self.runtime.device)
+
+    def clear_profile_allocator_cache(self) -> None:
+        """Release unused cached blocks before a recorded profile series."""
+
+        torch.cuda.synchronize(self.runtime.device)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def get_profile_result(
         self,
@@ -1089,4 +1319,14 @@ class PiperActor:
             },
             node_profiles=node_profiles,
             prologue_profile=prologue_profile,
+            timeline_origin_samples_us=tuple(
+                getattr(self, "_profile_timeline_origins_us", {}).get(mode, ())
+            ),
+            timeline_origin_uncertainty_samples_us=tuple(
+                getattr(
+                    self,
+                    "_profile_timeline_origin_uncertainties_us",
+                    {},
+                ).get(mode, ())
+            ),
         )

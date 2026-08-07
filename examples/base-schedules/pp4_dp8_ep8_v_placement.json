@@ -82,7 +82,10 @@
       12,
       14
     ],
-    "reduce_stream": "dp_stream"
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
   },
   {
     "op": "replicate",
@@ -99,7 +102,10 @@
       13,
       15
     ],
-    "reduce_stream": "dp_stream"
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
   },
   {
     "op": "replicate",
@@ -116,7 +122,10 @@
       13,
       15
     ],
-    "reduce_stream": "dp_stream"
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
   },
   {
     "op": "replicate",
@@ -133,7 +142,10 @@
       12,
       14
     ],
-    "reduce_stream": "dp_stream"
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
+    "shard_grads": true,
+    "shard_params": true
   },
   {
     "op": "shard",

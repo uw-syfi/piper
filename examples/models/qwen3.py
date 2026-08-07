@@ -5,12 +5,16 @@ from typing import Optional
 import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from examples.models.qwen3_bmm_experts_patch import BmmExperts
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
 from torchtitan.models.qwen3.model.model import TransformerBlock
 from torchtitan.models.moe import MoE, MoEArgs
 from torchtitan.protocols.model import AttentionMasksType
-from src.piper import annotate
+from src.piper import (
+    annotate,
+    mark_combine_payload,
+    mark_dispatch_counts,
+    mark_dispatch_payload,
+)
 
 PP_TAG = "PP"
 EP_TAG = "EP"
@@ -165,11 +169,68 @@ _QWEN35_397B = Qwen3ConfigSpec(
     exact_backbone=False,
 )
 
+# Synthetic H100 NVLink workload whose aggregate training expert GEMMs and
+# dispatch/combine A2A payloads have approximately equal roofline times.  The
+# depth-scaled variants preserve that per-layer ratio exactly.
+_QWEN3_COMM_1TO1 = Qwen3ConfigSpec(
+    vocab_size=4096,
+    dim=256,
+    n_layers=4,
+    n_heads=8,
+    n_kv_heads=4,
+    head_dim=32,
+    hidden_dim=512,
+    max_seq_len=8192,
+    rope_theta=1_000_000.0,
+    moe_inter_dim=864,
+    num_experts=8,
+    top_k=8,
+    route_norm=False,
+    load_balance_coeff=None,
+)
+
 # Synthetic development presets and non-quantized checkpoints from Qwen's
 # official model collections all use this one registry and construction path.
 # Quantized releases reuse these same architecture shapes and are not separate
 # presets.
 QWEN3_CONFIG_SPECS = {
+    "comm-1to1-L4": _QWEN3_COMM_1TO1,
+    # Preserve Qwen3-30B-A3B's architecture and change only the routed expert
+    # width from 768 to the H100-NVLink 1:1 roofline width of 864.  The local
+    # proxy uses eight layers; the other variants bracket H100 capacity.
+    "Qwen3-30B-A3B-comm1to1-L8": replace(
+        _QWEN3_30B, moe_inter_dim=864
+    ),
+    "Qwen3-30B-A3B-comm1to1-L20": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=20
+    ),
+    "Qwen3-30B-A3B-comm1to1-L22": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=22
+    ),
+    "Qwen3-30B-A3B-comm1to1-L23": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=23
+    ),
+    "Qwen3-30B-A3B-comm1to1-L24": replace(
+        _QWEN3_30B, moe_inter_dim=864, n_layers=24
+    ),
+    # Empirically calibrated from the normal PyTorch trace: the roofline width
+    # of 864 measured about 0.645:1 for the full expert region, so use the
+    # aligned width round(864 / 0.645) = 1344 and re-bracket capacity.
+    "Qwen3-30B-A3B-empirical1to1-L4": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=4
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L12": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=12
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L15": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=15
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L16": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=16
+    ),
+    "Qwen3-30B-A3B-empirical1to1-L17": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=17
+    ),
     "9M": Qwen3ConfigSpec(
         vocab_size=2048,
         dim=256,
@@ -178,7 +239,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=4,
         head_dim=32,
         hidden_dim=512,
-        max_seq_len=2048,
+        max_seq_len=393216,
         rope_theta=1_000_000.0,
         moe_inter_dim=128,
         num_experts=8,
@@ -193,7 +254,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=8,
         head_dim=64,
         hidden_dim=3584,
-        max_seq_len=2048,
+        max_seq_len=32768,
         rope_theta=1_000_000.0,
         moe_inter_dim=3584,
         num_experts=4,
@@ -208,7 +269,7 @@ QWEN3_CONFIG_SPECS = {
         n_kv_heads=8,
         head_dim=64,
         hidden_dim=7168,
-        max_seq_len=2048,
+        max_seq_len=8192,
         rope_theta=1_000_000.0,
         moe_inter_dim=7168,
         num_experts=8,
@@ -335,13 +396,6 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
 
 
 class AnnotatedMoE(MoE):
-    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
-        super().__init__(moe_args, dim=dim, hidden_dim=hidden_dim)
-        # Replace the grouped-mm (Triton) experts with a batched-matmul variant.
-        self.experts = BmmExperts(
-            dim=dim, hidden_dim=hidden_dim, num_experts=moe_args.num_experts
-        )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
@@ -352,6 +406,11 @@ class AnnotatedMoE(MoE):
             num_tokens_per_expert,
         ) = self.router(x, self.expert_bias)
 
+        # Match TorchTitan's default MoE bookkeeping. This count is distinct
+        # from the reordered count vector consumed by GroupedExperts below.
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
+
         (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
@@ -360,16 +419,28 @@ class AnnotatedMoE(MoE):
 
         # shape (bs*slen*top_k, dim)
         routed_input = x[token_indices_experts_sorted // self.router.top_k]
-
+        routed_expert_indices = selected_experts_indices.reshape(-1)[
+            token_indices_experts_sorted
+        ]
+        # Carry expert IDs through Piper's tensor all-to-all. Base-256 digits
+        # remain exact in bfloat16 for the largest Qwen presets in this file.
+        expert_id_low = torch.remainder(routed_expert_indices, 256)
+        expert_id_high = torch.div(
+            routed_expert_indices, 256, rounding_mode="floor"
+        )
         if self.score_before_experts:
             routed_input = (
                 routed_input.to(torch.float32)
                 * top_scores_experts_sorted.reshape(-1, 1)
             ).to(x.dtype)
 
+        routed_input = mark_dispatch_payload(routed_input)
+        num_tokens_per_expert = mark_dispatch_counts(num_tokens_per_expert)
+
         # expert component
         with annotate(EP_TAG):
             gathered_output = self.experts(routed_input, num_tokens_per_expert)
+            gathered_output = mark_combine_payload(gathered_output)
 
         gathered_output = gathered_output.reshape(-1, dim)
         out = self.shared_experts(x) if self.shared_experts is not None else None

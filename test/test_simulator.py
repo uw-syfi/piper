@@ -6,6 +6,7 @@ from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
 from src.profiling import NodeProfile, ProfileConfig, ProfiledTrainingPlan
 from src.simulator import (
     SimulationValidationError,
+    observed_profile_step_time_samples,
     simulate_profile_modes,
     simulate_training_step,
     simulate_training_step_samples,
@@ -156,6 +157,77 @@ def test_profile_mode_comparison_reports_uncertainty_and_prediction_error() -> N
     assert comparison.normal_statistics.samples == 3
 
 
+def test_profile_mode_comparison_reports_direct_uninstrumented_mode_speedup() -> None:
+    node = _node("a", {0: 1.0})
+    node.profile_times_by_mode = {
+        "interference_free": {0: NodeProfile.from_samples((3.0, 4.0, 5.0))},
+        "normal": {0: NodeProfile.from_samples((7.0, 8.0, 9.0))},
+    }
+    plan = ProfiledTrainingPlan.from_dags(
+        [_dag(node)],
+        profile_metadata={
+            "instrumented_global_step_samples_us_by_mode": {
+                "normal": [9.0, 10.0, 11.0],
+                "interference_free": [4.0, 5.0, 6.0],
+            },
+            "uninstrumented_global_step_samples_us_by_mode": {
+                "normal": [90.0, 100.0, 110.0],
+                "interference_free": [72.0, 80.0, 88.0],
+            },
+        },
+    )
+
+    comparison = simulate_profile_modes(plan)
+
+    assert comparison.observed_interference_reduction_pct == pytest.approx(20.0)
+    assert (
+        comparison.dependency_replay_interference_reduction_pct
+        == pytest.approx(50.0)
+    )
+    assert comparison.instrumented_policy_reduction_pct == pytest.approx(50.0)
+    assert comparison.uninstrumented_normal_statistics.estimate == pytest.approx(
+        100.0
+    )
+    assert (
+        comparison.uninstrumented_interference_free_statistics.estimate
+        == pytest.approx(80.0)
+    )
+    assert comparison.instrumented_normal_replay_error.signed_pct == pytest.approx(
+        -20.0
+    )
+    assert (
+        comparison.instrumented_interference_free_replay_error.signed_pct
+        == pytest.approx(-20.0)
+    )
+
+
+def test_observed_profile_envelope_does_not_cross_compare_rank_origins() -> None:
+    node = _node("a", {0: 1.0, 1: 1.0})
+    node.profile_times_by_mode = {
+        "interference_free": {
+            0: NodeProfile.from_samples((8.0, 8.0)),
+            1: NodeProfile.from_samples((8.0, 8.0)),
+        },
+        "normal": {
+            0: NodeProfile.from_samples(
+                (10.0, 10.0), start_offset_samples_us=(0.0, 20.0)
+            ),
+            1: NodeProfile.from_samples(
+                (5.0, 5.0), start_offset_samples_us=(50.0, 5.0)
+            ),
+        },
+    }
+    plan = ProfiledTrainingPlan.from_dags([_dag(node)])
+
+    samples = observed_profile_step_time_samples(plan, profile_mode="normal")
+    comparison = simulate_profile_modes(plan)
+
+    assert samples == pytest.approx((55.0, 30.0))
+    assert comparison.observed_normal_envelope_samples_us == pytest.approx(
+        (55.0, 30.0)
+    )
+
+
 def test_profile_comparison_calibrates_distribution_estimate_not_point_timeline() -> None:
     left = _node("left", {0: 1.0}, stream="left")
     right = _node("right", {0: 1.0}, stream="right")
@@ -254,11 +326,126 @@ def test_p2p_transactions_rendezvous_but_do_not_serialize_each_other() -> None:
 
     result = simulate_training_step([_dag(send1, recv2), _dag(recv1, send2)])
 
-    assert result.step_time_us == pytest.approx(6.0)
+    assert result.step_time_us == pytest.approx(7.0)
     assert result.event(0, "send.1").start_us == pytest.approx(0.0)
     assert result.event(1, "send.2").start_us == pytest.approx(0.0)
     assert result.event(1, "recv.1").end_us == pytest.approx(4.0)
+    assert result.event(0, "send.1").end_us == pytest.approx(5.0)
     assert result.event(0, "recv.2").end_us == pytest.approx(6.0)
+    assert result.event(1, "send.2").end_us == pytest.approx(7.0)
+
+
+def test_p2p_send_and_recv_have_distinct_local_completions() -> None:
+    send = _node(
+        "send",
+        {0: 5.0},
+        kind="SEND_COMM",
+        meta={"comm_id": "transfer", "peer_pp_rank": 1},
+    )
+    send_done = _node("send_done", {0: 1.0})
+    recv = _node(
+        "recv",
+        {1: 3.0},
+        kind="RECV_COMM",
+        meta={"comm_id": "transfer", "peer_pp_rank": 0},
+    )
+    recv_consumer = _node("recv_consumer", {1: 2.0})
+
+    result = simulate_training_step(
+        [
+            _dag(send, send_done, edges=(("send", "send_done", "data"),)),
+            _dag(recv, recv_consumer, edges=(("recv", "recv_consumer", "data"),)),
+        ]
+    )
+
+    assert result.event(0, "send").end_us == pytest.approx(5.0)
+    assert result.event(1, "recv").end_us == pytest.approx(3.0)
+    assert result.event(0, "send_done").start_us == pytest.approx(5.0)
+    assert result.event(1, "recv_consumer").start_us == pytest.approx(3.0)
+    assert result.step_time_us == pytest.approx(6.0)
+
+
+def test_p2p_profile_interval_subtracts_rendezvous_wait() -> None:
+    send = _node(
+        "send",
+        {0: 1.0},
+        kind="SEND_COMM",
+        meta={"comm_id": "delayed-transfer", "peer_pp_rank": 1},
+    )
+    recv = _node(
+        "recv",
+        {1: 1.0},
+        kind="RECV_COMM",
+        meta={"comm_id": "delayed-transfer", "peer_pp_rank": 0},
+    )
+    send.profile_times_by_mode["normal"] = {
+        0: NodeProfile.from_samples(
+            (12.0,),
+            start_offset_samples_us=(0.0,),
+            isolation_scope="logical_streams_with_directional_p2p",
+        )
+    }
+    recv.profile_times_by_mode["normal"] = {
+        1: NodeProfile.from_samples(
+            (2.0,),
+            start_offset_samples_us=(10.0,),
+            isolation_scope="logical_streams_with_directional_p2p",
+        )
+    }
+
+    result = simulate_training_step(
+        [_dag(send), _dag(recv)], profile_mode="normal"
+    )
+
+    assert result.event(0, "send").start_us == pytest.approx(10.0)
+    assert result.event(1, "recv").start_us == pytest.approx(10.0)
+    assert result.event(0, "send").profile_duration_us == pytest.approx(12.0)
+    assert result.event(0, "send").effective_duration_us == pytest.approx(2.0)
+    assert result.event(1, "recv").effective_duration_us == pytest.approx(2.0)
+    assert result.step_time_us == pytest.approx(12.0)
+
+
+def test_p2p_inconsistent_interval_uses_latest_arrival_fallback() -> None:
+    send = _node(
+        "send",
+        {0: 1.0},
+        kind="SEND_COMM",
+        meta={"comm_id": "inconsistent-transfer", "peer_pp_rank": 1},
+    )
+    recv = _node(
+        "recv",
+        {1: 1.0},
+        kind="RECV_COMM",
+        meta={"comm_id": "inconsistent-transfer", "peer_pp_rank": 0},
+    )
+    send.profile_times_by_mode["normal"] = {
+        0: NodeProfile.from_samples(
+            (5.0,),
+            start_offset_samples_us=(0.0,),
+            isolation_scope="logical_streams_with_directional_p2p",
+        )
+    }
+    recv.profile_times_by_mode["normal"] = {
+        1: NodeProfile.from_samples(
+            (2.0,),
+            start_offset_samples_us=(10.0,),
+            isolation_scope="logical_streams_with_directional_p2p",
+        )
+    }
+
+    result = simulate_training_step(
+        [_dag(send), _dag(recv)], profile_mode="normal"
+    )
+
+    # The send interval cannot contain the modeled 10 us wait.  Do not turn
+    # that inconsistency into zero service or revive the old minimum-rank
+    # heuristic: use the latest endpoint's 2 us interval and report it.
+    assert result.event(0, "send").effective_duration_us == pytest.approx(2.0)
+    assert result.event(1, "recv").effective_duration_us == pytest.approx(2.0)
+    assert result.step_time_us == pytest.approx(12.0)
+    assert len(result.warnings) == 1
+    assert "SEND_COMM=1" in result.warnings[0]
+    assert "reduces prediction reliability" in result.warnings[0]
 
 
 def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
@@ -316,7 +503,7 @@ def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
 
     assert result.event(0, "send.b").start_us == pytest.approx(0.0)
     assert result.event(1, "send.a").start_us == pytest.approx(0.0)
-    assert result.step_time_us == pytest.approx(6.0)
+    assert result.step_time_us == pytest.approx(7.0)
 
 
 def test_same_direction_p2p_transactions_preserve_directional_fifo() -> None:
@@ -364,8 +551,11 @@ def test_same_direction_p2p_transactions_preserve_directional_fifo() -> None:
     result = simulate_training_step([_dag(send1, send2), _dag(recv1, recv2)])
 
     assert result.event(0, "send.1").start_us == pytest.approx(0.0)
-    assert result.event(0, "send.2").start_us == pytest.approx(4.0)
-    assert result.step_time_us == pytest.approx(10.0)
+    assert result.event(0, "send.2").start_us == pytest.approx(5.0)
+    assert result.event(1, "recv.2").start_us == pytest.approx(5.0)
+    assert result.event(0, "send.2").end_us == pytest.approx(12.0)
+    assert result.event(1, "recv.2").end_us == pytest.approx(10.0)
+    assert result.step_time_us == pytest.approx(12.0)
 
 
 def test_p2p_group_participants_are_validated_across_dp_lanes() -> None:
@@ -397,11 +587,11 @@ def test_p2p_group_participants_are_validated_across_dp_lanes() -> None:
 
     result = simulate_training_step([_dag(send), _dag(recv)])
 
-    assert result.event(0, "send").duration_us == pytest.approx(4.0)
+    assert result.event(0, "send").duration_us == pytest.approx(5.0)
     assert result.event(1, "recv").duration_us == pytest.approx(4.0)
     assert result.event(2, "send").duration_us == pytest.approx(6.0)
-    assert result.event(3, "recv").duration_us == pytest.approx(6.0)
-    assert result.step_time_us == pytest.approx(6.0)
+    assert result.event(3, "recv").duration_us == pytest.approx(7.0)
+    assert result.step_time_us == pytest.approx(7.0)
 
 
 def test_p2p_rejects_participants_outside_endpoint_device_groups() -> None:
@@ -432,7 +622,7 @@ def test_p2p_rejects_participants_outside_endpoint_device_groups() -> None:
         simulate_training_step([_dag(send), _dag(recv)])
 
 
-def test_collective_uses_latest_arrival_and_minimum_service_proxy() -> None:
+def test_collective_subtracts_arrival_skew_and_keeps_last_completion() -> None:
     producer = _node(
         "backward.0",
         {0: 8.0, 1: 2.0},
@@ -441,7 +631,7 @@ def test_collective_uses_latest_arrival_and_minimum_service_proxy() -> None:
     )
     collective = _node(
         "reduce.0",
-        {0: 3.0, 1: 5.0},
+        {0: 3.0, 1: 10.0},
         stream="dp_stream",
         kind="REDUCE_COMM",
         device=[0, 1],
@@ -452,18 +642,102 @@ def test_collective_uses_latest_arrival_and_minimum_service_proxy() -> None:
         [_dag(producer, collective, edges=(("backward.0", "reduce.0", "data"),))]
     )
 
-    # Rank 0 arrives last at 8 us.  Its 3 us endpoint timing is the optimistic
-    # post-rendezvous service proxy; rank 1's 5 us raw interval includes 2 us
-    # of arrival skew that the graph has already modeled.
-    assert result.step_time_us == pytest.approx(11.0)
+    # Rank 1 arrives 6 us before rank 0, so 6 us is removed from its measured
+    # 10 us endpoint interval.  Its 4 us residual, not the minimum 3 us raw
+    # endpoint duration, determines the transaction's final completion.
+    assert result.step_time_us == pytest.approx(12.0)
     assert result.event(0, "reduce.0").start_us == pytest.approx(8.0)
     assert result.event(1, "reduce.0").start_us == pytest.approx(8.0)
     assert result.event(0, "reduce.0").profile_duration_us == pytest.approx(3.0)
-    assert result.event(1, "reduce.0").profile_duration_us == pytest.approx(5.0)
+    assert result.event(1, "reduce.0").profile_duration_us == pytest.approx(10.0)
     assert result.event(0, "reduce.0").effective_duration_us == pytest.approx(3.0)
-    assert result.event(1, "reduce.0").effective_duration_us == pytest.approx(3.0)
+    assert result.event(1, "reduce.0").effective_duration_us == pytest.approx(4.0)
     assert result.event(0, "reduce.0").duration_us == pytest.approx(3.0)
-    assert result.event(1, "reduce.0").duration_us == pytest.approx(3.0)
+    assert result.event(1, "reduce.0").duration_us == pytest.approx(4.0)
+
+
+def test_aligned_collective_reuses_observed_post_rendezvous_tails() -> None:
+    producer = _node(
+        "producer",
+        {0: 8.0, 1: 2.0},
+        stream="compute",
+        device=[0, 1],
+    )
+    producer.profile_times_by_mode["interference_free"] = {
+        0: NodeProfile.from_samples(
+            (8.0,), start_offset_samples_us=(0.0,)
+        ),
+        1: NodeProfile.from_samples(
+            (2.0,), start_offset_samples_us=(0.0,)
+        ),
+    }
+    collective = _node(
+        "reduce",
+        {0: 1.0, 1: 1.0},
+        stream="dp_stream",
+        kind="REDUCE_COMM",
+        device=[0, 1],
+        meta={"comm_id": "aligned.bucket", "participants": [0, 1]},
+    )
+    collective.profile_times_by_mode["interference_free"] = {
+        # Observed rendezvous is at 8 us: rank 0 completes 2 us later and
+        # rank 1 completes 3 us later, at observed time 11 us.
+        0: NodeProfile.from_samples(
+            (10.0,), start_offset_samples_us=(0.0,)
+        ),
+        1: NodeProfile.from_samples(
+            (3.0,), start_offset_samples_us=(8.0,)
+        ),
+    }
+    plan = SimpleNamespace(
+        per_pp_dags=[
+            _dag(
+                producer,
+                collective,
+                edges=(("producer", "reduce", "data"),),
+            )
+        ],
+        topology={"pp_degree": 1, "dp_degree": 2},
+        profile_metadata={
+            "timeline_alignment": {
+                "modes": {"interference_free": {"samples": 1}}
+            }
+        },
+    )
+
+    result = simulate_training_step(plan, profile_mode="interference_free")
+
+    assert result.event(0, "reduce").start_us == pytest.approx(8.0)
+    assert result.event(1, "reduce").start_us == pytest.approx(8.0)
+    assert result.event(0, "reduce").effective_duration_us == pytest.approx(2.0)
+    assert result.event(1, "reduce").effective_duration_us == pytest.approx(3.0)
+    assert result.step_time_us == pytest.approx(11.0)
+
+
+def test_ragged_a2a_does_not_create_an_all_rank_rendezvous() -> None:
+    producer = _node(
+        "producer",
+        {0: 10.0, 1: 0.0},
+        stream="compute",
+        device=[0, 1],
+    )
+    a2a = _node(
+        "a2a",
+        {0: 2.0, 1: 3.0},
+        stream="ep_stream",
+        kind="A2A_COMM",
+        device=[0, 1],
+        meta={"comm_id": "ragged", "participants": [0, 1]},
+    )
+
+    result = simulate_training_step(
+        [_dag(producer, a2a, edges=(("producer", "a2a", "data"),))]
+    )
+
+    assert result.event(0, "a2a").start_us == pytest.approx(10.0)
+    assert result.event(1, "a2a").start_us == pytest.approx(0.0)
+    assert result.event(1, "a2a").end_us == pytest.approx(3.0)
+    assert result.step_time_us == pytest.approx(12.0)
 
 
 def test_missing_rank_profile_is_rejected() -> None:

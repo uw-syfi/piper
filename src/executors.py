@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 import torch
 import torch.distributed as dist
+from torch.distributed._functional_collectives import (
+    all_to_all_single,
+    all_to_all_single_autograd,
+)
 from torch.autograd.graph import GradientEdge, Node
 from torch.nn import Parameter
+
+try:
+    from torchtitan.models.moe.utils import _permute, _unpermute
+except ImportError:  # Newer TorchTitan source layout.
+    from torchtitan.models.common.moe.utils import _permute, _unpermute
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
 from .execution_plan import (
@@ -61,6 +70,16 @@ class PreparedDagExecution:
 
 
 @dataclass
+class _ExpertA2AState:
+    ep_rank: int
+    ep_degree: int
+    input_splits: list[int] | None = None
+    output_splits: list[int] | None = None
+    input_shape: torch.Size | None = None
+    permuted_indices: torch.Tensor | None = None
+
+
+@dataclass
 class CommunicationExecutor:
     """Actor-local communication operations used by the DAG dispatcher."""
 
@@ -110,12 +129,6 @@ class CommunicationExecutor:
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
-
-    def all_to_all(self, input_tensor: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
-        output_buf = torch.empty_like(input_tensor, device=self.runtime.device)
-        with torch.cuda.stream(stream):
-            dist.all_to_all_single(output_buf, input_tensor, group=self.runtime.ep_group)
-        return output_buf
 
     def all_reduce_grads(self, ubid: Any, stream: torch.cuda.Stream) -> int:
         assert ubid is not None, "all_reduce_grads requires a non-None ubid"
@@ -510,6 +523,9 @@ class DagExecutor:
     communication: CommunicationExecutor
     compute: ComputeExecutor
     logger: Any
+    expert_a2a_states: dict[str, _ExpertA2AState] = field(
+        default_factory=dict
+    )
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
@@ -606,17 +622,59 @@ class DagExecutor:
 
         return recv_pred, a2a_pred
 
+    def _consume_local_backward_output_grads(
+        self,
+        node: Any,
+        fwd_out: dict,
+        stage_outputs: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+        """Consume gradients from a downstream compute node on this actor."""
+        local_bwd_pred = next(
+            (
+                pred
+                for pred in node.data_preds
+                if pred.task_type in (TaskType.BWD, TaskType.BWD_I)
+            ),
+            None,
+        )
+        if local_bwd_pred is None:
+            return stage_outputs, None
+
+        local_buf = self.buffers.task[local_bwd_pred.uid]
+        detached_outs = fwd_out["detached_outs"]
+        output_grads_full = [
+            local_buf["inp_grads"][i]
+            for i, tensor in enumerate(detached_outs)
+            if (
+                tensor is not None
+                and isinstance(tensor, torch.Tensor)
+                and tensor.requires_grad
+            )
+        ]
+        pairs = [
+            (output, grad)
+            for output, grad in zip(stage_outputs, output_grads_full)
+            if grad is not None
+        ]
+        self.buffers.release(local_bwd_pred.uid)
+        return (
+            [output for output, _grad in pairs],
+            [grad for _output, grad in pairs],
+        )
+
     def _all_to_all_ep_boundary(
         self,
         node: Any,
         tensor: torch.Tensor,
         stream: torch.cuda.Stream,
-    ) -> torch.Tensor:
+        routing_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Keep boundary layout kernels on the same stream as the collective.
         # This is especially important in profiling mode, where the timing
         # events delimit this physical stream rather than CUDA's ambient one.
         with torch.cuda.stream(stream):
-            direction = self._node_meta(node).get("direction")
+            node_meta = self._node_meta(node)
+            direction = node_meta.get("direction")
             if direction == "outgoing":
                 tensor = tensor.contiguous()
             elif direction != "incoming":
@@ -625,10 +683,195 @@ class DagExecutor:
                     f"direction={direction!r}; expected 'incoming' or 'outgoing'"
                 )
 
-            tensor = self.communication.all_to_all(tensor, stream=stream)
-            if direction == "incoming":
-                tensor = tensor.contiguous()
+            expert_fwd_uid = node_meta.get("expert_fwd_uid")
+            if not isinstance(expert_fwd_uid, str):
+                raise ValueError(
+                    f"A2A node {getattr(node, 'uid', '<unknown>')} is missing "
+                    "expert_fwd_uid"
+                )
+            state = self.expert_a2a_states.get(expert_fwd_uid)
+            if state is None:
+                if routing_counts is None:
+                    raise RuntimeError(
+                        f"A2A node {getattr(node, 'uid', '<unknown>')} ran before "
+                        f"forward dispatch for expert {expert_fwd_uid}"
+                    )
+                participants = node_meta.get("participants")
+                if not isinstance(participants, list) or not participants:
+                    raise ValueError(
+                        f"A2A node {node.uid} has invalid participants="
+                        f"{participants!r}"
+                    )
+                ep_degree = len(participants)
+                try:
+                    ep_rank = participants.index(self.runtime.global_rank)
+                except ValueError as error:
+                    raise ValueError(
+                        f"Actor rank {self.runtime.global_rank} is not in A2A "
+                        f"participants={participants}"
+                    ) from error
+                state = _ExpertA2AState(
+                    ep_rank=ep_rank,
+                    ep_degree=ep_degree,
+                )
+                self.expert_a2a_states[expert_fwd_uid] = state
+
+            task_type = getattr(node, "task_type", None)
+            if task_type == TaskType.FWD_A2A:
+                if direction == "incoming":
+                    if routing_counts is None:
+                        raise ValueError(
+                            f"Forward dispatch node {node.uid} is missing "
+                            "num_tokens_per_expert"
+                        )
+                    return self._dispatch_expert_a2a(
+                        state,
+                        tensor.contiguous(),
+                        routing_counts,
+                    )
+                return self._combine_expert_a2a(state, tensor)
+
+            if task_type == TaskType.BWD_A2A:
+                if direction == "incoming":
+                    return self._dispatch_expert_a2a_gradient(
+                        state,
+                        tensor.contiguous(),
+                    )
+                return self._combine_expert_a2a(state, tensor)
+
+            raise ValueError(
+                f"A2A node {getattr(node, 'uid', '<unknown>')} has unsupported "
+                f"task_type={task_type}"
+            )
+
+    @staticmethod
+    def _require_expert_a2a_state(state: _ExpertA2AState) -> None:
+        if (
+            state.input_splits is None
+            or state.output_splits is None
+            or state.input_shape is None
+            or state.permuted_indices is None
+        ):
+            raise RuntimeError(
+                "A2A combine/gradient dispatch ran before forward dispatch"
+            )
+
+    def _dispatch_expert_a2a(
+        self,
+        state: _ExpertA2AState,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_tokens_per_expert.ndim != 1:
+            raise ValueError(
+                "num_tokens_per_expert must be one-dimensional, got "
+                f"shape={tuple(num_tokens_per_expert.shape)}"
+            )
+        if num_tokens_per_expert.shape[0] % state.ep_degree:
+            raise ValueError(
+                f"num_experts={num_tokens_per_expert.shape[0]} must be divisible "
+                f"by ep_degree={state.ep_degree}"
+            )
+
+        num_local_experts = (
+            num_tokens_per_expert.shape[0] // state.ep_degree
+        )
+        if state.ep_degree > 1:
+            with torch.no_grad():
+                # Fixed-size metadata exchange. The result is source-major:
+                # [source rank][local expert].
+                grouped_counts = all_to_all_single(
+                    num_tokens_per_expert,
+                    None,
+                    None,
+                    group=self.runtime.ep_group,
+                )
+                grouped_counts = torch.ops._c10d_functional.wait_tensor(
+                    grouped_counts
+                )
+                input_splits = (
+                    num_tokens_per_expert.view(state.ep_degree, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=True)
+                )
+                output_splits = (
+                    grouped_counts.view(state.ep_degree, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=False)
+                )
+                state.input_splits = input_splits.tolist()
+                state.output_splits = output_splits.tolist()
+
+            routed_input = all_to_all_single_autograd(
+                routed_input,
+                state.output_splits,
+                state.input_splits,
+                self.runtime.ep_group,
+            )
+        else:
+            grouped_counts = num_tokens_per_expert
+            state.input_splits = []
+            state.output_splits = []
+
+        (
+            state.input_shape,
+            routed_input,
+            state.permuted_indices,
+            local_counts,
+        ) = _permute(
+            routed_input,
+            grouped_counts,
+            state.ep_degree,
+            num_local_experts,
+        )
+
+        # Piper's expert weights retain their global first dimension. Zero
+        # counts select only the local rank's contiguous expert range.
+        global_counts = torch.zeros_like(num_tokens_per_expert)
+        local_start = state.ep_rank * num_local_experts
+        global_counts[local_start : local_start + num_local_experts] = (
+            local_counts
+        )
+        return routed_input, global_counts
+
+    def _dispatch_expert_a2a_gradient(
+        self,
+        state: _ExpertA2AState,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        self._require_expert_a2a_state(state)
+        if state.ep_degree > 1:
+            tensor = all_to_all_single_autograd(
+                tensor,
+                state.output_splits,
+                state.input_splits,
+                self.runtime.ep_group,
+            )
+
+        # Reapply the forward source-major -> expert-major permutation. The
+        # sentinel row supplies every padding index generated by TorchTitan.
+        tensor = torch.vstack((tensor, tensor.new_zeros((tensor.shape[-1],))))
+        return tensor[state.permuted_indices, :]
+
+    def _combine_expert_a2a(
+        self,
+        state: _ExpertA2AState,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        self._require_expert_a2a_state(state)
+        tensor = _unpermute(
+            tensor,
+            state.input_shape,
+            state.permuted_indices,
+        )
+        if state.ep_degree == 1:
             return tensor
+        return all_to_all_single_autograd(
+            tensor,
+            state.input_splits,
+            state.output_splits,
+            self.runtime.ep_group,
+        )
 
     def prepare(
         self,
@@ -770,6 +1013,7 @@ class DagExecutor:
             stream.wait_event(zero_evt)
         completion_events: dict[str, torch.cuda.Event] = {}
         completion_streams: dict[str, torch.cuda.Stream] = {}
+        update_result = None
 
         self.buffers.init_refcounts(prepared.buffer_refcount_template)
 
@@ -843,13 +1087,43 @@ class DagExecutor:
 
                 case TaskType.FWD_A2A:
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
-                    tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
+                    node_meta = self._node_meta(node)
+                    tensor_idx = node_meta["a2a_tensor_idx"]
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
                     detached_outs = list(fwd_buf["detached_outs"])
-                    detached_outs[tensor_idx] = self._all_to_all_ep_boundary(
-                        node, detached_outs[tensor_idx], node_stream
-                    ).requires_grad_(True)
+                    direction = node_meta["direction"]
+                    counts_idx = (
+                        node_meta["routing_counts_idx"]
+                        if direction == "incoming"
+                        else None
+                    )
+                    routing_counts = (
+                        detached_outs[counts_idx] if counts_idx is not None else None
+                    )
+                    a2a_result = self._all_to_all_ep_boundary(
+                        node,
+                        detached_outs[tensor_idx],
+                        node_stream,
+                        routing_counts=routing_counts,
+                    )
+                    if direction == "incoming":
+                        if not isinstance(a2a_result, tuple):
+                            raise RuntimeError(
+                                f"Forward dispatch node {node.uid} did not return "
+                                "local routing counts"
+                            )
+                        a2a_tensor, local_counts = a2a_result
+                        assert counts_idx is not None
+                        detached_outs[counts_idx] = local_counts
+                    else:
+                        if isinstance(a2a_result, tuple):
+                            raise RuntimeError(
+                                f"Forward combine node {node.uid} unexpectedly "
+                                "returned routing counts"
+                            )
+                        a2a_tensor = a2a_result
+                    detached_outs[tensor_idx] = a2a_tensor.requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.buffers.task[node.uid] = fwd_buf
                     a2a_evt = torch.cuda.Event()
@@ -969,7 +1243,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
-                            outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], labels)
+                            outputs_or_loss = [loss]
+                            loss_buffer.append(loss.detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -1059,7 +1335,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
-                            stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], labels)
+                            stage_outputs_or_loss = [loss]
+                            loss_buffer.append(loss.detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
@@ -1091,6 +1369,20 @@ class DagExecutor:
                         stage_outputs_or_loss = [p[0] for p in pairs]
                         output_grads = [p[1] for p in pairs]
                         self.buffers.release(bwd_a2a_pred.uid)
+                    elif (
+                        not self._node_meta(node).get("compute_loss", False)
+                        and recv_pred is None
+                    ):
+                        (
+                            stage_outputs_or_loss,
+                            local_output_grads,
+                        ) = self._consume_local_backward_output_grads(
+                            node,
+                            fwd_out,
+                            stage_outputs_or_loss,
+                        )
+                        if local_output_grads is not None:
+                            output_grads = local_output_grads
 
                     input_values = fwd_out.get("inp_with_grad") or []
                     weights = self.stages.bucket(ubid).weights()
@@ -1153,7 +1445,7 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(
+                    update_result = self._update(
                         node_stream,
                         loss_buffer,
                         wait_for_dependencies=False,
@@ -1178,6 +1470,7 @@ class DagExecutor:
             # per-node sync can deadlock rendezvous communication.
             torch.cuda.synchronize()
             timing_recorder.finish()
+        return update_result
 
     def _update(
         self,
@@ -1210,7 +1503,7 @@ class DagExecutor:
             with torch.cuda.stream(stream):
                 bucket.optimizer.step()
 
-        losses = loss_buffer
+        losses = list(loss_buffer)
         loss_buffer.clear()
 
         if synchronize:

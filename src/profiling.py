@@ -9,7 +9,7 @@ CUDA event, and executor state from leaking into saved profile artifacts.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import math
@@ -71,10 +71,10 @@ class NodeProfile:
     samples_us: tuple[float, ...] = ()
     # Explicit IDs make raw samples pairable across nodes/ranks.
     sample_iteration_ids: tuple[int, ...] = ()
-    # Optional GPU timeline position for each duration sample.  Offsets are
-    # measured from the rank-local iteration origin to the node's start event.
-    # Concurrent replay uses these as release times, preserving host launch
-    # gaps that cannot be reconstructed from kernel durations alone.
+    # Optional GPU timeline position for each duration sample.  Newly collected
+    # plans align these offsets to a shared per-iteration origin across actors;
+    # legacy artifacts contain rank-local offsets.  ``profile_metadata`` says
+    # which representation a plan contains.
     start_offset_samples_us: tuple[float, ...] = ()
     start_offset_estimate_us: float | None = None
     estimate_us: float = 0.0
@@ -309,6 +309,11 @@ class ActorProfileResult:
     pp_rank: int = 0
     device_metadata: dict[str, Any] = field(default_factory=dict)
     prologue_profile: NodeProfile | None = None
+    # Coordinator-clock timestamps corresponding to each local CUDA prologue
+    # start event.  These are merge-time calibration data and are normalized
+    # out before the durable plan is written.
+    timeline_origin_samples_us: tuple[float, ...] = ()
+    timeline_origin_uncertainty_samples_us: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profile_mode", normalize_profile_mode(self.profile_mode))
@@ -321,6 +326,10 @@ class ActorProfileResult:
             "dp_rank": int(self.dp_rank),
             "pp_rank": int(self.pp_rank),
             "device_metadata": _json_safe_value(self.device_metadata),
+            "timeline_origin_samples_us": list(self.timeline_origin_samples_us),
+            "timeline_origin_uncertainty_samples_us": list(
+                self.timeline_origin_uncertainty_samples_us
+            ),
             "node_profiles": {
                 uid: profile.to_dict() for uid, profile in sorted(self.node_profiles.items())
             },
@@ -339,6 +348,16 @@ class ActorProfileResult:
             dp_rank=int(value.get("dp_rank", 0)),
             pp_rank=int(value.get("pp_rank", 0)),
             device_metadata=dict(value.get("device_metadata", {})),
+            timeline_origin_samples_us=tuple(
+                float(item)
+                for item in value.get("timeline_origin_samples_us", ())
+            ),
+            timeline_origin_uncertainty_samples_us=tuple(
+                float(item)
+                for item in value.get(
+                    "timeline_origin_uncertainty_samples_us", ()
+                )
+            ),
             node_profiles={
                 str(uid): NodeProfile.from_dict(profile)
                 for uid, profile in value.get("node_profiles", {}).items()
@@ -835,6 +854,90 @@ def merge_actor_profiles(
     """
 
     dags = list(per_pp_dags)
+    results = list(results)
+
+    # Normalize every actor's CUDA-event offsets to the earliest calibrated
+    # CUDA origin in the same mode/iteration.  The epoch itself is irrelevant;
+    # only cross-actor differences survive in the durable profile.
+    results_by_mode: dict[str, list[ActorProfileResult]] = {}
+    for result in results:
+        results_by_mode.setdefault(
+            normalize_profile_mode(result.profile_mode), []
+        ).append(result)
+    aligned_bases_by_mode: dict[str, tuple[float, ...]] = {}
+    alignment_metadata: dict[str, Any] = {}
+    for mode, mode_results in sorted(results_by_mode.items()):
+        has_origins = [bool(result.timeline_origin_samples_us) for result in mode_results]
+        if any(has_origins) and not all(has_origins):
+            raise ValueError(
+                f"profile mode {mode!r} mixes calibrated and uncalibrated actor timelines"
+            )
+        if not all(has_origins):
+            continue
+        sample_counts = {
+            len(result.timeline_origin_samples_us) for result in mode_results
+        }
+        if len(sample_counts) != 1:
+            raise ValueError(
+                f"profile mode {mode!r} has mismatched calibrated-origin sample counts: "
+                f"{sorted(sample_counts)}"
+            )
+        sample_count = next(iter(sample_counts))
+        if sample_count <= 0:
+            continue
+        for result in mode_results:
+            uncertainties = result.timeline_origin_uncertainty_samples_us
+            if uncertainties and len(uncertainties) != sample_count:
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "mismatched origin and uncertainty sample counts"
+                )
+        bases = tuple(
+            min(
+                float(result.timeline_origin_samples_us[index])
+                for result in mode_results
+            )
+            for index in range(sample_count)
+        )
+        aligned_bases_by_mode[mode] = bases
+        uncertainty_values = [
+            float(value)
+            for result in mode_results
+            for value in result.timeline_origin_uncertainty_samples_us
+        ]
+        alignment_metadata[mode] = {
+            "actors": len(mode_results),
+            "samples": sample_count,
+            "max_origin_uncertainty_us": (
+                max(uncertainty_values) if uncertainty_values else None
+            ),
+        }
+
+    def aligned_profile(
+        result: ActorProfileResult, profile: NodeProfile
+    ) -> NodeProfile:
+        bases = aligned_bases_by_mode.get(result.profile_mode)
+        if bases is None or not profile.executed:
+            return profile
+        local_offsets = profile.start_offset_samples_us
+        origins = result.timeline_origin_samples_us
+        if len(local_offsets) != len(origins):
+            raise ValueError(
+                f"profile mode {result.profile_mode!r} rank {result.global_rank} "
+                f"node sample count={len(profile.samples_us)} has "
+                f"start offsets={len(local_offsets)} and calibrated origins={len(origins)}"
+            )
+        global_offsets = tuple(
+            float(origin) - float(base) + float(local_offset)
+            for origin, base, local_offset in zip(origins, bases, local_offsets)
+        )
+        return replace(
+            profile,
+            start_offset_samples_us=global_offsets,
+            start_offset_estimate_us=estimate_profile_time(
+                global_offsets, profile.estimator
+            ),
+        )
     seen_shards: set[tuple[str, int]] = set()
     device_metadata: dict[str, dict[str, Any]] = {}
     for result in sorted(
@@ -867,7 +970,8 @@ def merge_actor_profiles(
                 f"missing={missing}, unknown={unknown}"
             )
 
-        for uid, profile in result.node_profiles.items():
+        for uid, raw_profile in result.node_profiles.items():
+            profile = aligned_profile(result, raw_profile)
             node = dag.nodes[uid]
             if node.device is not None and rank not in node.device:
                 raise ValueError(
@@ -897,9 +1001,17 @@ def merge_actor_profiles(
             result.device_metadata
         )
 
+    profile_metadata: dict[str, Any] = {"actors": device_metadata}
+    if alignment_metadata:
+        profile_metadata["timeline_alignment"] = {
+            "method": "ray_ntp_midpoint_plus_cuda_anchor",
+            "origin": "earliest_actor_cuda_prologue_per_mode_iteration",
+            "modes": alignment_metadata,
+        }
+
     return ProfiledTrainingPlan.from_dags(
         dags,
         profile_configs=profile_configs,
         topology=topology,
-        profile_metadata={"actors": device_metadata},
+        profile_metadata=profile_metadata,
     )

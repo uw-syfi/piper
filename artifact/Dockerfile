@@ -94,7 +94,7 @@ RUN conda create -y -n piper python=3.10 && \
         --extra-index-url https://download.pytorch.org/whl/cu128 && \
     conda clean -afy
 
-COPY artifact/e2e_eval.py artifact/run_deepspeed.py artifact/run_megatron.py artifact/sitecustomize.py /workspace/artifact/
+COPY artifact/e2e_eval.py artifact/run_deepspeed.py artifact/run_megatron.py /workspace/artifact/
 COPY artifact/scripts /workspace/artifact/scripts
 COPY artifact/README.md /workspace/artifact/README.md
 
