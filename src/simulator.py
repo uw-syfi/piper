@@ -5,17 +5,19 @@ duration as the service time the node would observe in isolation, preserves
 TrainingDAG dependencies and CUDA stream FIFO order, and otherwise provides no
 shared GPU or network capacity.  Consequently, independent streams and
 communication transactions overlap completely.  Communication endpoint
-timings can include time spent waiting for other ranks to arrive; a collapsed
-rendezvous therefore uses the minimum endpoint timing as an optimistic service
-time after graph readiness has synchronized all participants.
+timings can include time spent waiting for other ranks to arrive.  The
+simulator therefore separates rank-local endpoint arrival and completion with
+a shared zero-duration rendezvous.  For calibrated profiles it derives each
+endpoint's post-rendezvous tail once from the observed, cross-actor-aligned
+timeline and reuses that tail in both replays.  Legacy rank-local profiles
+retain the best-effort simulated-arrival-skew subtraction.
 
-P2P operations are a special case.  SEND/RECV endpoints are collapsed into a
-single rendezvous operation, with no synthetic FIFO between P2P transactions.
-Collapsing endpoints turns local issue-order edges into whole-transaction
-dependencies, which can create false cycles even when the runtime can enqueue
-all matching endpoints.  Data dependencies involving P2P nodes are always
-preserved; ordering-only temporal edges are relaxed because schedule lowering
-can materialize the logical ``pp_stream`` FIFO as explicit edges.
+P2P SEND/RECV endpoints retain distinct completion vertices.  Both arrivals
+gate their shared rendezvous, but send-side successors wait only for send
+completion and receive-side consumers wait only for receive completion.
+Ordering-only dependencies between opposite directional P2P streams remain
+relaxable because schedule lowering can materialize logical ``pp_stream`` FIFO
+as explicit edges; data dependencies are always preserved.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import heapq
 import json
 import math
 from numbers import Real
+import statistics
 from typing import Any
 
 from .dag import TrainingDAG, TrainingDAGNode
@@ -59,10 +62,14 @@ _COLLECTIVE_KINDS = frozenset(
         "ALL_REDUCE_COMM",
         "ALL_GATHER_COMM",
         "REDUCE_SCATTER_COMM",
-        "A2A_COMM",
     }
 )
-_COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS
+# Piper's ragged A2A node is implemented as independently tagged peer sends
+# and receives.  It is communication, but it is not an all-rank rendezvous:
+# zero-payload ranks and completed peer pairs may finish before other ranks
+# enter the same logical A2A node.
+_RAGGED_A2A_KINDS = frozenset({"A2A_COMM"})
+_COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS | _RAGGED_A2A_KINDS
 
 
 class SimulationValidationError(ValueError):
@@ -140,13 +147,26 @@ class SimulationComparisonResult:
     normal: SimulationResult
     interference_free_samples_us: tuple[float, ...]
     normal_samples_us: tuple[float, ...]
+    observed_normal_envelope_samples_us: tuple[float, ...]
     interference_free_statistics: TimingStatistics
     normal_statistics: TimingStatistics
+    observed_normal_envelope_statistics: TimingStatistics | None = None
     actual_statistics: TimingStatistics | None = None
     instrumented_normal_statistics: TimingStatistics | None = None
+    instrumented_interference_free_statistics: TimingStatistics | None = None
+    uninstrumented_normal_statistics: TimingStatistics | None = None
+    uninstrumented_interference_free_statistics: TimingStatistics | None = None
     normal_prediction_error: PredictionError | None = None
+    instrumented_normal_replay_error: PredictionError | None = None
+    instrumented_interference_free_replay_error: PredictionError | None = None
     predicted_interference_reduction_pct: float | None = None
+    dependency_replay_interference_reduction_pct: float | None = None
+    instrumented_policy_reduction_pct: float | None = None
+    observed_interference_reduction_pct: float | None = None
+    envelope_modeled_interference_reduction_pct: float | None = None
+    normal_dependency_replay_excess_pct: float | None = None
     profile_event_overhead_pct: float | None = None
+    mode_profile_event_overhead_pct: float | None = None
 
 @dataclass(frozen=True)
 class _RankLayout:
@@ -167,6 +187,7 @@ class _InstanceRecord:
     node: TrainingDAGNode
     profile_duration_us: float
     profile_start_offset_us: float = 0.0
+    observed_profile_start_offset_us: float = 0.0
 
 
 @dataclass
@@ -176,6 +197,15 @@ class _Vertex:
     duration_us: float
     release_us: float = 0.0
     communication_id: str | None = None
+    emit_timeline: bool = True
+    endpoint_arrival_vertex_id: str | None = None
+    endpoint_rendezvous_vertex_id: str | None = None
+    endpoint_profile_interval_us: float | None = None
+    endpoint_observed_service_us: float | None = None
+    rendezvous_endpoint_intervals: tuple[tuple[str, float], ...] = ()
+    rendezvous_fallback_service_us: float = 0.0
+    rendezvous_wait_us: float = 0.0
+    interval_underflow_us: float = 0.0
     preds: set[str] = field(default_factory=set)
     succs: set[str] = field(default_factory=set)
     start_us: float = 0.0
@@ -702,6 +732,64 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
             # determines this start.  Do not claim a shorter dependency-only
             # chain is critical through the release gap.
             vertex.critical_pred = None
+        if vertex.rendezvous_endpoint_intervals:
+            latest_arrival_us = max(
+                vertices[arrival_id].end_us
+                for arrival_id, _interval_us
+                in vertex.rendezvous_endpoint_intervals
+            )
+            latest_intervals = [
+                interval_us
+                for arrival_id, interval_us
+                in vertex.rendezvous_endpoint_intervals
+                if math.isclose(
+                    vertices[arrival_id].end_us,
+                    latest_arrival_us,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ]
+            # At least one endpoint has zero modeled rendezvous wait.  Its
+            # measured interval is therefore the safest available fallback
+            # when another endpoint's interval is inconsistent with the
+            # modeled arrival skew.  Median tied latest arrivals instead of
+            # selecting the minimum rank duration.
+            vertex.rendezvous_fallback_service_us = statistics.median(
+                latest_intervals
+            )
+        if vertex.endpoint_arrival_vertex_id is not None:
+            arrival = vertices[vertex.endpoint_arrival_vertex_id]
+            profile_interval_us = vertex.endpoint_profile_interval_us
+            observed_service_us = vertex.endpoint_observed_service_us
+            if profile_interval_us is None and observed_service_us is None:
+                raise SimulationValidationError(
+                    f"endpoint completion {vertex_id!r} has no communication timing"
+                )
+            vertex.rendezvous_wait_us = max(
+                0.0, vertex.start_us - arrival.end_us
+            )
+            if observed_service_us is not None:
+                # Calibrated profiles decompose service once on the observed
+                # cross-rank timeline.  Reuse that fixed endpoint-local tail
+                # in every replay instead of subtracting counterfactual wait.
+                residual_us = observed_service_us
+            else:
+                # Legacy profiles have only rank-local clock origins.  Retain
+                # the old best-effort decomposition for compatibility, while
+                # flagging inconsistent intervals below.
+                assert profile_interval_us is not None
+                residual_us = profile_interval_us - vertex.rendezvous_wait_us
+            vertex.interval_underflow_us = max(0.0, -residual_us)
+            if residual_us < 0.0:
+                rendezvous_id = vertex.endpoint_rendezvous_vertex_id
+                if rendezvous_id is None:
+                    raise SimulationValidationError(
+                        f"endpoint completion {vertex_id!r} has no rendezvous"
+                    )
+                residual_us = vertices[
+                    rendezvous_id
+                ].rendezvous_fallback_service_us
+            vertex.duration_us = residual_us
         vertex.end_us = vertex.start_us + vertex.duration_us
         for succ in sorted(vertex.succs):
             indegree[succ] -= 1
@@ -710,7 +798,7 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
     if len(order) != len(vertices):
         cyclic = sorted(vertex_id for vertex_id, degree in indegree.items() if degree > 0)
         raise SimulationValidationError(
-            "collapsed simulation graph contains a cycle (often inconsistent collective "
+            "communication simulation graph contains a cycle (often inconsistent collective "
             f"ordering across ranks): {cyclic!r}"
         )
     return tuple(order)
@@ -746,6 +834,14 @@ def simulate_training_step(
 
     profile_mode = normalize_profile_mode(profile_mode)
     dags, topology = _extract_inputs(plan_or_dags)
+    profile_metadata = getattr(plan_or_dags, "profile_metadata", {}) or {}
+    alignment = (
+        profile_metadata.get("timeline_alignment", {})
+        if isinstance(profile_metadata, Mapping)
+        else {}
+    )
+    aligned_modes = alignment.get("modes", {}) if isinstance(alignment, Mapping) else {}
+    cross_actor_offsets_aligned = profile_mode in aligned_modes
     empty_dags = [index for index, dag in enumerate(dags) if not dag.nodes]
     if empty_dags:
         raise SimulationValidationError(
@@ -840,15 +936,25 @@ def simulate_training_step(
                         context=f"node {uid!r} rank {rank}",
                         sample_iteration_id=sample_iteration_id,
                     )
+                    observed_profile_start_offset = _profile_start_offset_us(
+                        profile,
+                        context=f"node {uid!r} rank {rank}",
+                        sample_iteration_id=sample_iteration_id,
+                    )
                     profile_start_offset = (
-                        _profile_start_offset_us(
-                            profile,
-                            context=f"node {uid!r} rank {rank}",
-                            sample_iteration_id=sample_iteration_id,
-                        )
+                        observed_profile_start_offset
                         if profile_mode == NORMAL_PROFILE_MODE
                         else 0.0
                     )
+                    if cross_actor_offsets_aligned and not tuple(
+                        getattr(profile, "start_offset_samples_us", ())
+                    ):
+                        raise SimulationValidationError(
+                            f"aligned profile mode {profile_mode!r} is missing "
+                            f"start offsets for node {uid!r} rank {rank}"
+                        )
+                if node.node_kind == "ORDER_DUMMY":
+                    observed_profile_start_offset = 0.0
                 instances[key] = _InstanceRecord(
                     key=key,
                     pp_index=pp_index,
@@ -856,6 +962,9 @@ def simulate_training_step(
                     node=node,
                     profile_duration_us=profile_duration,
                     profile_start_offset_us=profile_start_offset,
+                    observed_profile_start_offset_us=(
+                        observed_profile_start_offset
+                    ),
                 )
 
     comm_groups: dict[tuple[Any, ...], list[_InstanceRecord]] = defaultdict(list)
@@ -867,37 +976,53 @@ def simulate_training_step(
             comm_groups[("collective", kind, _comm_id(record.node))].append(record)
 
     vertices: dict[str, _Vertex] = {}
+    # Completion vertices represent when rank-local consumers may proceed.
+    # Start vertices represent when an operation has satisfied its local
+    # dependencies.  They differ for communication endpoints because every
+    # arrival must first join a shared rendezvous.
     instance_vertex: dict[NodeInstance, str] = {}
+    instance_start_vertex: dict[NodeInstance, str] = {}
 
-    # Communication vertices are constructed first so all endpoints resolve to
-    # the same operation before local dependency edges are lowered.
+    # Communication vertices are constructed first so local dependency edges
+    # can target endpoint arrivals while outgoing edges originate at distinct
+    # endpoint completions.
     for group_key in sorted(comm_groups, key=repr):
         members = comm_groups[group_key]
         communication_id = ":".join(_identity_text(part) for part in group_key[1:])
-        vertex_id = f"comm:{group_key[0]}:{communication_id}"
-        if vertex_id in vertices:
-            raise SimulationValidationError(f"duplicate communication identity {vertex_id!r}")
-        # A CUDA-event interval around a communication endpoint includes both
-        # transfer service and any time that endpoint spends waiting for its
-        # peers.  This collapsed vertex already starts at the latest endpoint
-        # readiness time, so using the maximum sample would count arrival skew
-        # twice.  The minimum endpoint interval is the interference-free
-        # lower-bound proxy for service after every participant is ready.  Raw
-        # per-rank samples remain attached to TimelineEvent.profile_duration_us.
-        vertex = _Vertex(
-            vertex_id=vertex_id,
+        rendezvous_id = f"comm:{group_key[0]}:{communication_id}:rendezvous"
+        if rendezvous_id in vertices:
+            raise SimulationValidationError(
+                f"duplicate communication identity {rendezvous_id!r}"
+            )
+        rendezvous = _Vertex(
+            vertex_id=rendezvous_id,
             members=list(members),
-            duration_us=min(member.profile_duration_us for member in members),
-            release_us=max(
-                member.profile_start_offset_us for member in members
-            ),
+            duration_us=0.0,
             communication_id=communication_id,
+            emit_timeline=False,
         )
-        vertices[vertex_id] = vertex
-        for member in members:
-            instance_vertex[member.key] = vertex_id
+        vertices[rendezvous_id] = rendezvous
+
+        observed_rendezvous_us: float | None = None
+        if cross_actor_offsets_aligned:
+            observed_rendezvous_us = max(
+                member.observed_profile_start_offset_us for member in members
+            )
+            latest_observed_intervals = [
+                member.profile_duration_us
+                for member in members
+                if math.isclose(
+                    member.observed_profile_start_offset_us,
+                    observed_rendezvous_us,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ]
+            rendezvous.rendezvous_fallback_service_us = statistics.median(
+                latest_observed_intervals
+            )
         if group_key[0] == "p2p":
-            _validate_p2p_vertex(vertex)
+            _validate_p2p_vertex(rendezvous)
         else:
             actual = {member.key.global_rank for member in members}
             expected_sets = {
@@ -917,6 +1042,66 @@ def simulate_training_step(
                     f"{sorted(next(iter(expected_sets)))!r}"
                 )
 
+        rendezvous_endpoint_intervals: list[tuple[str, float]] = []
+        for member in members:
+            endpoint_suffix = (
+                f"{member.key.global_rank}:{member.key.uid}"
+            )
+            arrival_id = (
+                f"comm:{group_key[0]}:{communication_id}:arrival:{endpoint_suffix}"
+            )
+            completion_id = (
+                f"comm:{group_key[0]}:{communication_id}:completion:{endpoint_suffix}"
+            )
+            if arrival_id in vertices or completion_id in vertices:
+                raise SimulationValidationError(
+                    f"duplicate communication endpoint {member.key!r}"
+                )
+            vertices[arrival_id] = _Vertex(
+                vertex_id=arrival_id,
+                members=[member],
+                duration_us=0.0,
+                release_us=member.profile_start_offset_us,
+                communication_id=communication_id,
+                emit_timeline=False,
+            )
+            vertices[completion_id] = _Vertex(
+                vertex_id=completion_id,
+                members=[member],
+                # Calibrated profiles provide a fixed tail derived from the
+                # observed rendezvous. Legacy profiles resolve the tail from
+                # the measured interval minus graph-predicted peer wait.
+                duration_us=0.0,
+                communication_id=communication_id,
+                endpoint_arrival_vertex_id=arrival_id,
+                endpoint_rendezvous_vertex_id=rendezvous_id,
+                endpoint_profile_interval_us=(
+                    None
+                    if observed_rendezvous_us is not None
+                    else member.profile_duration_us
+                ),
+                endpoint_observed_service_us=(
+                    None
+                    if observed_rendezvous_us is None
+                    else (
+                        member.observed_profile_start_offset_us
+                        + member.profile_duration_us
+                        - observed_rendezvous_us
+                    )
+                ),
+            )
+            if observed_rendezvous_us is None:
+                rendezvous_endpoint_intervals.append(
+                    (arrival_id, member.profile_duration_us)
+                )
+            _add_vertex_edge(vertices, arrival_id, rendezvous_id)
+            _add_vertex_edge(vertices, rendezvous_id, completion_id)
+            instance_start_vertex[member.key] = arrival_id
+            instance_vertex[member.key] = completion_id
+        rendezvous.rendezvous_endpoint_intervals = tuple(
+            rendezvous_endpoint_intervals
+        )
+
     for record in instances.values():
         if record.key in instance_vertex:
             continue
@@ -926,8 +1111,14 @@ def simulate_training_step(
             members=[record],
             duration_us=record.profile_duration_us,
             release_us=record.profile_start_offset_us,
+            communication_id=(
+                _comm_id(record.node)
+                if record.node.node_kind in _RAGGED_A2A_KINDS
+                else None
+            ),
         )
         instance_vertex[record.key] = vertex_id
+        instance_start_vertex[record.key] = vertex_id
 
     # A rank-local synthetic prologue gates all local streams.  Absence means
     # the caller intentionally chose not to model prologue work.
@@ -959,21 +1150,20 @@ def simulate_training_step(
             duration_us=record.profile_duration_us,
         )
         instance_vertex[key] = vertex_id
+        instance_start_vertex[key] = vertex_id
 
     # Lower the same completion dependencies used by DagExecutor.  The shared
     # plan includes stream FIFO order, DAG edges, RECV consumer-stream guards,
     # and update synchronization.  Profiling maps the two directional P2P
-    # communicators onto dedicated physical streams, and collapsed P2P
-    # rendezvous vertices cannot safely inherit endpoint issue-order edges.
-    # Their synthetic serialization dependencies are therefore relaxed by the
-    # same shared predicate as the CUDA executor; data dependencies are never
-    # relaxed.
+    # communicators onto dedicated physical streams.  Opposite-direction P2P
+    # issue-order edges are relaxed by the same shared predicate as the CUDA
+    # executor; data dependencies are never relaxed.
     for pp_index, dag in enumerate(dags):
         plan = dag_plans[pp_index]
         for rank in layout.ranks_by_pp[pp_index]:
             for operation in plan:
                 node = dag.nodes[operation.uid]
-                dst = instance_vertex[NodeInstance(rank, operation.uid)]
+                dst = instance_start_vertex[NodeInstance(rank, operation.uid)]
                 for predecessor_uid in operation.completion_predecessors:
                     predecessor = dag.nodes[predecessor_uid]
                     if is_relaxable_p2p_ordering_dependency(
@@ -986,20 +1176,53 @@ def simulate_training_step(
                     _add_vertex_edge(vertices, src, dst)
 
     # Every prologue precedes every real operation on its rank.  Adding all
-    # such edges is equivalent to gating the first operation of each stream and
-    # remains correct after communication endpoints are collapsed.
+    # such edges is equivalent to gating the first operation of each stream.
     for rank in sorted(rank_set & set(merged_prologue)):
         prologue_vertex = instance_vertex[NodeInstance(rank, _PROLOGUE_UID)]
         for record in instances.values():
             if record.key.global_rank == rank:
-                _add_vertex_edge(vertices, prologue_vertex, instance_vertex[record.key])
+                _add_vertex_edge(
+                    vertices,
+                    prologue_vertex,
+                    instance_start_vertex[record.key],
+                )
 
     simulation_order = _simulate_vertices(vertices)
+    interval_underflows = [
+        vertex
+        for vertex in vertices.values()
+        if vertex.interval_underflow_us > 0.0
+    ]
+    if interval_underflows:
+        worst = max(
+            interval_underflows,
+            key=lambda vertex: vertex.interval_underflow_us,
+        )
+        underflow_counts: dict[str, int] = defaultdict(int)
+        for vertex in interval_underflows:
+            for member in vertex.members:
+                underflow_counts[member.node.node_kind] += 1
+        counts_text = ", ".join(
+            f"{kind}={count}"
+            for kind, count in sorted(underflow_counts.items())
+        )
+        warnings.append(
+            "communication timing decomposition produced negative residual "
+            f"service for {len(interval_underflows)} endpoints; "
+            "their residual service used the median interval of the "
+            "latest-arriving endpoint(s) "
+            f"(by kind: {counts_text}; "
+            f"worst underflow={worst.interval_underflow_us:.3f} us at "
+            f"{worst.vertex_id}). This indicates inconsistent endpoint "
+            "clocks or replay arrivals and reduces prediction reliability."
+        )
 
     timeline: list[TimelineEvent] = []
     per_rank: dict[int, float] = {rank: 0.0 for rank in layout.ranks}
     for vertex_id in simulation_order:
         vertex = vertices[vertex_id]
+        if not vertex.emit_timeline:
+            continue
         for member in sorted(vertex.members, key=lambda item: item.key):
             critical_predecessor = None
             if vertex.critical_pred is not None:
@@ -1135,6 +1358,63 @@ def simulate_training_step_samples(
     )
 
 
+def observed_profile_step_time_samples(
+    plan_or_dags: Any,
+    *,
+    profile_mode: str = NORMAL_PROFILE_MODE,
+) -> tuple[float, ...]:
+    """Return the observed CUDA timeline envelope for each profile iteration.
+
+    Normal profiling records every node's duration and its start offset from
+    that actor's iteration origin.  New profile plans translate those offsets
+    to a shared origin, so the maximum ``offset + duration`` reconstructs the
+    global observed GPU envelope.  For legacy plans the same calculation is
+    only an approximate rank-local diagnostic.  It is not a counterfactual
+    scheduler: it deliberately does not collapse collective endpoints or move
+    downstream work.
+    """
+
+    mode = normalize_profile_mode(profile_mode)
+    iteration_ids = profile_iteration_ids(plan_or_dags, profile_mode=mode)
+    dags, _topology = _extract_inputs(plan_or_dags)
+    samples: list[float] = []
+    for iteration_id in iteration_ids:
+        ends_us: list[float] = []
+        for dag in dags:
+            for node in dag.nodes.values():
+                if node.node_kind == "ORDER_DUMMY":
+                    continue
+                profiles = get_node_profile_times(node, mode)
+                for rank, profile in profiles.items():
+                    if not bool(getattr(profile, "executed", True)):
+                        continue
+                    offsets = tuple(
+                        getattr(profile, "start_offset_samples_us", ())
+                    )
+                    if not offsets:
+                        raise SimulationValidationError(
+                            f"node {node.uid!r} rank {rank} in mode {mode!r} "
+                            "has no observed start-offset samples"
+                        )
+                    duration_us = _profile_duration_us(
+                        profile,
+                        context=f"node {node.uid!r} rank {rank}",
+                        sample_iteration_id=iteration_id,
+                    )
+                    offset_us = _profile_start_offset_us(
+                        profile,
+                        context=f"node {node.uid!r} rank {rank}",
+                        sample_iteration_id=iteration_id,
+                    )
+                    ends_us.append(offset_us + duration_us)
+        if not ends_us:
+            raise SimulationValidationError(
+                f"profile mode {mode!r} has no executed timeline events"
+            )
+        samples.append(max(ends_us))
+    return tuple(samples)
+
+
 def simulate_profile_modes(
     plan_or_dags: Any,
     *,
@@ -1171,12 +1451,122 @@ def simulate_profile_modes(
         normal_samples,
         estimator="median",
     )
+    observed_normal_envelope_samples: tuple[float, ...] = ()
+    observed_normal_envelope_statistics = None
+    try:
+        observed_normal_envelope_samples = observed_profile_step_time_samples(
+            plan_or_dags,
+            profile_mode=NORMAL_PROFILE_MODE,
+        )
+    except SimulationValidationError:
+        # Duration-only artifacts predate start-offset capture and retain the
+        # dependency-replay behavior without an envelope diagnostic.
+        pass
+    if observed_normal_envelope_samples:
+        observed_normal_envelope_statistics = summarize_timing_samples(
+            observed_normal_envelope_samples,
+            estimator="median",
+        )
 
     actual_statistics = None
     normal_error = None
     reduction_pct = None
     event_overhead_pct = None
     instrumented_statistics = None
+    instrumented_interference_free_statistics = None
+    uninstrumented_normal_statistics = None
+    uninstrumented_interference_free_statistics = None
+    instrumented_normal_replay_error = None
+    instrumented_interference_free_replay_error = None
+    observed_reduction_pct = None
+    dependency_replay_reduction_pct = predicted_reduction(
+        interference_free_statistics.estimate,
+        normal_statistics.estimate,
+    )
+    instrumented_policy_reduction_pct = None
+    envelope_modeled_reduction_pct = None
+    normal_dependency_replay_excess_pct = None
+    mode_profile_event_overhead_pct = None
+    metadata = getattr(plan_or_dags, "profile_metadata", {}) or {}
+    instrumented_by_mode = metadata.get(
+        "instrumented_global_step_samples_us_by_mode", {}
+    )
+    instrumented_samples = instrumented_by_mode.get(NORMAL_PROFILE_MODE, ())
+    if instrumented_samples:
+        instrumented_statistics = summarize_timing_samples(
+            instrumented_samples,
+            estimator="median",
+        )
+        instrumented_normal_replay_error = prediction_error(
+            normal_statistics.estimate,
+            instrumented_statistics.estimate,
+        )
+    instrumented_interference_free_samples = instrumented_by_mode.get(
+        INTERFERENCE_FREE_PROFILE_MODE, ()
+    )
+    if instrumented_interference_free_samples:
+        instrumented_interference_free_statistics = summarize_timing_samples(
+            instrumented_interference_free_samples,
+            estimator="median",
+        )
+        instrumented_interference_free_replay_error = prediction_error(
+            interference_free_statistics.estimate,
+            instrumented_interference_free_statistics.estimate,
+        )
+    if (
+        instrumented_statistics is not None
+        and instrumented_interference_free_statistics is not None
+    ):
+        instrumented_policy_reduction_pct = predicted_reduction(
+            instrumented_interference_free_statistics.estimate,
+            instrumented_statistics.estimate,
+        )
+
+    uninstrumented_by_mode = metadata.get(
+        "uninstrumented_global_step_samples_us_by_mode", {}
+    )
+    uninstrumented_normal_samples = uninstrumented_by_mode.get(
+        NORMAL_PROFILE_MODE, ()
+    )
+    uninstrumented_interference_free_samples = uninstrumented_by_mode.get(
+        INTERFERENCE_FREE_PROFILE_MODE, ()
+    )
+    if uninstrumented_normal_samples:
+        uninstrumented_normal_statistics = summarize_timing_samples(
+            uninstrumented_normal_samples,
+            estimator="median",
+        )
+    if uninstrumented_interference_free_samples:
+        uninstrumented_interference_free_statistics = summarize_timing_samples(
+            uninstrumented_interference_free_samples,
+            estimator="median",
+        )
+    if (
+        uninstrumented_normal_statistics is not None
+        and uninstrumented_interference_free_statistics is not None
+    ):
+        observed_reduction_pct = predicted_reduction(
+            uninstrumented_interference_free_statistics.estimate,
+            uninstrumented_normal_statistics.estimate,
+        )
+    if observed_normal_envelope_statistics is not None:
+        envelope_modeled_reduction_pct = predicted_reduction(
+            interference_free_statistics.estimate,
+            observed_normal_envelope_statistics.estimate,
+        )
+        normal_dependency_replay_excess_pct = prediction_error(
+            normal_statistics.estimate,
+            observed_normal_envelope_statistics.estimate,
+        ).signed_pct
+    if (
+        instrumented_statistics is not None
+        and uninstrumented_normal_statistics is not None
+    ):
+        mode_profile_event_overhead_pct = prediction_error(
+            instrumented_statistics.estimate,
+            uninstrumented_normal_statistics.estimate,
+        ).signed_pct
+
     if actual_step_samples_us:
         actual_statistics = summarize_timing_samples(
             actual_step_samples_us,
@@ -1189,18 +1579,7 @@ def simulate_profile_modes(
             interference_free_statistics.estimate, actual_statistics.estimate
         )
 
-        metadata = getattr(plan_or_dags, "profile_metadata", {}) or {}
-        instrumented_by_mode = metadata.get(
-            "instrumented_global_step_samples_us_by_mode", {}
-        )
-        instrumented_samples = instrumented_by_mode.get(
-            NORMAL_PROFILE_MODE, ()
-        )
         if instrumented_samples:
-            instrumented_statistics = summarize_timing_samples(
-                instrumented_samples,
-                estimator="median",
-            )
             event_overhead_pct = prediction_error(
                 instrumented_statistics.estimate,
                 actual_statistics.estimate,
@@ -1211,13 +1590,42 @@ def simulate_profile_modes(
         normal=normal,
         interference_free_samples_us=interference_free_samples,
         normal_samples_us=normal_samples,
+        observed_normal_envelope_samples_us=(
+            observed_normal_envelope_samples
+        ),
         interference_free_statistics=interference_free_statistics,
         normal_statistics=normal_statistics,
+        observed_normal_envelope_statistics=(
+            observed_normal_envelope_statistics
+        ),
         actual_statistics=actual_statistics,
         instrumented_normal_statistics=instrumented_statistics,
+        instrumented_interference_free_statistics=(
+            instrumented_interference_free_statistics
+        ),
+        uninstrumented_normal_statistics=uninstrumented_normal_statistics,
+        uninstrumented_interference_free_statistics=(
+            uninstrumented_interference_free_statistics
+        ),
         normal_prediction_error=normal_error,
+        instrumented_normal_replay_error=instrumented_normal_replay_error,
+        instrumented_interference_free_replay_error=(
+            instrumented_interference_free_replay_error
+        ),
         predicted_interference_reduction_pct=reduction_pct,
+        dependency_replay_interference_reduction_pct=(
+            dependency_replay_reduction_pct
+        ),
+        instrumented_policy_reduction_pct=instrumented_policy_reduction_pct,
+        observed_interference_reduction_pct=observed_reduction_pct,
+        envelope_modeled_interference_reduction_pct=(
+            envelope_modeled_reduction_pct
+        ),
+        normal_dependency_replay_excess_pct=(
+            normal_dependency_replay_excess_pct
+        ),
         profile_event_overhead_pct=event_overhead_pct,
+        mode_profile_event_overhead_pct=mode_profile_event_overhead_pct,
     )
 
 
@@ -1231,5 +1639,6 @@ __all__ = [
     "profile_iteration_ids",
     "simulate_training_step",
     "simulate_training_step_samples",
+    "observed_profile_step_time_samples",
     "simulate_profile_modes",
 ]

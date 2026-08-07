@@ -340,7 +340,7 @@ def test_sharded_gradient_lifetime_pruning_still_coalesces_within_microbatch() -
     assert "zero_alloc_full_grads_before" not in second.node_meta
 
 
-def test_expert_shard_clears_accumulated_grad_markers_for_all_microbatches() -> None:
+def test_expert_shard_retains_accumulated_grad_sync_for_replicated_weights() -> None:
     dag = TrainingDAG()
     backwards = []
     for mb in range(3):
@@ -371,12 +371,12 @@ def test_expert_shard_clears_accumulated_grad_markers_for_all_microbatches() -> 
         [0, 2],
     )
 
-    assert not any(
+    assert any(
         node.node_kind == "REDUCE_SCATTER_COMM"
         for node in dag.nodes.values()
     )
     assert all(
-        "zero_alloc_full_grads_before" not in node.node_meta
+        node.node_meta.get("zero_alloc_full_grads_before") is True
         for node in backwards
     )
 
@@ -687,7 +687,7 @@ def test_apply_order_directive_rejects_cross_device_order_edge() -> None:
         )
 
 
-def test_shard_removes_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
+def test_shard_retains_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
     dag = TrainingDAG()
     node = TrainingDAGNode(
         uid="expert.bwd",
@@ -707,8 +707,96 @@ def test_shard_removes_zero_grad_lifetime_metadata_with_reduce_scatter() -> None
 
     directives._insert_shard_a2a_comm_nodes(dag, [{"PP": 0, "EP": 0}], [0, 2])
 
-    assert "zero_alloc_full_grads_before" not in node.node_meta
-    assert not any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
+    assert node.node_meta["zero_alloc_full_grads_before"] is True
+    assert any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
+
+
+def test_shard_uses_routed_contract_for_all_ep_collectives() -> None:
+    dag = TrainingDAG()
+    pre = _compute("pre.fwd", {"PP": 0, "PASS": "F"})
+    expert = _compute(
+        "expert.fwd",
+        {"PP": 0, "EP": 0, "PASS": "F"},
+    )
+    post = _compute("post.fwd", {"PP": 0, "PASS": "F"})
+    pre.device = expert.device = post.device = [0, 2]
+    pre.node_meta["a2a_boundary_after"] = {
+        "tensor_idx": 0,
+        "routing_counts_idx": 1,
+    }
+    expert.node_meta["a2a_boundary_after"] = {"tensor_idx": 0}
+
+    post_bwd = _bwd(
+        "post.bwd",
+        "post.fwd",
+        {"PP": 0, "PASS": "B"},
+    )
+    expert_bwd = _bwd(
+        "expert.bwd",
+        "expert.fwd",
+        {"PP": 0, "EP": 0, "PASS": "B"},
+    )
+    pre_bwd = _bwd(
+        "pre.bwd",
+        "pre.fwd",
+        {"PP": 0, "PASS": "B"},
+    )
+    post_bwd.device = expert_bwd.device = pre_bwd.device = [0, 2]
+
+    for node in (pre, expert, post, post_bwd, expert_bwd, pre_bwd):
+        dag.add_node(node)
+    dag.add_edge(TrainingDAGEdge("pre.fwd", "expert.fwd", "data"))
+    dag.add_edge(TrainingDAGEdge("expert.fwd", "post.fwd", "data"))
+    dag.add_edge(TrainingDAGEdge("post.bwd", "expert.bwd", "data"))
+    dag.add_edge(TrainingDAGEdge("expert.bwd", "pre.bwd", "data"))
+
+    directives._insert_shard_a2a_comm_nodes(
+        dag,
+        [{"PP": 0, "EP": 0}],
+        [0, 2],
+    )
+
+    collectives = [
+        node
+        for node in dag.nodes.values()
+        if node.node_kind == "A2A_COMM"
+    ]
+    assert len(collectives) == 4
+    assert all("ragged" not in node.node_meta for node in collectives)
+    assert {
+        node.node_meta["expert_fwd_uid"] for node in collectives
+    } == {"expert.fwd"}
+
+    count_collectives = [
+        node
+        for node in collectives
+        if node.node_meta.get("routing_counts_idx") is not None
+    ]
+    assert len(count_collectives) == 1
+    assert count_collectives[0].tag["PASS"] == "F"
+    assert count_collectives[0].node_meta["direction"] == "incoming"
+    assert count_collectives[0].node_meta["routing_counts_idx"] == 1
+
+
+def test_shard_requires_routing_counts_on_forward_expert_boundary() -> None:
+    dag = TrainingDAG()
+    pre = _compute("pre.fwd", {"PP": 0, "PASS": "F"})
+    expert = _compute(
+        "expert.fwd",
+        {"PP": 0, "EP": 0, "PASS": "F"},
+    )
+    pre.device = expert.device = [0, 2]
+    pre.node_meta["a2a_boundary_after"] = {"tensor_idx": 0}
+    dag.add_node(pre)
+    dag.add_node(expert)
+    dag.add_edge(TrainingDAGEdge("pre.fwd", "expert.fwd", "data"))
+
+    with pytest.raises(ValueError, match="requires a routing-count tensor"):
+        directives._insert_shard_a2a_comm_nodes(
+            dag,
+            [{"PP": 0, "EP": 0}],
+            [0, 2],
+        )
 
 
 def test_validate_schedule_tags_exist_rejects_tags_missing_from_model() -> None:

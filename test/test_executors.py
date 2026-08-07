@@ -51,6 +51,49 @@ def test_backward_input_events_waits_for_recv_all_gather_and_a2a() -> None:
     assert events.a2a == {}
 
 
+def test_split_backward_input_consumes_local_downstream_grads() -> None:
+    local_pred = SimpleNamespace(uid="local_bwd", task_type=TaskType.BWD_I)
+    node = SimpleNamespace(data_preds=[local_pred])
+    output_a = torch.randn(2, 3, requires_grad=True)
+    output_b = torch.randn(2, 3, requires_grad=True)
+    detached_a = output_a.detach().requires_grad_(True)
+    nondifferentiable = torch.ones(2, dtype=torch.int64)
+    detached_b = output_b.detach().requires_grad_(True)
+    grad_a = torch.randn_like(output_a)
+    grad_b = torch.randn_like(output_b)
+    buffers = SimpleNamespace(
+        task={
+            local_pred.uid: {
+                "inp_grads": [grad_a, None, grad_b],
+            }
+        },
+        release=Mock(),
+    )
+    executor = DagExecutor(
+        runtime=None,
+        stages=None,
+        buffers=buffers,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+    )
+
+    outputs, output_grads = executor._consume_local_backward_output_grads(
+        node,
+        {"detached_outs": [detached_a, nondifferentiable, detached_b]},
+        [output_a, output_b],
+    )
+
+    assert outputs[0] is output_a
+    assert outputs[1] is output_b
+    assert output_grads is not None
+    assert output_grads[0] is grad_a
+    assert output_grads[1] is grad_b
+    buffers.release.assert_called_once_with(local_pred.uid)
+
+
 def test_update_steps_sharded_and_regular_optimizers(monkeypatch) -> None:
     stream = Mock()
     all_reduce_evt = object()
@@ -109,3 +152,72 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
     assert grad.dtype == torch.float32
     weight.grad = grad
+
+
+def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
+    def fake_permute(tensor, counts, ep_degree, num_local_experts):
+        assert ep_degree == 1
+        assert num_local_experts == counts.numel()
+        return (
+            tensor.shape,
+            tensor + 1,
+            torch.arange(tensor.shape[0]),
+            counts + 2,
+        )
+
+    monkeypatch.setattr(executors, "_permute", fake_permute)
+    monkeypatch.setattr(
+        executors,
+        "_unpermute",
+        lambda tensor, _shape, _indices: tensor + 3,
+    )
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+
+    executor = DagExecutor(
+        runtime=SimpleNamespace(ep_group="ep", global_rank=3),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=Mock(),
+        compute=None,
+        logger=None,
+    )
+    incoming = SimpleNamespace(
+        uid="incoming",
+        task_type=TaskType.FWD_A2A,
+        node_meta={
+            "direction": "incoming",
+            "expert_fwd_uid": "expert",
+            "participants": [3],
+        },
+    )
+    outgoing = SimpleNamespace(
+        uid="outgoing",
+        task_type=TaskType.FWD_A2A,
+        node_meta={
+            "direction": "outgoing",
+            "expert_fwd_uid": "expert",
+            "participants": [3],
+        },
+    )
+    tensor = torch.ones(4, 2)
+    counts = torch.tensor([1, 1, 1, 1])
+
+    dispatched, local_counts = executor._all_to_all_ep_boundary(
+        incoming,
+        tensor,
+        stream=object(),
+        routing_counts=counts,
+    )
+    combined = executor._all_to_all_ep_boundary(
+        outgoing,
+        dispatched,
+        stream=object(),
+    )
+
+    assert torch.equal(dispatched, tensor + 1)
+    assert torch.equal(local_counts, counts + 2)
+    assert torch.equal(combined, tensor + 4)
+    state = executor.expert_a2a_states["expert"]
+    assert (state.ep_rank, state.ep_degree) == (0, 1)

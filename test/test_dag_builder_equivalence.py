@@ -35,7 +35,11 @@ def _dummy_gm() -> fx.GraphModule:
     return fx.GraphModule({}, graph)
 
 
-def _base_training_dag(logical_stages: int) -> TrainingDAG:
+def _base_training_dag(
+    logical_stages: int,
+    *,
+    routed_a2a: bool = False,
+) -> TrainingDAG:
     dag = TrainingDAG()
     fwd_uids: list[str] = []
     previous_uid: str | None = None
@@ -43,6 +47,9 @@ def _base_training_dag(logical_stages: int) -> TrainingDAG:
         for segment, ep in enumerate((None, 0, None)):
             uid = f"s{pp}.seg{segment}"
             fwd_uids.append(uid)
+            boundary_after = {"tensor_idx": 0}
+            if routed_a2a and segment == 0:
+                boundary_after["routing_counts_idx"] = 1
             dag.add_node(
                 TrainingDAGNode(
                     uid=uid,
@@ -59,7 +66,7 @@ def _base_training_dag(logical_stages: int) -> TrainingDAG:
                         "graphargs": [],
                         "input_idxs": [],
                         "param_idxs": [],
-                        "a2a_boundary_after": {"tensor_idx": 0},
+                        "a2a_boundary_after": boundary_after,
                     },
                 )
             )
@@ -259,7 +266,7 @@ def _case_digest(
     logical_stages = (
         case["physical_pp"] if placement == "normal" else 2 * case["physical_pp"]
     )
-    dag = _base_training_dag(logical_stages)
+    dag = _base_training_dag(logical_stages, routed_a2a=bool(case["ep"]))
     original_bucket_stage = directives.bucket_stage
     if case.get("bucket"):
         directives.bucket_stage = lambda *_args, **_kwargs: [
@@ -301,13 +308,13 @@ def _case_digest(
 LEGACY_DIGESTS: dict[str, str] = {
     "bucketed_zero3_zerobubble": "e6250ab79c0c72294d78992726b21d75407c351cae9bec5d0813024215641437",
     "dp_only_unsharded": "5e248c6eb273dbb10c6261aafb3cee2fe55e0da998cb1e6f0977081986f72cf2",
-    "interleaved_placement": "18653c3dd9be76dad7258d636f221fb9cb37a694f352509446744598892a1f91",
-    "pp_dp_ep_1f1b": "8232983dad41fb5d4814f82f1d459ef4408db25fa8ad4eaee5a0df22462fc673",
+    "interleaved_placement": "59a2117379e4e44a63e8599c001cf5e57841cbcc2dbdd07913a396e96aa8a6e8",
+    "pp_dp_ep_1f1b": "6a3845d839c766795a4a799ae47d5dcfcf4111acbb931197f2fa60c6f07dcc2e",
     "pp_dp_grad_sharded": "fdd15fd8eca5897402e89f482197a53e9f209c12bc0a61634343fa3c9f79d969",
     "pp_dp_unsharded": "d81344f46b34e8c8f3cba9238a8a37f9f5b8b382ee88821df65579f7a3263bd3",
     "pp_dp_zero3_zerobubble": "b8759170e8e02a53dabc58e6eddfc10d6cd416f5d0bb706621838d2818688e34",
     "pp_only_1f1b": "eac89ef8094e8acbd18cc296384effa13d22b91de6a59856d9a7bea36c2e79f0",
-    "v_placement_dualpipev": "09c4d9d32de8c0e3b34d28b7dc9930b61f2bf12414154225680bd067471e11ac",
+    "v_placement_dualpipev": "b9510ebd6d7eb5a1c0aa1582805e9495898244ed93536281c4972490a490012a",
 }
 
 

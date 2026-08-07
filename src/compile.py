@@ -12,6 +12,7 @@ from .state import (
     LOG_LEVEL,
 )
 from .fx import _serialize_graphmodule
+from .model_state import DEFAULT_MODEL_SEED
 from .piper import _reset_annotation_state, piper
 from .schedule import (
     derive_schedule_info,
@@ -58,6 +59,11 @@ class _CompiledDataStore:
 
     def get_training_dag_data(self) -> dict:
         return self._training_dag_data
+
+    def monotonic_time_ns(self) -> int:
+        """Return the coordinator's monotonic clock for actor calibration."""
+
+        return time.monotonic_ns()
 
     def begin_profile_generation(self) -> int:
         """Start a fresh distributed profile collection and return its id."""
@@ -159,6 +165,7 @@ def piper_setup(
     const_attrs: dict = None,
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
+    model_seed: int = DEFAULT_MODEL_SEED,
 ):
     """
     Compile a model with the TrainingDAG backend.
@@ -176,6 +183,8 @@ def piper_setup(
         schedule_directives_file: JSON schedule description consumed by the
             TrainingDAG backend. When provided, Piper derives pp/dp/mbs
             schedule metadata internally.
+        model_seed: Shared seed used to initialize every lifted model parameter
+            deterministically by its eager ``state_dict`` name.
     """
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
@@ -216,6 +225,7 @@ def piper_setup(
         no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
         use_inductor=use_inductor,
         pp_outer=pp_outer,
+        model_seed=model_seed,
     )
 
     if dp_rank == 0:

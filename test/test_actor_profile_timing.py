@@ -23,6 +23,9 @@ class _FakeEvent:
     def elapsed_time(self, end: "_FakeEvent") -> float:
         return end.timestamp_ms - self.timestamp_ms
 
+    def synchronize(self) -> None:
+        pass
+
 
 def test_cuda_event_recorder_reuses_events_for_cross_stream_start_offsets(
     monkeypatch,
@@ -53,11 +56,14 @@ def test_cuda_event_recorder_reuses_events_for_cross_stream_start_offsets(
     )
 
 
-def test_actor_only_retains_start_offsets_for_normal_profiles(monkeypatch) -> None:
+def test_actor_retains_start_offsets_for_both_profile_modes(monkeypatch) -> None:
     class _Recorder:
         node_samples_us = {"node": 7.0}
         node_start_offsets_us = {"node": 19.0}
         prologue_sample_us = None
+
+        def __init__(self, **_kwargs) -> None:
+            pass
 
     actor_class = PiperActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
@@ -81,7 +87,9 @@ def test_actor_only_retains_start_offsets_for_normal_profiles(monkeypatch) -> No
         "interference_free": defaultdict(list, {"node": [7.0]}),
         "normal": defaultdict(list, {"node": [7.0]}),
     }
-    assert "interference_free" not in actor._profile_node_start_offsets
+    assert actor._profile_node_start_offsets["interference_free"] == {
+        "node": [19.0]
+    }
     assert actor._profile_node_start_offsets["normal"] == {
         "node": [19.0]
     }

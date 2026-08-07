@@ -9,7 +9,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from models.qwen3 import QWEN_MODEL_NAMES
+try:
+    from .models.qwen3 import QWEN_MODEL_NAMES
+except ImportError:
+    # Keep direct ``python examples/run_qwen_examples.py`` execution working.
+    from models.qwen3 import QWEN_MODEL_NAMES
 
 
 QWEN_MODELS = QWEN_MODEL_NAMES

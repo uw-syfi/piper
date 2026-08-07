@@ -842,11 +842,9 @@ def _insert_reduce_comm_nodes(
     filters: list[dict[str, Any]],
     devices: list[int],
     comm_stream: str | None = None,
-    skip_sync_uids: set[str] | None = None,
 ) -> None:
     """Insert one all-reduce per bucket after all matched weight backwards."""
     expected = sorted(int(d) for d in devices)
-    skip_sync_uids = skip_sync_uids or set()
     if len(expected) <= 1:
         # A singleton replica group is no-DP. Local autograd still accumulates
         # gradients across microbatches, but there is nothing to synchronize.
@@ -897,10 +895,6 @@ def _insert_reduce_comm_nodes(
             node_kind="REDUCE_COMM",
             prefix="reduce",
         )
-        # Preserve the legacy UID sequence even when this collective would be
-        # deleted by the later EP-shard pass.
-        if anchor.uid in skip_sync_uids:
-            continue
         bucket_key = anchor.node_meta.get("bucket_key")
         comm_key = (
             bucket_key
@@ -974,10 +968,8 @@ def _insert_all_gather_comm_nodes(
     filters: list[dict[str, Any]],
     devices: list[int],
     comm_stream: str | None = None,
-    skip_sync_uids: set[str] | None = None,
 ) -> None:
     expected = sorted(int(d) for d in devices)
-    skip_sync_uids = skip_sync_uids or set()
     for uid in _matching_uids(dag, filters):
         node = dag.nodes[uid]
         if (
@@ -1003,10 +995,6 @@ def _insert_all_gather_comm_nodes(
             node_kind="ALL_GATHER_COMM",
             prefix="all_gather",
         )
-        # The EP lowering path used to insert this node, then remove it again.
-        # Reserve its legacy UID but avoid materializing transient topology.
-        if node.uid in skip_sync_uids:
-            continue
         ag_tag = dict(node.tag)
         ag_node = TrainingDAGNode(
             uid=ag_uid,
@@ -1053,7 +1041,6 @@ def _insert_reduce_scatter_comm_nodes(
     filters: list[dict[str, Any]],
     devices: list[int],
     comm_stream: str | None = None,
-    skip_sync_uids: set[str] | None = None,
 ) -> None:
     """Insert one reduce-scatter per bucket after all matched backwards.
 
@@ -1069,7 +1056,6 @@ def _insert_reduce_scatter_comm_nodes(
     lifetime-pruning pass proves that a longer full-parameter lifetime is safe.
     """
     expected = sorted(int(d) for d in devices)
-    skip_sync_uids = skip_sync_uids or set()
     candidates: list[TrainingDAGNode] = []
     for uid in _matching_uids(dag, filters):
         node = dag.nodes[uid]
@@ -1115,11 +1101,6 @@ def _insert_reduce_scatter_comm_nodes(
             node_kind="REDUCE_SCATTER_COMM",
             prefix="reduce_scatter",
         )
-        # The legacy A2A pass removes a bucket collective when its data-anchor
-        # backward is expert-sharded. Keep later UIDs stable while skipping the
-        # transient collective and its lifetime metadata entirely.
-        if anchor.uid in skip_sync_uids:
-            continue
         bucket_key = anchor.node_meta.get("bucket_key")
         comm_key = (
             bucket_key
@@ -1179,7 +1160,6 @@ def _insert_shard_a2a_comm_nodes(
         for uid in _matching_uids(dag, filters)
         if dag.nodes[uid].node_kind == "COMPUTE"
     ]
-    removable_comm_uids_to_delete: set[str] = set()
     compute_edges_to_delete: list[TrainingDAGEdge] = []
     compute_edge_keys_to_delete: set[
         tuple[str, str, str, str | None]
@@ -1212,6 +1192,51 @@ def _insert_shard_a2a_comm_nodes(
             )
         return binfo
 
+    def _expert_fwd_uid(compute_node: TrainingDAGNode) -> str:
+        if compute_node.compute_subkind == "FWD":
+            return compute_node.uid
+        fwd_uid = compute_node.node_meta.get("fwd_uid")
+        if not isinstance(fwd_uid, str):
+            raise ValueError(
+                f"Expert backward node {compute_node.uid} is missing fwd_uid"
+            )
+        return fwd_uid
+
+    # Routed A2A is the expert-parallel contract. The forward incoming edge
+    # supplies token counts; the outgoing and backward nodes reuse the
+    # dispatch state keyed by the expert forward node.
+    routing_counts_by_fwd_uid: dict[str, int] = {}
+    for matched_uid in matched_uids:
+        matched_node = dag.nodes[matched_uid]
+        if matched_node.compute_subkind != "FWD":
+            continue
+        routing_count_indices: list[int] = []
+        for edge in list(dag.edges):
+            if edge.dep_kind != "data" or edge.dst_uid != matched_uid:
+                continue
+            src_node = dag.nodes[edge.src_uid]
+            if src_node.node_kind != "COMPUTE" or src_node.compute_subkind != "FWD":
+                continue
+            boundary_info = src_node.node_meta.get("a2a_boundary_after")
+            if (
+                isinstance(boundary_info, dict)
+                and boundary_info.get("routing_counts_idx") is not None
+            ):
+                routing_count_indices.append(
+                    int(boundary_info["routing_counts_idx"])
+                )
+        if len(routing_count_indices) > 1:
+            raise ValueError(
+                f"Expert node {matched_uid} has multiple routing-count "
+                f"boundaries: {routing_count_indices}"
+            )
+        if not routing_count_indices:
+            raise ValueError(
+                f"Expert node {matched_uid} requires a routing-count tensor on "
+                "its incoming A2A boundary"
+            )
+        routing_counts_by_fwd_uid[matched_uid] = routing_count_indices[0]
+
     for uid in matched_uids:
         if uid not in dag.nodes:
             continue
@@ -1221,74 +1246,6 @@ def _insert_shard_a2a_comm_nodes(
                 f"shard requires matched node {uid} to have devices={devices}, got node_devices={node.device}"
             )
 
-        if node.compute_subkind == "FWD":
-            node.node_meta["apply_zero"] = False
-        elif _is_backward_compute_subkind(node.compute_subkind):
-            fwd_uid = node.node_meta.get("fwd_uid")
-            if isinstance(fwd_uid, str) and fwd_uid in dag.nodes:
-                dag.nodes[fwd_uid].node_meta["apply_zero"] = False
-
-        # Shard replaces replicate-style grad/param sync comms around matched
-        # compute nodes; remove existing gather/reduce comm nodes attached to
-        # this compute node before inserting A2A edges.
-        removable_sync_kinds = {"ALL_GATHER_COMM", "REDUCE_COMM", "REDUCE_SCATTER_COMM"}
-        removable_comm_uids: set[str] = set()
-        for e in (
-            dag.outgoing_edges(uid, dep_kind="data")
-            + dag.incoming_edges(uid, dep_kind="data")
-        ):
-            if e.src_uid == uid and e.dst_uid in dag.nodes:
-                other = dag.nodes[e.dst_uid]
-                if (
-                    other.node_kind in removable_sync_kinds
-                    and other.uid not in removable_comm_uids_to_delete
-                ):
-                    removable_comm_uids.add(other.uid)
-            elif e.dst_uid == uid and e.src_uid in dag.nodes:
-                other = dag.nodes[e.src_uid]
-                if (
-                    other.node_kind in removable_sync_kinds
-                    and other.uid not in removable_comm_uids_to_delete
-                ):
-                    removable_comm_uids.add(other.uid)
-        for comm_uid in sorted(removable_comm_uids):
-            if comm_uid not in dag.nodes:
-                continue
-            comm_node = dag.nodes[comm_uid]
-            if comm_node.node_kind == "REDUCE_SCATTER_COMM":
-                # A reduce-scatter can represent every microbatch contributing
-                # to one accumulated gradient bucket while only its final
-                # contributor carries the data edge.  Removing that collective
-                # for expert sharding must clear the ZeRO grad-allocation
-                # marker from every contributor, including temporal-only ones.
-                contributor_uids = comm_node.node_meta.get(
-                    "bwd_uids",
-                    [comm_node.node_meta.get("bwd_uid")],
-                )
-                for contributor_uid in contributor_uids:
-                    if contributor_uid in dag.nodes:
-                        dag.nodes[contributor_uid].node_meta.pop(
-                            "zero_alloc_full_grads_before",
-                            None,
-                        )
-            # Bypass removed sync-comm nodes so dataflow remains connected:
-            # pred -> COMM -> succ  ==>  pred -> succ
-            in_comm = dag.incoming_edges(comm_uid, dep_kind="data")
-            out_comm = dag.outgoing_edges(comm_uid, dep_kind="data")
-            for ie in in_comm:
-                for oe in out_comm:
-                    dag.add_edge(
-                        TrainingDAGEdge(
-                            src_uid=ie.src_uid,
-                            dst_uid=oe.dst_uid,
-                            dep_kind="data",
-                            tensor_name=(oe.tensor_name if oe.tensor_name is not None else ie.tensor_name),
-                        )
-                    )
-            removable_comm_uids_to_delete.add(comm_uid)
-        if removable_comm_uids:
-            node.node_meta.pop("zero_alloc_full_grads_before", None)
-            node.node_meta.pop("zero_free_full_params_after", None)
         if node.compute_subkind == "BWD_W":
             continue
 
@@ -1359,11 +1316,26 @@ def _insert_shard_a2a_comm_nodes(
             src_node = dag.nodes[e.src_uid]
             binfo = _a2a_boundary_for_edge(src_node, node)
             a2a_tensor_idx = binfo["tensor_idx"]
+            expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = _reserve_comm_uid(
                 dag,
                 node_kind="A2A_COMM",
                 prefix="a2a",
             )
+            comm_meta = {
+                "direction": "incoming",
+                "target_uid": uid,
+                "expert_fwd_uid": expert_fwd_uid,
+                "a2a_tensor_idx": a2a_tensor_idx,
+                "bucket_key": node.node_meta.get("bucket_key", src_node.node_meta.get("bucket_key")),
+                "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
+                "comm_group_kind": "ep",
+                "participants": sorted(int(rank) for rank in node.device),
+            }
+            if node.compute_subkind == "FWD":
+                comm_meta["routing_counts_idx"] = routing_counts_by_fwd_uid[
+                    expert_fwd_uid
+                ]
             comm_node = TrainingDAGNode(
                 uid=comm_uid,
                 node_kind="A2A_COMM",
@@ -1371,15 +1343,7 @@ def _insert_shard_a2a_comm_nodes(
                 tag=dict(node.tag),
                 device=list(node.device) if node.device is not None else None,
                 stream=comm_stream if comm_stream is not None else "default_stream",
-                node_meta={
-                    "direction": "incoming",
-                    "target_uid": uid,
-                    "a2a_tensor_idx": a2a_tensor_idx,
-                    "bucket_key": node.node_meta.get("bucket_key", src_node.node_meta.get("bucket_key")),
-                    "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
-                    "comm_group_kind": "ep",
-                    "participants": sorted(int(rank) for rank in node.device),
-                },
+                node_meta=comm_meta,
             )
             dag.add_node(comm_node)
             dag.add_edge(TrainingDAGEdge(src_uid=e.src_uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
@@ -1389,6 +1353,7 @@ def _insert_shard_a2a_comm_nodes(
             dst_node = dag.nodes[e.dst_uid]
             binfo = _a2a_boundary_for_edge(node, dst_node)
             a2a_tensor_idx = binfo["tensor_idx"]
+            expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = _reserve_comm_uid(
                 dag,
                 node_kind="A2A_COMM",
@@ -1404,6 +1369,7 @@ def _insert_shard_a2a_comm_nodes(
                 node_meta={
                     "direction": "outgoing",
                     "source_uid": uid,
+                    "expert_fwd_uid": expert_fwd_uid,
                     "a2a_tensor_idx": a2a_tensor_idx,
                     "bucket_key": node.node_meta.get("bucket_key", dst_node.node_meta.get("bucket_key")),
                     "comm_id": f"a2a:{uid}->{e.dst_uid}:{a2a_tensor_idx}",
@@ -1416,7 +1382,6 @@ def _insert_shard_a2a_comm_nodes(
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
     _remove_edges(dag, compute_edges_to_delete)
-    _remove_nodes_and_incident_edges(dag, removable_comm_uids_to_delete)
 
 
 def _apply_split_directive(
@@ -1860,39 +1825,11 @@ def apply_order_directives(
         )
 
 
-def _sharded_compute_uids(
-    training_dag: TrainingDAG,
-    directives: list[Any],
-) -> set[str]:
-    matched_uids: set[str] = set()
-    for raw in directives:
-        if not isinstance(raw, dict) or raw.get("op") != "shard":
-            continue
-        (
-            _op,
-            shard_filters,
-            _devices,
-            _stream,
-            _gather_stream,
-            _reduce_stream,
-            _shard_params,
-            _shard_grads,
-            _bucket_size,
-        ) = _normalize_filter_devices_directive(raw)
-        matched_uids.update(
-            uid
-            for uid in _matching_uids(training_dag, shard_filters)
-            if training_dag.nodes[uid].node_kind == "COMPUTE"
-        )
-    return matched_uids
-
-
 def _apply_communication_directive(
     training_dag: TrainingDAG,
     raw: dict[str, Any],
     *,
     directive_idx: int,
-    sharded_compute_uids: set[str],
     bucket_already_lowered: bool,
 ) -> bool:
     (
@@ -1937,14 +1874,12 @@ def _apply_communication_directive(
                 filters,
                 devices,
                 comm_stream=gather_stream,
-                skip_sync_uids=sharded_compute_uids,
             )
             _insert_reduce_scatter_comm_nodes(
                 training_dag,
                 filters,
                 devices,
                 comm_stream=reduce_stream,
-                skip_sync_uids=sharded_compute_uids,
             )
         elif shard_grads:
             _insert_reduce_scatter_comm_nodes(
@@ -1952,7 +1887,6 @@ def _apply_communication_directive(
                 filters,
                 devices,
                 comm_stream=reduce_stream,
-                skip_sync_uids=sharded_compute_uids,
             )
         else:
             _insert_reduce_comm_nodes(
@@ -1960,7 +1894,6 @@ def _apply_communication_directive(
                 filters,
                 devices,
                 comm_stream=reduce_stream,
-                skip_sync_uids=sharded_compute_uids,
             )
     elif op == "shard":
         _insert_shard_a2a_comm_nodes(
@@ -1981,10 +1914,6 @@ def apply_communication_directives_to_rank_dags(
     """Lower device-local DP/EP communication after physical-PP splitting."""
 
     shared_comm_indices: dict[str, int] = {}
-    sharded_by_dag = {
-        id(rank_dag): _sharded_compute_uids(rank_dag, directives)
-        for rank_dag in rank_dags
-    }
     for rank_dag in rank_dags:
         rank_dag._next_comm_index_by_kind = shared_comm_indices
 
@@ -1997,7 +1926,6 @@ def apply_communication_directives_to_rank_dags(
                 rank_dag,
                 raw,
                 directive_idx=directive_idx,
-                sharded_compute_uids=sharded_by_dag[id(rank_dag)],
                 # Bucketing is always part of the pre-split structural phase.
                 bucket_already_lowered=True,
             ):
@@ -2089,13 +2017,6 @@ def apply_schedule_directives(
     if defer_communication:
         return
 
-    # Compile the final EP policy before materializing DP communication.  A
-    # shard directive replaces every replicate-style collective attached to a
-    # matched expert compute node, so inserting those collectives only to
-    # delete them later is pure transient work.  The insertion helpers still
-    # reserve legacy communication UIDs for skipped nodes/groups.
-    sharded_compute_uids = _sharded_compute_uids(training_dag, directives)
-
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
             continue
@@ -2103,7 +2024,6 @@ def apply_schedule_directives(
             training_dag,
             raw,
             directive_idx=i,
-            sharded_compute_uids=sharded_compute_uids,
             bucket_already_lowered=i in bucketed_replicate_directives,
         ):
             raise ValueError(f"communication directive[{i}] matched zero compute nodes: {raw}")
