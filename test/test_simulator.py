@@ -103,7 +103,7 @@ def test_raw_profile_iterations_produce_paired_simulation_samples() -> None:
     assert samples == pytest.approx((3.0, 5.0, 4.0))
 
 
-def test_normal_replay_preserves_iteration_aligned_start_offsets() -> None:
+def test_replay_uses_earliest_legal_start_and_retains_observed_offsets() -> None:
     node = _node("a", {0: 1.0})
     node.profile_times_by_mode["normal"] = {
         0: NodeProfile.from_samples(
@@ -118,10 +118,11 @@ def test_normal_replay_preserves_iteration_aligned_start_offsets() -> None:
     estimate = simulate_training_step([dag], profile_mode="normal")
     samples = simulate_training_step_samples([dag], profile_mode="normal")
 
-    assert estimate.event(0, "a").start_us == pytest.approx(15.0)
-    assert estimate.event(0, "a").profile_start_offset_us == pytest.approx(15.0)
-    assert estimate.step_time_us == pytest.approx(18.0)
-    assert samples == pytest.approx((12.0, 24.0))
+    assert estimate.event(0, "a").start_us == pytest.approx(0.0)
+    assert estimate.event(0, "a").profile_start_offset_us == pytest.approx(0.0)
+    assert estimate.event(0, "a").observed_profile_start_offset_us == pytest.approx(15.0)
+    assert estimate.step_time_us == pytest.approx(3.0)
+    assert samples == pytest.approx((2.0, 4.0))
 
 
 def test_interference_free_replay_does_not_apply_start_offsets() -> None:
@@ -397,10 +398,10 @@ def test_p2p_profile_interval_subtracts_rendezvous_wait() -> None:
         [_dag(send), _dag(recv)], profile_mode="normal"
     )
 
-    assert result.event(0, "send").start_us == pytest.approx(10.0)
-    assert result.event(1, "recv").start_us == pytest.approx(10.0)
+    assert result.event(0, "send").start_us == pytest.approx(0.0)
+    assert result.event(1, "recv").start_us == pytest.approx(0.0)
     assert result.event(0, "send").profile_duration_us == pytest.approx(12.0)
-    assert result.event(0, "send").effective_duration_us == pytest.approx(2.0)
+    assert result.event(0, "send").effective_duration_us == pytest.approx(12.0)
     assert result.event(1, "recv").effective_duration_us == pytest.approx(2.0)
     assert result.step_time_us == pytest.approx(12.0)
 
@@ -437,15 +438,13 @@ def test_p2p_inconsistent_interval_uses_latest_arrival_fallback() -> None:
         [_dag(send), _dag(recv)], profile_mode="normal"
     )
 
-    # The send interval cannot contain the modeled 10 us wait.  Do not turn
-    # that inconsistency into zero service or revive the old minimum-rank
-    # heuristic: use the latest endpoint's 2 us interval and report it.
-    assert result.event(0, "send").effective_duration_us == pytest.approx(2.0)
+    # Timeline offsets are validation data, not replay releases.  Without a
+    # modeled predecessor delay there is no basis to subtract peer wait from
+    # the measured endpoint interval.
+    assert result.event(0, "send").effective_duration_us == pytest.approx(5.0)
     assert result.event(1, "recv").effective_duration_us == pytest.approx(2.0)
-    assert result.step_time_us == pytest.approx(12.0)
-    assert len(result.warnings) == 1
-    assert "SEND_COMM=1" in result.warnings[0]
-    assert "reduces prediction reliability" in result.warnings[0]
+    assert result.step_time_us == pytest.approx(5.0)
+    assert not result.warnings
 
 
 def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
