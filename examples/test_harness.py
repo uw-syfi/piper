@@ -126,6 +126,12 @@ def main() -> None:
         default=None,
         help="Ray namespace. Defaults to the selected test module name.",
     )
+    parser.add_argument(
+        "--num-standby",
+        type=int,
+        default=0,
+        help="Number of standby DP ranks to reserve (one extra GPU bundle each).",
+    )
     args, test_args = parser.parse_known_args()
 
     if args.schedule != "custom":
@@ -241,12 +247,17 @@ def _run_test_module(
     )
     try:
         pp_outer = getattr(test_ns, "pp_outer", False)
-        pg = create_piper_placement_group(test_ns.schedule_directives_file, pp_outer=pp_outer)
+        num_standby = getattr(args, "num_standby", 0)
+        pg = create_piper_placement_group(
+            test_ns.schedule_directives_file, pp_outer=pp_outer,
+            num_standby=num_standby,
+        )
         ray.get(pg.ready(), timeout=600)
         logging.getLogger(module_name).info(placement_group_table(pg))
         coordinator = PiperProgramCoordinator.remote(
             schedule_directives_file=test_ns.schedule_directives_file,
             pp_outer=pp_outer,
+            num_standby=num_standby,
         )
         handles = coordinator.run_program.remote(test_module.main, pg, test_ns, pg)
         dp_metrics = ray.get(handles)

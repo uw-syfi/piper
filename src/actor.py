@@ -1,4 +1,5 @@
 import ray
+import threading
 import torch
 import os
 import re
@@ -69,6 +70,12 @@ def _create_actors(
                 # "NCCL_P2P_DISABLE": "1",
                 # "NCCL_DEBUG": "INFO",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
+                # Actors don't inherit the driver's os.environ.
+                "PIPER_NUM_STANDBY": os.environ.get("PIPER_NUM_STANDBY", "0"),
+                # Watchdog auto-handling reacts to our intentional abort by
+                # aborting every comm (see _abort_process_group docs).
+                **({"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"}
+                   if int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0 else {}),
             }
         }
         # When pp_outer=True, one bundle corresponds to one pipeline stage and
@@ -78,6 +85,9 @@ def _create_actors(
         bundle_index = pp_rank if pp_outer else dp_rank
         actor = PiperActor.options(
             num_gpus=0.6,
+            # Threaded actor: control methods (abort_comms, get_last_committed,
+            # join_standby_group) must run while run_dag blocks the main call.
+            max_concurrency=2,
             runtime_env={**nsight_env, **nccl_env},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -159,6 +169,14 @@ class PiperActor:
             self.compute,
             self.logger,
         )
+        # Standby mode: UPD must CPU-sync all-reduces and honor the fence flag
+        # (an aborted collective otherwise commits garbage gradients).
+        self.dag_executor._cpu_sync_allreduce = (
+            int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0
+        )
+        # Set when abort_comms has fully finished; join_standby_group must not
+        # build a new comm while an abort is still in flight in this process.
+        self._abort_done = threading.Event()
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the coordinator before compilation so _load_stage can fill them in
@@ -265,7 +283,10 @@ class PiperActor:
             self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
     def _join_dp_process_group(self):
-        num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
+        # Standby ranks execute every collective new_group call (required by
+        # default-mode new_group) but are members of no dp/ep group.
+        n_trainers = self.runtime.dp_degree * self.runtime.pp_degree
+        num_dp_groups = n_trainers // self.runtime.dp_degree
         for dp_group_id in range(num_dp_groups):
             group_ranks = [
                 (dp_group_id + num_dp_groups * i) for i in range(self.runtime.dp_degree)
@@ -275,12 +296,13 @@ class PiperActor:
             # the same internal NCCL proxy stream, which prevents true overlap.
             process_group = dist.new_group(ranks=group_ranks, backend="nccl")
             ep_process_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            if self.runtime.global_rank % num_dp_groups == dp_group_id:
+            if self.runtime.global_rank in group_ranks:
                 self.runtime.dp_group = process_group
                 self.runtime.ep_group = ep_process_group
 
     def _join_pp_process_group(self):
-        num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
+        n_trainers = self.runtime.dp_degree * self.runtime.pp_degree
+        num_pp_groups = n_trainers // self.runtime.pp_degree
 
         for pp_group_id in range(num_pp_groups):
             group_ranks = [
@@ -292,6 +314,62 @@ class PiperActor:
             if self.runtime.global_rank in group_ranks:
                 self.runtime.pp_lo_hi = lo_hi_group
                 self.runtime.pp_hi_lo = hi_lo_group
+
+    def abort_comms(self):
+        """Abort this actor's dp/ep NCCL communicators (fencing during promotion)."""
+        from torch.distributed.distributed_c10d import _abort_process_group
+
+        # The fence flag must be visible BEFORE the abort releases any kernel,
+        # so the executor refuses the poisoned iteration's optimizer step.
+        self.dag_executor._fenced = True
+        aborted = []
+        if self.runtime.dp_group is not None:
+            _abort_process_group(self.runtime.dp_group)
+            aborted.append("dp_group")
+        if self.runtime.ep_group is not None:
+            _abort_process_group(self.runtime.ep_group)
+            aborted.append("ep_group")
+        self.logger.info(f"abort_comms: aborted {aborted}")
+        self._abort_done.set()
+        return aborted
+
+    def join_standby_group(self, new_ranks):
+        """Create the survivor+standby dp/ep groups and verify with an all-reduce.
+
+        new_ranks: sorted global ranks of the members; only members call this.
+        """
+        new_ranks = list(new_ranks)
+        if self.dag_executor._fenced:
+            # Building a fresh NCCL comm while an abort is in flight in this
+            # process deadlocks; wait for abort_comms to finish.
+            if not self._abort_done.wait(timeout=120):
+                raise RuntimeError("abort_comms did not finish within 120s")
+            torch.cuda.synchronize()
+        self.logger.info(f"join_standby_group: creating groups ranks={new_ranks}")
+        new_dp = dist.new_group(
+            ranks=new_ranks, backend="nccl", use_local_synchronization=True
+        )
+        new_ep = dist.new_group(
+            ranks=new_ranks, backend="nccl", use_local_synchronization=True
+        )
+        self.logger.info("join_standby_group: groups created; running sanity all_reduce")
+        # Force eager communicator construction and prove the group works:
+        # each member contributes 1, so the result equals len(new_ranks).
+        probe = torch.ones(1, device=self.runtime.device)
+        dist.all_reduce(probe, group=new_dp)
+        torch.cuda.synchronize()
+        # Phase 2 will swap these into runtime.dp_group/ep_group at promotion.
+        self.runtime.standby_dp_group = new_dp
+        self.runtime.standby_ep_group = new_ep
+        val = float(probe.item())
+        self.logger.info(
+            f"join_standby_group: ranks={new_ranks} sanity_allreduce={val}"
+        )
+        return val
+
+    def get_last_committed(self):
+        """Last iteration whose optimizer update fully committed (-1 if none)."""
+        return getattr(self.dag_executor, "_last_committed", -1)
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()

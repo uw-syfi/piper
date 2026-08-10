@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import contextmanager
 from typing import Iterator
@@ -216,6 +217,24 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
+class PiperFencedError(Exception):
+    """Raised when this dp_rank's step was aborted by the coordinator during
+    standby promotion (not a real failure; the caller should stop cleanly)."""
+
+
+def _promotion_cmd():
+    """Return the active promotion command, or None when no standby machinery
+    exists (M1 behavior) or no promotion is in progress."""
+    from .coordinator import _PROMOTION_SIGNAL_ACTOR
+
+    try:
+        sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
+    except ValueError:
+        # No signal actor: num_standby == 0, plain M1 behavior.
+        return None
+    return ray.get(sig.get.remote(), timeout=10)
+
+
 def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None = None) -> list:
     """Execute one training step using the loaded per-rank TrainingDAG.
 
@@ -234,16 +253,48 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
         results = ray.get(run_refs)
     else:
         # Keep waiting on the SAME refs (resubmitting would queue a second
-        # step behind a possibly-stuck one); actor errors propagate.
+        # step behind a possibly-stuck one); genuine actor errors propagate.
         while True:
             try:
                 results = ray.get(run_refs, timeout=step_timeout)
                 break
             except ray.exceptions.GetTimeoutError:
+                # TODO: stuck ranks cannot be handled here — this timeout
+                # fires identically on the stuck rank and on peers blocked at
+                # its rendezvous, so no local information can name the culprit.
                 logger.warning(
                     f"step exceeded step_timeout={step_timeout:.1f}s; "
                     "still waiting on in-flight step (peer may be down)"
                 )
+            except (ray.exceptions.RayTaskError, ray.exceptions.RayActorError) as e:
+                cmd = _promotion_cmd()
+                my_rank = int(os.environ.get("PIPER_DP_RANK", "-1"))
+                if (
+                    cmd is not None
+                    and cmd.get("op") == "promote"
+                    and my_rank != cmd.get("failed")
+                ):
+                    # Fenced by the coordinator: the abort of our comms ended
+                    # this step; not a real failure of this rank.
+                    logger.info(
+                        f"fenced by coordinator during promotion "
+                        f"(step error: {type(e).__name__}: {str(e.cause)[:200] if hasattr(e, 'cause') else str(e)[:200]})"
+                    )
+                    survivor_actor = actors[0]
+                    res = ray.get(
+                        survivor_actor.join_standby_group.remote(cmd["new_ranks"]),
+                        timeout=180,
+                    )
+                    lc = ray.get(survivor_actor.get_last_committed.remote(), timeout=60)
+                    logger.info(
+                        f"survivor: joined standby group {cmd['new_ranks']} "
+                        f"(sanity allreduce={res}); last_committed={lc}; "
+                        f"recovery would redo iteration {lc + 1}"
+                    )
+                    raise PiperFencedError(
+                        f"fenced at last_committed={lc}"
+                    ) from e
+                raise
     step_time = time.perf_counter() - t0
 
     if log_stats:

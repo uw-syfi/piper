@@ -11,7 +11,7 @@ harness (test_harness.py)
   └─ PiperProgramCoordinator.run_program          [src/coordinator.py]
        ray.wait on dp_rank tasks (completion order)
        ├─ 1st task failure → log "a dp_rank task failed (k/n)"
-       │    └─ STANDBY_ENABLED off → raise (fail fast) → job exits
+       │    └─ no standby configured → raise (fail fast) → job exits
        └─ driver, per dp_rank (test_qwen.main)
             └─ piper_exec_dag(..., step_timeout)  [src/piper.py]
                  ray.get(run_refs, timeout=step_timeout)
@@ -33,7 +33,7 @@ harness (test_harness.py)
 | Knob | Where | Meaning |
 |---|---|---|
 | `step_timeout` (param, seconds, default `None`) | `piper_exec_dag` | Warn when a step is overdue; `None` disables. `test_qwen.py` sets it automatically: `None` during warmup, then `max(5.0, 5 × last warmup step time)`. |
-| `PIPER_STANDBY_ENABLED` (env, default `0`) | coordinator | `0`: fail fast on first dp_rank failure. `1`: keep waiting until all dp_ranks fail (socket for the standby milestone). |
+| `--num-standby` (harness flag, default 0) | coordinator | `0`: fail fast on first dp_rank failure. `>0`: promote a standby instead (see `docs/standby_worker.md`). |
 | `PIPER_FAULT` (env, debug only) | `executors.py` BWD dispatch | Fault injection for tests; fires once per matching iteration and prints `PIPER_FAULT firing: <spec>`. Formats below. |
 
 `PIPER_FAULT` formats (`<iter>` is the 0-based `run_dag` counter; warmup counts):
