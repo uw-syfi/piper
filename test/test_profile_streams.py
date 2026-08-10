@@ -88,7 +88,7 @@ def test_execution_stream_policy_uses_directional_p2p_streams() -> None:
     )
 
 
-def test_interference_free_profile_collapses_non_p2p_to_default_stream() -> None:
+def test_interference_free_profile_preserves_non_p2p_logical_stream() -> None:
     runtime = _runtime()
     task = SimpleNamespace(uid="compute", node_kind="COMPUTE")
     logical_stream = runtime.streams["compute_stream"]
@@ -97,7 +97,7 @@ def test_interference_free_profile_collapses_non_p2p_to_default_stream() -> None
         runtime.profile_stream_for_task(
             task, logical_stream, profile_mode="interference_free"
         )
-        is runtime.streams["default_stream"]
+        is logical_stream
     )
 
 
