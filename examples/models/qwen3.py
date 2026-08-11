@@ -18,6 +18,8 @@ from src.piper import (
 
 PP_TAG = "PP"
 EP_TAG = "EP"
+ATTN_TAG = "ATTN"
+FFN_TAG = "FFN"
 
 
 @dataclass(frozen=True)
@@ -396,7 +398,16 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
 
 
 class AnnotatedMoE(MoE):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _run_experts(
+        self,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        with annotate(EP_TAG):
+            gathered_output = self.experts(routed_input, num_tokens_per_expert)
+            return mark_combine_payload(gathered_output)
+
+    def _route_experts(self, x: torch.Tensor):
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
@@ -437,10 +448,27 @@ class AnnotatedMoE(MoE):
         routed_input = mark_dispatch_payload(routed_input)
         num_tokens_per_expert = mark_dispatch_counts(num_tokens_per_expert)
 
-        # expert component
-        with annotate(EP_TAG):
-            gathered_output = self.experts(routed_input, num_tokens_per_expert)
-            gathered_output = mark_combine_payload(gathered_output)
+        return (
+            routed_input,
+            num_tokens_per_expert,
+            x,
+            top_scores,
+            token_indices_experts_sorted,
+            bs,
+            slen,
+            dim,
+        )
+
+    def _combine_experts(
+        self,
+        gathered_output: torch.Tensor,
+        x: torch.Tensor,
+        top_scores: torch.Tensor,
+        token_indices_experts_sorted: torch.Tensor,
+        bs,
+        slen,
+        dim,
+    ) -> torch.Tensor:
 
         gathered_output = gathered_output.reshape(-1, dim)
         out = self.shared_experts(x) if self.shared_experts is not None else None
@@ -471,6 +499,40 @@ class AnnotatedMoE(MoE):
             return out_experts.reshape(bs, slen, dim)
         return (out + out_experts).reshape(bs, slen, dim)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        (
+            routed_input,
+            num_tokens_per_expert,
+            x,
+            top_scores,
+            token_indices_experts_sorted,
+            bs,
+            slen,
+            dim,
+        ) = self._route_experts(x)
+        gathered_output = self._run_experts(routed_input, num_tokens_per_expert)
+        return self._combine_experts(
+            gathered_output,
+            x,
+            top_scores,
+            token_indices_experts_sorted,
+            bs,
+            slen,
+            dim,
+        )
+
+
+class AFDAnnotatedMoE(AnnotatedMoE):
+    """MoE whose caller assigns only routed expert compute to an F region."""
+
+    def _run_experts(
+        self,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        gathered_output = self.experts(routed_input, num_tokens_per_expert)
+        return mark_combine_payload(gathered_output)
+
 
 class AnnotatedQwen3TransformerBlock(TransformerBlock):
     def __init__(self, layer_id: int, model_args: Qwen3ModelArgs):
@@ -499,6 +561,77 @@ class AnnotatedQwen3TransformerBlock(TransformerBlock):
             x = x + self.feed_forward(self.ffn_norm(x))
         return x
 
+
+class AFDAnnotatedQwen3TransformerBlock(AnnotatedQwen3TransformerBlock):
+    """Qwen block split into alternating dense A and routed-expert F regions."""
+
+    def __init__(self, layer_id: int, model_args: Qwen3ModelArgs):
+        super().__init__(layer_id, model_args)
+        if self.moe_enabled:
+            self.moe = AFDAnnotatedMoE(
+                model_args.moe_args,
+                dim=model_args.dim,
+                hidden_dim=model_args.moe_inter_dim,
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
+    ):
+        # A_i contains every dense operation from the previous expert result
+        # (assigned below by layer i - 1) through this layer's router.  This
+        # makes the schedule-facing regions alternate A_i -> F_i -> A_{i+1}.
+        with annotate(ATTN_TAG, index=self.layer_id):
+            x = x + self.attention(
+                self.attention_norm(x), freqs_cis, attention_masks, positions
+            )
+            if self.moe_enabled:
+                (
+                    routed_input,
+                    num_tokens_per_expert,
+                    flattened_x,
+                    top_scores,
+                    token_indices_experts_sorted,
+                    bs,
+                    slen,
+                    dim,
+                ) = self.moe._route_experts(self.ffn_norm(x))
+            else:
+                x = x + self.feed_forward(self.ffn_norm(x))
+
+        if not self.moe_enabled:
+            return x
+
+        # F_i is only the routed expert calculation.  Dispatch/count and
+        # combine-payload aliases remain at the two tensor boundaries.
+        with annotate(FFN_TAG, index=self.layer_id):
+            gathered_output = self.moe._run_experts(
+                routed_input,
+                num_tokens_per_expert,
+            )
+
+        def combine_with_residual():
+            return x + self.moe._combine_experts(
+                gathered_output,
+                flattened_x,
+                top_scores,
+                token_indices_experts_sorted,
+                bs,
+                slen,
+                dim,
+            )
+
+        # The post-expert dense tail starts A_{i+1}; the next block reuses that
+        # logical index for its attention/router prefix.  The final layer
+        # therefore has a terminal A_L tail before the output PP region.
+        with annotate(ATTN_TAG, index=self.layer_id + 1):
+            x = combine_with_residual()
+        return x
+
+
 class PiperQwen3Model(Qwen3Model):
     """
     Qwen3Model with pipeline stage annotations.
@@ -507,6 +640,8 @@ class PiperQwen3Model(Qwen3Model):
     in the forward pass for pipeline parallelism, and EP dispatch/combine
     annotations in the MoE layers.
     """
+
+    transformer_block_cls = AnnotatedQwen3TransformerBlock
 
     def __init__(self, config: Qwen3ModelArgs, num_stages: int):
         super().__init__(config)
@@ -517,9 +652,9 @@ class PiperQwen3Model(Qwen3Model):
             num_stages = int(schedule_info.get("num_stages", schedule_info.get("pp_degree", 2)))
         self.num_stages = num_stages
 
-        # Replace TransformerBlock layers with AnnotatedQwen3TransformerBlock
+        # Replace TransformerBlock layers with the model's annotated block type.
         for layer_id in range(config.n_layers):
-            self.layers[str(layer_id)] = AnnotatedQwen3TransformerBlock(layer_id, config)
+            self.layers[str(layer_id)] = self.transformer_block_cls(layer_id, config)
 
     def forward(
         self,
@@ -545,3 +680,9 @@ class PiperQwen3Model(Qwen3Model):
                     output = self.output(h) if self.output is not None else h
 
         return output
+
+
+class AFDQwen3Model(PiperQwen3Model):
+    """Qwen3 model with PP stages and per-layer ATTN/FFN annotations."""
+
+    transformer_block_cls = AFDAnnotatedQwen3TransformerBlock

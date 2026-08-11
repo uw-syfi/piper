@@ -502,7 +502,7 @@ def _tag_from_stack(stack: tuple[dict[str, int], ...]) -> dict[str, int]:
     return tag
 
 
-def _ep_boundary_role(node: fx.Node) -> str | None:
+def _routed_boundary_role(node: fx.Node) -> str | None:
     custom = node.meta.get("custom")
     if not isinstance(custom, dict):
         return None
@@ -511,20 +511,20 @@ def _ep_boundary_role(node: fx.Node) -> str | None:
         return None
     if role not in _EP_BOUNDARY_ROLES:
         raise ValueError(
-            f"FX node {node.name!r} has invalid Piper EP boundary role {role!r}"
+            f"FX node {node.name!r} has invalid Piper routed boundary role {role!r}"
         )
     if (
         node.op != "call_function"
         or node.target is not torch.ops.aten.alias.default
     ):
         raise ValueError(
-            f"Piper EP boundary role {role!r} must annotate an aten.alias node; "
+            f"Piper routed boundary role {role!r} must annotate an aten.alias node; "
             f"got node {node.name!r} with op={node.op!r}, target={node.target!r}"
         )
     return role
 
 
-def _require_ep_boundary_roles(
+def _require_routed_boundary_roles(
     nodes: list[fx.Node],
     required_roles: tuple[str, ...],
     *,
@@ -533,7 +533,7 @@ def _require_ep_boundary_roles(
 ) -> dict[str, int]:
     marked: dict[str, list[tuple[int, str]]] = {}
     for idx, node in enumerate(nodes):
-        role = _ep_boundary_role(node)
+        role = _routed_boundary_role(node)
         if role is not None:
             marked.setdefault(role, []).append((idx, node.name))
 
@@ -545,7 +545,7 @@ def _require_ep_boundary_roles(
     }
     if unexpected:
         raise ValueError(
-            f"EP boundary {from_tag}->{to_tag} has marker roles in the wrong "
+            f"Routed boundary {from_tag}->{to_tag} has marker roles in the wrong "
             f"location: {unexpected}"
         )
 
@@ -554,11 +554,170 @@ def _require_ep_boundary_roles(
         matches = marked.get(role, [])
         if len(matches) != 1:
             raise ValueError(
-                f"EP boundary {from_tag}->{to_tag} requires exactly one "
+                f"Routed boundary {from_tag}->{to_tag} requires exactly one "
                 f"{_EP_BOUNDARY_APIS[role]}(...) tensor, found {len(matches)}"
             )
         indices[role] = matches[0][0]
     return indices
+
+
+def _validate_routed_marker_tensor(node: fx.Node, role: str) -> torch.Tensor:
+    """Validate the placement-independent tensor contract of a route marker."""
+    value = _example_value(node)
+    api_name = _EP_BOUNDARY_APIS[role]
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(
+            f"{api_name}(...) on FX node {node.name!r} is missing tensor "
+            "example metadata; routed marker schemas must be known while "
+            "building the annotated graph"
+        )
+
+    if role == EP_DISPATCH_COUNTS:
+        if value.ndim != 1:
+            raise ValueError(
+                f"{api_name}(...) requires a 1-D per-route count tensor, got "
+                f"shape={tuple(value.shape)} on FX node {node.name!r}"
+            )
+        if (
+            value.dtype == torch.bool
+            or value.dtype.is_floating_point
+            or value.dtype.is_complex
+        ):
+            raise ValueError(
+                f"{api_name}(...) requires an integer count tensor, got "
+                f"dtype={value.dtype} on FX node {node.name!r}"
+            )
+        if value.requires_grad:
+            raise ValueError(
+                f"{api_name}(...) requires non-differentiable route counts, "
+                f"but FX node {node.name!r} has requires_grad=True"
+            )
+    else:
+        if value.ndim != 2:
+            raise ValueError(
+                f"{api_name}(...) requires a 2-D [tokens, hidden] payload "
+                f"tensor, got shape={tuple(value.shape)} on FX node "
+                f"{node.name!r}"
+            )
+    return value
+
+
+def _concrete_tensor_shape(value: torch.Tensor) -> tuple[int, ...] | None:
+    """Return a shape only when comparing it cannot create symbolic guards."""
+    shape = tuple(value.shape)
+    if not all(type(dim) is int for dim in shape):
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _routed_tensor_schema(value: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": _concrete_tensor_shape(value),
+        "dtype": str(value.dtype),
+        "requires_grad": bool(value.requires_grad),
+    }
+
+
+def _is_fx_ancestor(ancestor: fx.Node, descendant: fx.Node) -> bool:
+    pending = list(descendant.all_input_nodes)
+    seen: set[fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node is ancestor:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        pending.extend(node.all_input_nodes)
+    return False
+
+
+def _validate_routed_region_interfaces(
+    *,
+    nodes: list[fx.Node],
+    seg_cross_in: list[list[fx.Node]],
+    segments: list[AnnotationSegment],
+    routed_segment_ids: set[int],
+) -> None:
+    """Validate the route-marker grammar before placement/DAG lowering.
+
+    A routed region has one immediately adjacent dispatch boundary and one
+    immediately adjacent combine boundary. Its payload/count ranks and graph
+    dependency are fixed by the routed collective runtime.
+
+    These constraints follow solely from FX annotation and marker placement,
+    so reporting them here is both earlier and independent of schedule tags.
+    Buffer-layout constraints used only by cross-group communication are
+    deliberately validated later, once placement is known.
+    """
+    marker_boundaries: dict[fx.Node, list[int]] = defaultdict(list)
+    for boundary_idx, crossing_nodes in enumerate(seg_cross_in[1:]):
+        for node in crossing_nodes:
+            if _routed_boundary_role(node) is not None:
+                marker_boundaries[node].append(boundary_idx)
+
+    marker_nodes = [node for node in nodes if _routed_boundary_role(node) is not None]
+    for node in marker_nodes:
+        boundary_ids = marker_boundaries.get(node, [])
+        role = _routed_boundary_role(node)
+        assert role is not None
+        if len(boundary_ids) != 1:
+            raise ValueError(
+                f"{_EP_BOUNDARY_APIS[role]}(...) on FX node {node.name!r} must "
+                "cross exactly one adjacent annotation boundary, but crosses "
+                f"{len(boundary_ids)} boundaries"
+            )
+        _validate_routed_marker_tensor(node, role)
+
+    for seg in sorted(routed_segment_ids):
+        incoming = segments[seg - 1].a2a_boundary_after
+        outgoing = segments[seg].a2a_boundary_after
+        assert isinstance(incoming, dict) and isinstance(outgoing, dict)
+        route = (
+            f"{incoming.get('from_tag')}->{segments[seg].tag}->"
+            f"{outgoing.get('to_tag')}"
+        )
+        inputs = seg_cross_in[seg]
+        outputs = seg_cross_in[seg + 1]
+        dispatch_idx = incoming.get("tensor_idx")
+        counts_idx = incoming.get("routing_counts_idx")
+        combine_idx = outgoing.get("tensor_idx")
+        assert isinstance(dispatch_idx, int) and not isinstance(dispatch_idx, bool)
+        assert isinstance(counts_idx, int) and not isinstance(counts_idx, bool)
+        assert isinstance(combine_idx, int) and not isinstance(combine_idx, bool)
+        dispatch_node = inputs[dispatch_idx]
+        counts_node = inputs[counts_idx]
+        combine_node = outputs[combine_idx]
+        dispatch_value = _validate_routed_marker_tensor(
+            dispatch_node, EP_DISPATCH_PAYLOAD
+        )
+        counts_value = _validate_routed_marker_tensor(
+            counts_node, EP_DISPATCH_COUNTS
+        )
+        combine_value = _validate_routed_marker_tensor(
+            combine_node, EP_COMBINE_PAYLOAD
+        )
+        incoming["payload_schema"] = _routed_tensor_schema(dispatch_value)
+        incoming["routing_counts_schema"] = _routed_tensor_schema(counts_value)
+        outgoing["payload_schema"] = _routed_tensor_schema(combine_value)
+        if not _is_fx_ancestor(dispatch_node, combine_node):
+            raise ValueError(
+                f"Routed region {route} must compute its combine payload from "
+                f"its dispatch payload; FX node {dispatch_node.name!r} is not "
+                f"an ancestor of {combine_node.name!r}"
+            )
+        dispatch_shape = _concrete_tensor_shape(dispatch_value)
+        combine_shape = _concrete_tensor_shape(combine_value)
+        if (
+            dispatch_shape is not None
+            and combine_shape is not None
+            and dispatch_shape[1:] != combine_shape[1:]
+        ):
+            raise ValueError(
+                f"Routed region {route} must preserve the concrete trailing "
+                "payload shape across dispatch/combine, got "
+                f"{dispatch_shape[1:]} and {combine_shape[1:]}"
+            )
 
 
 def _externalize_torchtitan_expert_dispatch(
@@ -637,7 +796,7 @@ def _externalize_torchtitan_expert_dispatch(
         for node in graph.nodes
         if node.op == "call_function"
         and node.target is torch.ops.aten.alias.default
-        and _ep_boundary_role(node) == EP_COMBINE_PAYLOAD
+        and _routed_boundary_role(node) == EP_COMBINE_PAYLOAD
     ]
     if (
         len(expert_outputs) != 1
@@ -690,7 +849,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         stack = _validate_and_get_annotation_stack(node)
         if node in compute_nodes:
             node_stacks[node] = stack
-            _ep_boundary_role(node)
+            _routed_boundary_role(node)
 
     annotated_compute = [node for node in compute_nodes if node_stacks.get(node)]
     if not annotated_compute:
@@ -850,30 +1009,47 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 "from_tag": from_tag,
                 "to_tag": to_tag,
             }
-            enters_ep = "EP" not in from_tag and "EP" in to_tag
-            exits_ep = "EP" in from_tag and "EP" not in to_tag
             crossing_nodes = seg_cross_in[seg + 1]
-            if enters_ep:
-                indices = _require_ep_boundary_roles(
+            marker_roles = {
+                role
+                for node in crossing_nodes
+                for role in [_routed_boundary_role(node)]
+                if role is not None
+            }
+            dispatch_roles = {
+                EP_DISPATCH_PAYLOAD,
+                EP_DISPATCH_COUNTS,
+            }
+            has_dispatch = bool(marker_roles & dispatch_roles)
+            has_combine = EP_COMBINE_PAYLOAD in marker_roles
+            if has_dispatch and has_combine:
+                raise ValueError(
+                    f"Routed boundary {from_tag}->{to_tag} mixes dispatch and "
+                    f"combine markers: {sorted(marker_roles)}"
+                )
+            if has_dispatch:
+                indices = _require_routed_boundary_roles(
                     crossing_nodes,
                     (EP_DISPATCH_PAYLOAD, EP_DISPATCH_COUNTS),
                     from_tag=from_tag,
                     to_tag=to_tag,
                 )
+                boundary_after["routed_boundary"] = "dispatch"
                 boundary_after["tensor_idx"] = indices[EP_DISPATCH_PAYLOAD]
                 boundary_after["routing_counts_idx"] = indices[
                     EP_DISPATCH_COUNTS
                 ]
-            elif exits_ep:
-                indices = _require_ep_boundary_roles(
+            elif has_combine:
+                indices = _require_routed_boundary_roles(
                     crossing_nodes,
                     (EP_COMBINE_PAYLOAD,),
                     from_tag=from_tag,
                     to_tag=to_tag,
                 )
+                boundary_after["routed_boundary"] = "combine"
                 boundary_after["tensor_idx"] = indices[EP_COMBINE_PAYLOAD]
             else:
-                _require_ep_boundary_roles(
+                _require_routed_boundary_roles(
                     crossing_nodes,
                     (),
                     from_tag=from_tag,
@@ -898,17 +1074,40 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             )
         )
 
-    for seg, segment in enumerate(segments):
-        if "EP" not in segment.tag:
-            continue
-        if seg == 0 or seg == len(segments) - 1:
-            raise ValueError(
-                f"EP segment {segment.tag} must have both dispatch and combine "
-                "boundaries"
-            )
+    dispatch_targets = {
+        seg + 1
+        for seg, segment in enumerate(segments[:-1])
+        if isinstance(segment.a2a_boundary_after, dict)
+        and segment.a2a_boundary_after.get("routed_boundary") == "dispatch"
+    }
+    combine_sources = {
+        seg
+        for seg, segment in enumerate(segments[:-1])
+        if isinstance(segment.a2a_boundary_after, dict)
+        and segment.a2a_boundary_after.get("routed_boundary") == "combine"
+    }
+    if dispatch_targets != combine_sources:
+        raise ValueError(
+            "Every routed region must have adjacent dispatch and combine "
+            "boundaries marked by mark_dispatch_payload(...), "
+            "mark_dispatch_counts(...), and mark_combine_payload(...); dispatch targets="
+            f"{sorted(dispatch_targets)}, combine sources={sorted(combine_sources)}"
+        )
+
+    _validate_routed_region_interfaces(
+        nodes=nodes,
+        seg_cross_in=seg_cross_in,
+        segments=segments,
+        routed_segment_ids=dispatch_targets,
+    )
+
+    for seg in sorted(dispatch_targets):
+        segment = segments[seg]
         incoming = segments[seg - 1].a2a_boundary_after
         if not isinstance(incoming, dict):
-            raise ValueError(f"EP segment {segment.tag} is missing its dispatch boundary")
+            raise ValueError(
+                f"Routed segment {segment.tag} is missing its dispatch boundary"
+            )
         routed_input_idx = incoming["tensor_idx"]
         routing_counts_idx = incoming["routing_counts_idx"]
         _externalize_torchtitan_expert_dispatch(

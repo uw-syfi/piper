@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ class PiperPlacementBundle:
     nvlink_domain: str | None
     outer_rank: int
     actor_global_ranks: tuple[int, ...]
-    driver_dp_ranks: tuple[int, ...]
+    program_driver_ids: tuple[int, ...]
     resources: dict[str, float]
 
 
@@ -36,26 +37,24 @@ class PiperPlacementPlan:
     """Logical-to-Ray bundle mapping shared by drivers and GPU actors."""
 
     pp_degree: int
-    dp_degree: int
-    pp_outer: bool
     bundles: tuple[PiperPlacementBundle, ...]
     actor_bundle_indices: tuple[int, ...]
     driver_bundle_indices: tuple[int, ...]
+    actor_groups: tuple[tuple[int, ...], ...] = ()
 
-    def actor_bundle_index(self, pp_rank: int, dp_rank: int) -> int:
-        global_rank = int(pp_rank) + int(dp_rank) * self.pp_degree
-        return self.actor_bundle_indices[global_rank]
+    def actor_global_rank_bundle_index(self, global_rank: int) -> int:
+        return self.actor_bundle_indices[int(global_rank)]
 
-    def driver_bundle_index(self, dp_rank: int) -> int:
-        return self.driver_bundle_indices[int(dp_rank)]
+    def driver_bundle_index(self, program_driver_id: int = 0) -> int:
+        return self.driver_bundle_indices[int(program_driver_id)]
 
     def describe(self) -> str:
-        outer_name = "PP" if self.pp_outer else "DP/EP"
-        inner_name = "DP/EP" if self.pp_outer else "PP"
         lines = [
-            f"{outer_name} outer, {inner_name} inner; "
-            f"PP={self.pp_degree}, DP/EP={self.dp_degree}"
+            f"ActorGroup placement; groups={len(self.actor_groups)}, "
+            f"world_size={len(self.actor_bundle_indices)}"
         ]
+        for group_id, members in enumerate(self.actor_groups):
+            lines.append(f"actor_group {group_id}: ranks={list(members)}")
         for index, bundle in enumerate(self.bundles):
             domain = (
                 f", NVLink domain={bundle.nvlink_domain}"
@@ -63,10 +62,10 @@ class PiperPlacementPlan:
                 else ""
             )
             lines.append(
-                f"bundle {index}: outer_rank={bundle.outer_rank}, "
+                f"bundle {index}: actor_group={bundle.outer_rank}, "
                 f"host={bundle.hostname}{domain}, "
                 f"actors={list(bundle.actor_global_ranks)}, "
-                f"DP drivers={list(bundle.driver_dp_ranks)}"
+                f"program drivers={list(bundle.program_driver_ids)}"
             )
         return "\n".join(lines)
 
@@ -253,98 +252,84 @@ def _allocate_inner_group(
     return _take_actor_slots(nodes, inner_degree)
 
 
-def _build_piper_placement_plan(
+def _build_actor_group_placement_plan(
     *,
-    pp_degree: int,
-    dp_degree: int,
-    pp_outer: bool,
+    actor_groups: list[list[int]] | tuple[tuple[int, ...], ...],
     ray_nodes: list[dict],
 ) -> PiperPlacementPlan:
-    pp_degree = int(pp_degree)
-    dp_degree = int(dp_degree)
-    if pp_degree <= 0 or dp_degree <= 0:
+    """Place schedule-defined ActorGroups on Ray nodes.
+
+    Every schedule device ordinal is one global distributed rank.  An
+    ActorGroup is allocated as one innermost SPMD group, including the same
+    GB200 NVLink-domain constraint used for large groups.
+    A single program driver creates and controls all actors; Piper does not
+    interpret ActorGroup width as data parallelism.
+    """
+    normalized_groups = tuple(
+        tuple(int(rank) for rank in group) for group in actor_groups
+    )
+    if not normalized_groups or any(not group for group in normalized_groups):
+        raise ValueError("actor_groups must contain non-empty rank lists")
+    flat_ranks = [rank for group in normalized_groups for rank in group]
+    if sorted(flat_ranks) != list(range(len(flat_ranks))):
         raise ValueError(
-            f"Piper parallel degrees must be positive, got PP={pp_degree}, DP={dp_degree}"
+            "actor_groups must partition contiguous global ranks starting at 0; "
+            f"got {sorted(flat_ranks)}"
         )
 
     nodes = _placement_nodes(ray_nodes)
-    world_size = pp_degree * dp_degree
+    world_size = len(flat_ranks)
     total_gpus = sum(node.gpu_capacity for node in nodes)
     if total_gpus < world_size:
         raise ValueError(
-            f"Piper requires {world_size} GPUs for PP={pp_degree}, DP={dp_degree}, "
+            f"Piper requires {world_size} GPUs for schedule ActorGroups, "
             f"but the Ray cluster exposes only {total_gpus}"
         )
-
-    # Domain-aware cross-node grouping is intentionally specific to homogeneous
-    # GB200 allocations whose hostnames expose the nvl72dNNN-TNN convention.
     use_gb200_domains = all(node.nvlink_domain is not None for node in nodes)
-    outer_degree = pp_degree if pp_outer else dp_degree
-    inner_degree = dp_degree if pp_outer else pp_degree
 
     mutable_bundles: list[dict[str, Any]] = []
     actor_bundle_indices = [-1] * world_size
-    for outer_rank in range(outer_degree):
+    for group_id, members in enumerate(normalized_groups):
         chunks = _allocate_inner_group(
             nodes,
-            inner_degree,
+            len(members),
             use_gb200_domains=use_gb200_domains,
         )
-        inner_rank = 0
+        member_offset = 0
         for node, actor_count in chunks:
             bundle_index = len(mutable_bundles)
-            actor_global_ranks = []
-            for _ in range(actor_count):
-                if pp_outer:
-                    pp_rank, dp_rank = outer_rank, inner_rank
-                else:
-                    pp_rank, dp_rank = inner_rank, outer_rank
-                global_rank = pp_rank + dp_rank * pp_degree
+            actor_ranks = members[member_offset : member_offset + actor_count]
+            member_offset += actor_count
+            for global_rank in actor_ranks:
                 actor_bundle_indices[global_rank] = bundle_index
-                actor_global_ranks.append(global_rank)
-                inner_rank += 1
             mutable_bundles.append(
                 {
                     "node": node,
-                    "outer_rank": outer_rank,
-                    "actor_global_ranks": tuple(actor_global_ranks),
-                    "driver_dp_ranks": [],
+                    "outer_rank": group_id,
+                    "actor_global_ranks": actor_ranks,
+                    "program_driver_ids": [],
                 }
             )
-        assert inner_rank == inner_degree
+        assert member_offset == len(members)
 
     if any(index < 0 for index in actor_bundle_indices):
         raise AssertionError(
             f"Internal placement error: incomplete actor map {actor_bundle_indices}"
         )
 
-    driver_bundle_indices = []
-    for dp_rank in range(dp_degree):
-        if pp_outer:
-            # Spread DP drivers over the PP groups while keeping each driver on
-            # the node that hosts one of its own PP actors.
-            driver_pp_rank = dp_rank % pp_degree
-            global_rank = driver_pp_rank + dp_rank * pp_degree
-        else:
-            # The DP driver owns this whole outer DP group.
-            global_rank = dp_rank * pp_degree
-        bundle_index = actor_bundle_indices[global_rank]
-        driver_bundle_indices.append(bundle_index)
-        mutable_bundles[bundle_index]["driver_dp_ranks"].append(dp_rank)
+    # The rank-0 actor and sole program driver share a bundle. This preserves
+    # the existing compile master's locality.
+    driver_bundle_indices = [actor_bundle_indices[0]]
+    mutable_bundles[driver_bundle_indices[0]]["program_driver_ids"].append(0)
 
     cpu_by_node: dict[str, int] = {}
     bundles: list[PiperPlacementBundle] = []
     for raw_bundle in mutable_bundles:
         node = raw_bundle["node"]
         actor_ranks = tuple(raw_bundle["actor_global_ranks"])
-        driver_ranks = tuple(raw_bundle["driver_dp_ranks"])
-        cpu_count = len(actor_ranks) + len(driver_ranks)
+        driver_ids = tuple(raw_bundle["program_driver_ids"])
+        cpu_count = len(actor_ranks) + len(driver_ids)
         cpu_by_node[node.address] = cpu_by_node.get(node.address, 0) + cpu_count
-        resources = {
-            "CPU": float(cpu_count),
-            "GPU": float(len(actor_ranks)),
-            node.node_resource: _NODE_PIN_RESOURCE_FRACTION,
-        }
         bundles.append(
             PiperPlacementBundle(
                 node_id=node.node_id,
@@ -353,8 +338,12 @@ def _build_piper_placement_plan(
                 nvlink_domain=node.nvlink_domain,
                 outer_rank=int(raw_bundle["outer_rank"]),
                 actor_global_ranks=actor_ranks,
-                driver_dp_ranks=driver_ranks,
-                resources=resources,
+                program_driver_ids=driver_ids,
+                resources={
+                    "CPU": float(cpu_count),
+                    "GPU": float(len(actor_ranks)),
+                    node.node_resource: _NODE_PIN_RESOURCE_FRACTION,
+                },
             )
         )
 
@@ -369,41 +358,37 @@ def _build_piper_placement_plan(
             )
 
     return PiperPlacementPlan(
-        pp_degree=pp_degree,
-        dp_degree=dp_degree,
-        pp_outer=bool(pp_outer),
+        pp_degree=len(normalized_groups),
         bundles=tuple(bundles),
         actor_bundle_indices=tuple(actor_bundle_indices),
         driver_bundle_indices=tuple(driver_bundle_indices),
+        actor_groups=normalized_groups,
     )
 
 
-# Coordinator needs GPUs when using profiling to infer stage boundaries.
-# Use manual stage annotations for more stable placement.
 @ray.remote(num_gpus=0.1)
-def run_dp_rank(
-    dp_rank,
-    dp_degree,
-    pp_degree,
-    world_size,
+def run_actor_group_program(
+    actor_groups: list[list[int]],
+    world_size: int,
     training_func: Callable,
     *args,
     **kwargs,
 ):
-    logger = create_logger("coordinator", LOG_LEVEL)
-    logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
-
-    os.environ["PIPER_DP_RANK"] = str(dp_rank)
-    os.environ["PIPER_DP_DEGREE"] = str(dp_degree)
-    os.environ["PIPER_PP_DEGREE"] = str(pp_degree)
+    """Run one program driver that owns every schedule-defined ActorGroup."""
+    # Ray workers may be reused. Ensure retired launch metadata cannot leak in
+    # from an earlier task and influence execution.
+    os.environ.pop("PIPER_DP_RANK", None)
+    os.environ.pop("PIPER_DP_DEGREE", None)
+    os.environ["PIPER_PP_DEGREE"] = str(len(actor_groups))
     os.environ["PIPER_WORLD_SIZE"] = str(world_size)
+    os.environ["PIPER_ACTOR_GROUPS"] = json.dumps(actor_groups)
     os.environ["TORCH_LOGS"] = "+graph_breaks"
     return training_func(*args, **kwargs)
 
 
 @ray.remote
 class PiperProgramCoordinator:
-    """Central actor that coordinates all DP replicas of one pipeline."""
+    """Central actor that runs one program over all schedule ActorGroups."""
 
     def __init__(
         self,
@@ -413,24 +398,21 @@ class PiperProgramCoordinator:
         if schedule_directives_file is None:
             raise ValueError("PiperProgramCoordinator requires schedule_directives_file")
         info = load_schedule_info(schedule_directives_file)
-        self.dp_degree = info["dp_degree"]
         self.pp_degree = info["pp_degree"]
-        self.world_size = self.dp_degree * self.pp_degree
+        self.actor_groups = [
+            list(group["devices"]) for group in info["actor_groups"]
+        ]
+        self.world_size = int(info["world_size"])
+        # Retained as a source-compatible constructor option. Placement is
+        # determined solely by explicit ActorGroup memberships.
         self.pp_outer = pp_outer
 
     def run_program(self, training_func: Callable, pg, *args, **kwargs):
-        from .compile import _COMPILED_DATA_ACTOR, _RANK0_ADDR_ACTOR
+        from .compile import _COMPILED_DATA_ACTOR
 
         logger = create_logger("coordinator", LOG_LEVEL)
-        try:
-            ray.kill(ray.get_actor(_RANK0_ADDR_ACTOR))
-        except ValueError:
-            logger.debug("No stale Ray actor named %s to kill", _RANK0_ADDR_ACTOR)
-        except Exception:
-            logger.exception("Failed to kill stale Ray actor named %s", _RANK0_ADDR_ACTOR)
-            raise
-        # Kill any stale compiled-data store from a previous run so that
-        # dp_rank>0 workers cannot read outdated (e.g. wrong-model) stage data.
+        # Kill any stale compiled-data store from a previous run so a new
+        # program always gets a fresh profile-calibration clock.
         try:
             ray.kill(ray.get_actor(_COMPILED_DATA_ACTOR))
         except ValueError:
@@ -441,45 +423,52 @@ class PiperProgramCoordinator:
 
         ray_pg = getattr(pg, "placement_group", pg)
         plan = getattr(pg, "plan", None)
-        return ray.get(
-            [
-                run_dp_rank.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=ray_pg,
-                        placement_group_bundle_index=(
-                            plan.driver_bundle_index(dp_rank)
-                            if plan is not None
-                            else (
-                                dp_rank % self.pp_degree
-                                if self.pp_outer
-                                else dp_rank
-                            )
-                        ),
-                    )
-                ).remote(
-                    dp_rank,
-                    self.dp_degree,
-                    self.pp_degree,
-                    self.world_size,
-                    training_func,
-                    *args,
-                    **kwargs,
+        bundle_index = plan.driver_bundle_index() if plan is not None else 0
+        return [ray.get(
+            run_actor_group_program.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=ray_pg,
+                    placement_group_bundle_index=bundle_index,
                 )
-                for dp_rank in range(self.dp_degree)
-            ]
-        )
+            ).remote(
+                self.actor_groups,
+                self.world_size,
+                training_func,
+                *args,
+                **kwargs,
+            )
+        )]
 
 
 def create_piper_placement_group(
     schedule_directives_file: str,
     pp_outer: bool = False,
+    node_addresses: tuple[str, ...] | list[str] | None = None,
 ) -> PiperPlacementGroup:
+    # ``pp_outer`` remains accepted for API compatibility. Explicit place
+    # device lists now fully define topology and placement grouping.
+    del pp_outer
     info = load_schedule_info(schedule_directives_file)
-    plan = _build_piper_placement_plan(
-        pp_degree=info["pp_degree"],
-        dp_degree=info["dp_degree"],
-        pp_outer=pp_outer,
-        ray_nodes=ray.nodes(),
+    ray_nodes = ray.nodes()
+    if node_addresses is not None:
+        requested = {str(address) for address in node_addresses}
+        ray_nodes = [
+            node
+            for node in ray_nodes
+            if str(node.get("NodeManagerAddress", "")) in requested
+        ]
+        found = {
+            str(node.get("NodeManagerAddress", "")) for node in ray_nodes
+        }
+        missing = sorted(requested - found)
+        if missing:
+            raise ValueError(
+                "Requested Piper placement nodes are not live Ray nodes: "
+                f"{missing}"
+            )
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[group["devices"] for group in info["actor_groups"]],
+        ray_nodes=ray_nodes,
     )
     ray_pg = placement_group(
         [dict(bundle.resources) for bundle in plan.bundles],

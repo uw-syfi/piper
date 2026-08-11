@@ -18,12 +18,17 @@ from .ordering import _serial_topological_order
 _BACKWARD_SUBKINDS = {"BWD", "BWD_I", "BWD_W"}
 _UPDATE_SYNC_KINDS = {"REDUCE_COMM", "REDUCE_SCATTER_COMM"}
 _P2P_KINDS = {"SEND_COMM", "RECV_COMM"}
-_RELAXABLE_P2P_REASONS = {
+_ROUTED_KINDS = {"M_TO_N_COMM", "N_TO_M_COMM"}
+_RELAXABLE_DIRECTIONAL_COMM_REASONS = {
     "stream_fifo",
     "same_stream_temporal",
     "cross_stream_temporal",
 }
 _P2P_DIRECTIONS = {"pp_lo_hi", "pp_hi_lo"}
+_ROUTED_DIRECTION_BY_KIND = {
+    "M_TO_N_COMM": "m_to_n",
+    "N_TO_M_COMM": "n_to_m",
+}
 
 
 @dataclass(frozen=True)
@@ -51,43 +56,61 @@ class PlannedOperation:
         return self.dependency_reasons[index]
 
 
+def is_relaxable_directional_communication_ordering_dependency(
+    predecessor: object,
+    node: object,
+    dependency_reason: str,
+) -> bool:
+    """Whether a logical ordering wait may be omitted across physical streams.
+
+    Schedule lowering can materialize logical ``pp_stream`` order as temporal
+    DAG edges in addition to stream-FIFO dependencies. P2P and cross-group
+    routed communication run on dedicated physical streams for their opposite
+    directions. Retaining synthetic serialization between those streams can
+    create a rendezvous progress cycle. Only ordering-only reasons are
+    relaxable; data and future synchronization dependencies are preserved.
+    """
+    reason_components = set(str(dependency_reason).split("+"))
+    if (
+        not reason_components
+        or not reason_components <= _RELAXABLE_DIRECTIONAL_COMM_REASONS
+    ):
+        return False
+
+    predecessor_kind = getattr(predecessor, "node_kind", None)
+    node_kind = getattr(node, "node_kind", None)
+    if predecessor_kind in _P2P_KINDS and node_kind in _P2P_KINDS:
+        predecessor_direction = (
+            getattr(predecessor, "node_meta", {}) or {}
+        ).get("comm_group_kind")
+        node_direction = (getattr(node, "node_meta", {}) or {}).get(
+            "comm_group_kind"
+        )
+        return (
+            predecessor_direction in _P2P_DIRECTIONS
+            and node_direction in _P2P_DIRECTIONS
+            and predecessor_direction != node_direction
+        )
+
+    if predecessor_kind in _ROUTED_KINDS and node_kind in _ROUTED_KINDS:
+        return (
+            _ROUTED_DIRECTION_BY_KIND[predecessor_kind]
+            != _ROUTED_DIRECTION_BY_KIND[node_kind]
+        )
+    return False
+
+
 def is_relaxable_p2p_ordering_dependency(
     predecessor: object,
     node: object,
     dependency_reason: str,
 ) -> bool:
-    """Whether execution/simulation may omit ordering between P2P operations.
-
-    Schedule lowering can materialize logical ``pp_stream`` order as temporal
-    DAG edges in addition to the execution plan's stream-FIFO dependency.
-    P2P runs on dedicated directional NCCL streams in ordinary execution and
-    profiling; retaining either form of serialization across physical streams
-    can create a send/recv progress cycle.  The simulator likewise must not
-    impose a synthetic transaction FIFO when SEND/RECV endpoints are collapsed
-    into rendezvous operations.  Only ordering-only reasons are relaxable.  A
-    data dependency (or any future synchronization reason) is always preserved.
-    """
-    if (
-        getattr(predecessor, "node_kind", None) not in _P2P_KINDS
-        or getattr(node, "node_kind", None) not in _P2P_KINDS
-    ):
-        return False
-    predecessor_direction = (
-        getattr(predecessor, "node_meta", {}) or {}
-    ).get("comm_group_kind")
-    node_direction = (getattr(node, "node_meta", {}) or {}).get(
-        "comm_group_kind"
+    """Compatibility wrapper for all directional communication dependencies."""
+    return is_relaxable_directional_communication_ordering_dependency(
+        predecessor,
+        node,
+        dependency_reason,
     )
-    if (
-        predecessor_direction not in _P2P_DIRECTIONS
-        or node_direction not in _P2P_DIRECTIONS
-        or predecessor_direction == node_direction
-    ):
-        return False
-    reason_components = set(str(dependency_reason).split("+"))
-    if not reason_components or not reason_components <= _RELAXABLE_P2P_REASONS:
-        return False
-    return True
 
 
 def _execution_stream_key(node: object) -> str:
@@ -98,6 +121,11 @@ def _execution_stream_key(node: object) -> str:
         )
         if direction in _P2P_DIRECTIONS:
             return str(direction)
+    routed_direction = _ROUTED_DIRECTION_BY_KIND.get(
+        getattr(node, "node_kind", None)
+    )
+    if routed_direction is not None:
+        return routed_direction
     return str(getattr(node, "stream", None) or "default_stream")
 
 
@@ -256,5 +284,6 @@ def build_execution_plan(
 __all__ = [
     "PlannedOperation",
     "build_execution_plan",
+    "is_relaxable_directional_communication_ordering_dependency",
     "is_relaxable_p2p_ordering_dependency",
 ]

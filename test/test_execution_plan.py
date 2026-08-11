@@ -9,6 +9,7 @@ import src.executors as executors
 from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
 from src.execution_plan import (
     build_execution_plan,
+    is_relaxable_directional_communication_ordering_dependency,
     is_relaxable_p2p_ordering_dependency,
 )
 from src.executors import DagExecutor
@@ -181,6 +182,46 @@ def test_p2p_ordering_without_direction_metadata_is_not_relaxed() -> None:
 
     assert not is_relaxable_p2p_ordering_dependency(
         first, second, "stream_fifo"
+    )
+
+
+def test_directional_routed_collectives_use_independent_fifo_domains() -> None:
+    dispatch0 = _node(
+        "dispatch0", stream="ep", kind="M_TO_N_COMM", subkind=None
+    )
+    combine = _node(
+        "combine", stream="ep", kind="N_TO_M_COMM", subkind=None
+    )
+    dispatch1 = _node(
+        "dispatch1", stream="ep", kind="M_TO_N_COMM", subkind=None
+    )
+    dag = _dag(dispatch0, combine, dispatch1)
+
+    plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
+
+    assert plan["dispatch0"].logical_stream == "m_to_n"
+    assert plan["combine"].logical_stream == "n_to_m"
+    assert plan["combine"].completion_predecessors == ()
+    assert plan["dispatch1"].completion_predecessors == ("dispatch0",)
+    assert plan["dispatch1"].reason_for("dispatch0") == "stream_fifo"
+
+    dag.add_edge(TrainingDAGEdge("dispatch0", "combine", "temporal"))
+    temporal_plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
+    reason = temporal_plan["combine"].reason_for("dispatch0")
+    assert reason == "cross_stream_temporal"
+    assert is_relaxable_directional_communication_ordering_dependency(
+        dispatch0, combine, reason
+    )
+    assert is_relaxable_p2p_ordering_dependency(dispatch0, combine, reason)
+
+    dag.edges.clear()
+    dag._rebuild_edge_indexes()
+    dag.add_edge(TrainingDAGEdge("dispatch0", "combine", "data"))
+    data_plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
+    data_reason = data_plan["combine"].reason_for("dispatch0")
+    assert data_reason == "cross_stream_data"
+    assert not is_relaxable_directional_communication_ordering_dependency(
+        dispatch0, combine, data_reason
     )
 
 

@@ -6,6 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
+from typing import Any
 
 from .dag import TrainingDAG, TrainingDAGNode, _topological_levels
 from .ordering import _serial_topological_order
@@ -25,12 +26,22 @@ _PASS_COLOR: dict[str, str] = {
 
 @dataclass(frozen=True)
 class _ScheduleOp:
-    pp: int
+    region: tuple[tuple[str, Any], ...]
     mb: int
     pass_: str
+    devices: tuple[int, ...]
 
 
 _ScheduleSlot = list[_ScheduleOp]
+
+
+@dataclass(frozen=True)
+class _ScheduleRow:
+    devices: tuple[int, ...]
+    slots: list[_ScheduleSlot]
+
+
+_RUNTIME_FILTER_KEYS = frozenset({"MB", "PASS"})
 
 
 def _format_tag(tag: dict[str, int | None]) -> str:
@@ -203,25 +214,15 @@ def print_training_dag_order(
 
 
 def visualize_order_directives(
-    order_directives: list[dict],
+    schedule_directives: list[dict],
     output_path: str | Path = "out/schedule",
     fmt: str = "png",
 ) -> str:
-    """Render a 2-D schedule grid, one row per physical rank."""
-    rows = _rows_from_order_directives(order_directives)
+    """Render one timeline row per disjoint ``place.devices`` group."""
+    rows = _rows_from_schedule_directives(schedule_directives)
     placements = _compute_columns(rows)
-    max_col = max(
-        (col + _slot_width(rows[rank][slot_idx]) - 1 for (rank, slot_idx), col in placements.items()),
-        default=-1,
-    )
-
-    table: list[list[_ScheduleSlot | None]] = [
-        [None for _ in range(max_col + 1)]
-        for _ in rows
-    ]
-    for key, col in placements.items():
-        rank, slot_idx = key
-        table[rank][col] = rows[rank][slot_idx]
+    device_groups = _placed_device_groups(schedule_directives)
+    table = _build_device_table(rows, placements, device_groups)
 
     output = Path(output_path)
     if output.suffix:
@@ -235,7 +236,11 @@ def visualize_order_directives(
 
     dot = graphviz.Digraph("PipelineSchedule")
     dot.attr(rankdir="LR")
-    dot.node("schedule", label=_schedule_html_table(table), shape="plain")
+    dot.node(
+        "schedule",
+        label=_schedule_html_table(table, device_groups),
+        shape="plain",
+    )
     try:
         return dot.render(str(output), format=fmt, cleanup=True)
     finally:
@@ -249,7 +254,7 @@ def _op_width(op: _ScheduleOp) -> int:
 
 
 def _slot_width(slot: _ScheduleSlot) -> int:
-    return sum(_op_width(op) for op in slot)
+    return max((_op_width(op) for op in slot), default=1)
 
 
 def _cleanup_visualizer_sidecars(
@@ -263,28 +268,176 @@ def _cleanup_visualizer_sidecars(
             output_base.with_suffix(suffix).unlink()
 
 
-def _rows_from_order_directives(order_directives: list[dict]) -> list[list[_ScheduleSlot]]:
-    rows = []
-    for directive in order_directives:
-        if directive.get("op") != "order":
-            raise ValueError(f"expected order directive, got {directive}")
+def _rows_from_schedule_directives(schedule_directives: list[dict]) -> list[_ScheduleRow]:
+    place_directives = [
+        directive
+        for directive in schedule_directives
+        if isinstance(directive, dict) and directive.get("op") == "place"
+    ]
+    if not place_directives:
+        raise ValueError("schedule visualization requires at least one place directive")
+
+    rows: list[_ScheduleRow] = []
+    for directive in schedule_directives:
+        if not isinstance(directive, dict) or directive.get("op") != "order":
+            continue
         filters = directive.get("filters")
         if not isinstance(filters, list):
             raise ValueError(f"order directive requires filters list: {directive}")
         row: list[_ScheduleSlot] = []
+        row_devices: set[tuple[int, ...]] = set()
         for filter_slot in _parse_filter_slots(filters):
             slot: _ScheduleSlot = []
             for flt in filter_slot:
                 spec = _filter_to_dict(flt)
-                pass_value = spec["PASS"]
+                if "MB" not in spec or "PASS" not in spec:
+                    raise ValueError(f"order filter requires MB and PASS: {spec}")
+                pass_value = str(spec["PASS"])
                 if pass_value not in _VALID_PASSES:
                     raise ValueError(
                         f"unsupported PASS={pass_value!r}; expected one of {sorted(_VALID_PASSES)}"
                     )
-                slot.append(_ScheduleOp(pp=int(spec["PP"]), mb=int(spec["MB"]), pass_=pass_value))
+                region_spec = {
+                    key: value
+                    for key, value in spec.items()
+                    if key not in _RUNTIME_FILTER_KEYS
+                }
+                if not region_spec:
+                    raise ValueError(f"order filter does not identify a model region: {spec}")
+                devices = _resolve_order_filter_devices(region_spec, place_directives)
+                row_devices.add(devices)
+                slot.append(
+                    _ScheduleOp(
+                        region=_region_key(region_spec),
+                        mb=int(spec["MB"]),
+                        pass_=pass_value,
+                        devices=devices,
+                    )
+                )
             row.append(slot)
-        rows.append(row)
+        devices = tuple(sorted({device for group in row_devices for device in group}))
+        rows.append(_ScheduleRow(devices=devices, slots=row))
+    if not rows:
+        raise ValueError("schedule visualization requires at least one order directive")
     return rows
+
+
+def _placed_device_groups(schedule_directives: list[dict]) -> list[tuple[int, ...]]:
+    """Return disjoint rows while preserving every ``place.devices`` grouping."""
+    groups: list[set[int]] = []
+    for directive in schedule_directives:
+        if not isinstance(directive, dict) or directive.get("op") != "place":
+            continue
+        raw_devices = directive.get("devices", directive.get("device"))
+        if not isinstance(raw_devices, list) or not raw_devices:
+            raise ValueError(f"place directive requires non-empty devices: {directive}")
+        placed = {int(device) for device in raw_devices}
+        overlapping = [group for group in groups if group & placed]
+        for group in overlapping:
+            placed.update(group)
+            groups.remove(group)
+        groups.append(placed)
+    if not groups:
+        raise ValueError("schedule visualization requires at least one placed device")
+    return sorted(
+        (tuple(sorted(group)) for group in groups),
+        key=lambda group: group[0],
+    )
+
+
+def _build_device_table(
+    rows: list[_ScheduleRow],
+    placements: dict[tuple[int, int], int],
+    device_groups: list[tuple[int, ...]],
+) -> list[list[_ScheduleSlot]]:
+    """Place each chunk once, combining chunks that start in the same timestep."""
+    max_col = max(
+        (
+            col + _slot_width(rows[row_idx].slots[slot_idx])
+            for (row_idx, slot_idx), col in placements.items()
+        ),
+        default=0,
+    )
+    table: list[list[_ScheduleSlot]] = [
+        [[] for _ in range(max_col)]
+        for _group in device_groups
+    ]
+    row_by_device = {
+        device: row_idx
+        for row_idx, group in enumerate(device_groups)
+        for device in group
+    }
+    for (schedule_row_idx, slot_idx), col in placements.items():
+        schedule_row = rows[schedule_row_idx]
+        for op in schedule_row.slots[slot_idx]:
+            device_row_indices = {row_by_device[device] for device in op.devices}
+            if len(device_row_indices) != 1:
+                raise ValueError(
+                    f"placement {op.devices} spans visual device groups {device_groups}"
+                )
+            device_row_idx = next(iter(device_row_indices))
+            table[device_row_idx][col].append(op)
+
+    for device_row_idx, row in enumerate(table):
+        occupied_until = 0
+        for col, slot in enumerate(row):
+            if not slot:
+                continue
+            if col < occupied_until:
+                raise ValueError(
+                    "visualized schedule contains overlapping chunks on "
+                    f"GPU group {device_groups[device_row_idx]} at t{col}"
+                )
+            occupied_until = col + _slot_width(slot)
+    return table
+
+
+def _region_key(region_spec: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    return tuple(sorted(region_spec.items()))
+
+
+def _selector_contains(container: dict[str, Any], contained: dict[str, Any]) -> bool:
+    """Whether every tag selected by ``contained`` also matches ``container``."""
+    for key, container_value in container.items():
+        if key not in contained:
+            return False
+        contained_value = contained[key]
+        if container_value == "*":
+            if contained_value in ("-", None):
+                return False
+        elif container_value == "-":
+            if contained_value != "-":
+                return False
+        elif contained_value != container_value:
+            return False
+    return True
+
+
+def _resolve_order_filter_devices(
+    region_spec: dict[str, Any],
+    place_directives: list[dict],
+) -> tuple[int, ...]:
+    """Resolve the effective placement for a symbolic order filter.
+
+    Place directives use ordered override semantics, so the last placement whose
+    selector contains the complete order-filter region is the effective one.
+    """
+    devices: tuple[int, ...] | None = None
+    for directive in place_directives:
+        place_filter = directive.get("filter")
+        if not isinstance(place_filter, dict):
+            raise ValueError(f"place directive requires a filter object: {directive}")
+        if not _selector_contains(place_filter, region_spec):
+            continue
+        raw_devices = directive.get("devices", directive.get("device"))
+        if not isinstance(raw_devices, list) or not raw_devices:
+            raise ValueError(f"place directive requires non-empty devices: {directive}")
+        devices = tuple(int(device) for device in raw_devices)
+    if devices is None:
+        raise ValueError(
+            f"order filter region {region_spec} is not covered by a place directive"
+        )
+    return devices
 
 
 def _parse_filter_slots(filters: Sequence[object]) -> list[list[dict]]:
@@ -305,20 +458,20 @@ def _filter_to_dict(flt: object) -> dict:
     raise ValueError(f"invalid order filter: {flt}")
 
 
-def _compute_columns(rows: list[list[_ScheduleSlot]]) -> dict[tuple[int, int], int]:
-    key_by_op: dict[tuple[int, int, str], tuple[int, int]] = {}
-    for rank, row in enumerate(rows):
-        for slot_idx, slot in enumerate(row):
+def _compute_columns(rows: list[_ScheduleRow]) -> dict[tuple[int, int], int]:
+    key_by_op: dict[tuple[tuple[tuple[str, Any], ...], int, str], tuple[int, int]] = {}
+    for row_idx, row in enumerate(rows):
+        for slot_idx, slot in enumerate(row.slots):
             for op in slot:
-                op_key = (op.pp, op.mb, op.pass_)
+                op_key = (op.region, op.mb, op.pass_)
                 if op_key in key_by_op:
                     raise ValueError(f"duplicate scheduled op: {op_key}")
-                key_by_op[op_key] = (rank, slot_idx)
+                key_by_op[op_key] = (row_idx, slot_idx)
 
     preds: dict[tuple[int, int], set[tuple[int, int]]] = {
-        (rank, slot_idx): set()
-        for rank, row in enumerate(rows)
-        for slot_idx, _slot in enumerate(row)
+        (row_idx, slot_idx): set()
+        for row_idx, row in enumerate(rows)
+        for slot_idx, _slot in enumerate(row.slots)
     }
     succs: dict[tuple[int, int], set[tuple[int, int]]] = {
         key: set() for key in preds
@@ -330,24 +483,32 @@ def _compute_columns(rows: list[list[_ScheduleSlot]]) -> dict[tuple[int, int], i
         preds[dst].add(src)
         succs[src].add(dst)
 
-    for rank, row in enumerate(rows):
-        for slot_idx in range(1, len(row)):
-            add_edge((rank, slot_idx - 1), (rank, slot_idx))
+    for row_idx, row in enumerate(rows):
+        for slot_idx in range(1, len(row.slots)):
+            add_edge((row_idx, slot_idx - 1), (row_idx, slot_idx))
 
-    for rank, row in enumerate(rows):
-        for slot_idx, slot in enumerate(row):
-            dst = (rank, slot_idx)
+    region_order = _infer_region_order(rows)
+    region_idx = {region: idx for idx, region in enumerate(region_order)}
+    for row_idx, row in enumerate(rows):
+        for slot_idx, slot in enumerate(row.slots):
+            dst = (row_idx, slot_idx)
             for op in slot:
+                idx = region_idx[op.region]
+                previous_region = region_order[idx - 1] if idx > 0 else None
+                next_region = region_order[idx + 1] if idx + 1 < len(region_order) else None
                 if op.pass_ == "F":
-                    add_edge(key_by_op.get((op.pp - 1, op.mb, "F")), dst)
+                    if previous_region is not None:
+                        add_edge(key_by_op.get((previous_region, op.mb, "F")), dst)
                 elif op.pass_ == "B":
-                    add_edge(key_by_op.get((op.pp, op.mb, "F")), dst)
-                    add_edge(key_by_op.get((op.pp + 1, op.mb, "B")), dst)
+                    add_edge(key_by_op.get((op.region, op.mb, "F")), dst)
+                    if next_region is not None:
+                        add_edge(key_by_op.get((next_region, op.mb, "B")), dst)
                 elif op.pass_ == "BI":
-                    add_edge(key_by_op.get((op.pp, op.mb, "F")), dst)
-                    add_edge(key_by_op.get((op.pp + 1, op.mb, "BI")), dst)
+                    add_edge(key_by_op.get((op.region, op.mb, "F")), dst)
+                    if next_region is not None:
+                        add_edge(key_by_op.get((next_region, op.mb, "BI")), dst)
                 elif op.pass_ == "BW":
-                    add_edge(key_by_op.get((op.pp, op.mb, "BI")), dst)
+                    add_edge(key_by_op.get((op.region, op.mb, "BI")), dst)
                 else:
                     raise ValueError(f"unsupported pass={op.pass_!r}")
 
@@ -360,8 +521,11 @@ def _compute_columns(rows: list[list[_ScheduleSlot]]) -> dict[tuple[int, int], i
         key = ready.pop(0)
         visited += 1
         for succ in sorted(succs[key]):
-            rank, slot_idx = key
-            columns[succ] = max(columns[succ], columns[key] + _slot_width(rows[rank][slot_idx]))
+            row_idx, slot_idx = key
+            columns[succ] = max(
+                columns[succ],
+                columns[key] + _slot_width(rows[row_idx].slots[slot_idx]),
+            )
             pending[succ].discard(key)
             if not pending[succ]:
                 ready.append(succ)
@@ -372,19 +536,103 @@ def _compute_columns(rows: list[list[_ScheduleSlot]]) -> dict[tuple[int, int], i
     return columns
 
 
-def _schedule_html_table(table: list[list[_ScheduleSlot | None]]) -> str:
+def _infer_region_order(rows: list[_ScheduleRow]) -> list[tuple[tuple[str, Any], ...]]:
+    """Infer logical forward order without assigning meaning to a tag name.
+
+    Numeric annotation regions are ordered by index, with their order-directive
+    row breaking ties (e.g. ATTN0, FFN0, ATTN1, FFN1). Regions selected with
+    absent-tag constraints are pipeline boundaries.  Their exact numeric
+    selector values and first forward occurrence distinguish the leading and
+    trailing endpoints even when both endpoints live on the same actor row.
+    """
+    first_seen: dict[tuple[tuple[str, Any], ...], tuple[int, int]] = {}
+    for row_idx, row in enumerate(rows):
+        for slot_idx, slot in enumerate(row.slots):
+            for op in slot:
+                if op.pass_ == "F":
+                    first_seen.setdefault(op.region, (row_idx, slot_idx))
+    if not first_seen:
+        raise ValueError("schedule visualization requires at least one forward operation")
+
+    boundaries: list[tuple[tuple[str, Any], ...]] = []
+    interior: list[tuple[tuple[str, Any], ...]] = []
+    for region in first_seen:
+        has_absent_constraint = any(value == "-" for _key, value in region)
+        if has_absent_constraint:
+            boundaries.append(region)
+        else:
+            interior.append(region)
+
+    def indexed_region_key(
+        region: tuple[tuple[str, Any], ...],
+    ) -> tuple[int, tuple[int, ...], int, int]:
+        row_idx, slot_idx = first_seen[region]
+        indices = tuple(
+            int(value)
+            for _key, value in region
+            if isinstance(value, int) and not isinstance(value, bool)
+        )
+        if indices:
+            return (0, indices, row_idx, slot_idx)
+        return (1, (), row_idx, slot_idx)
+
+    interior.sort(key=indexed_region_key)
+
+    def boundary_key(
+        region: tuple[tuple[str, Any], ...],
+    ) -> tuple[int, tuple[int, ...], int, int]:
+        row_idx, slot_idx = first_seen[region]
+        exact_indices = tuple(
+            int(value)
+            for _key, value in region
+            if isinstance(value, int) and not isinstance(value, bool)
+        )
+        if exact_indices:
+            return (0, exact_indices, row_idx, slot_idx)
+        return (1, (), row_idx, slot_idx)
+
+    boundaries.sort(key=boundary_key)
+    if not boundaries:
+        leading = []
+        trailing = []
+    elif len(boundaries) == 1:
+        # A one-ended graph (common in focused schedules) keeps the historical
+        # behavior and treats its sole boundary as the input.
+        leading = boundaries
+        trailing = []
+    else:
+        leading = boundaries[:1]
+        # Any additional boundary selectors are ordered after the annotated
+        # regions.  AFD currently has exactly one such output endpoint.
+        trailing = boundaries[1:]
+    return leading + interior + trailing
+
+
+def _format_region(region: tuple[tuple[str, Any], ...]) -> str:
+    return " ".join(
+        f"{key}{value}"
+        for key, value in region
+        if value != "-"
+    )
+
+
+def _schedule_html_table(
+    table: list[list[_ScheduleSlot]],
+    device_groups: list[tuple[int, ...]],
+) -> str:
     max_cols = max((len(row) for row in table), default=0)
     lines = ['<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6">']
-    lines.append('<TR><TD BGCOLOR="#eeeeee">rank</TD>')
+    lines.append('<TR><TD BGCOLOR="#eeeeee">GPU</TD>')
     for col in range(max_cols):
         lines.append(f'<TD BGCOLOR="#eeeeee">t{col}</TD>')
     lines.append("</TR>")
-    for rank, row in enumerate(table):
-        lines.append(f'<TR><TD BGCOLOR="#eeeeee">r{rank}</TD>')
+    for row_idx, row in enumerate(table):
+        devices = ",".join(str(device) for device in device_groups[row_idx])
+        lines.append(f'<TR><TD BGCOLOR="#eeeeee">GPU [{devices}]</TD>')
         col = 0
         while col < len(row):
             slot = row[col]
-            if slot is None:
+            if not slot:
                 lines.append('<TD WIDTH="72" HEIGHT="36"></TD>')
                 col += 1
             else:
@@ -394,7 +642,10 @@ def _schedule_html_table(table: list[list[_ScheduleSlot | None]]) -> str:
                 if len(slot) == 1:
                     op = slot[0]
                     color = _PASS_COLOR[op.pass_]
-                    label = f"{escape(op.pass_)}<BR/>PP{op.pp} MB{op.mb}"
+                    label = (
+                        f"{escape(op.pass_)}<BR/>"
+                        f"{escape(_format_region(op.region))} MB{op.mb}"
+                    )
                     lines.append(
                         f'<TD BGCOLOR="{color}" WIDTH="{width}" HEIGHT="36"{colspan_attr}>{label}</TD>'
                     )
@@ -402,7 +653,10 @@ def _schedule_html_table(table: list[list[_ScheduleSlot | None]]) -> str:
                     inner = ['<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6">']
                     for op in slot:
                         color = _PASS_COLOR[op.pass_]
-                        label = f"{escape(op.pass_)}<BR/>PP{op.pp} MB{op.mb}"
+                        label = (
+                            f"{escape(op.pass_)}<BR/>"
+                            f"{escape(_format_region(op.region))} MB{op.mb}"
+                        )
                         inner.append(
                             f'<TR><TD BGCOLOR="{color}" WIDTH="{width}" HEIGHT="36">{label}</TD></TR>'
                         )

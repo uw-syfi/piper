@@ -697,7 +697,10 @@ def test_aligned_collective_reuses_observed_post_rendezvous_tails() -> None:
                 edges=(("producer", "reduce", "data"),),
             )
         ],
-        topology={"pp_degree": 1, "dp_degree": 2},
+        topology={
+            "pp_degree": 1,
+            "actor_groups": [{"id": 0, "devices": [0, 1]}],
+        },
         profile_metadata={
             "timeline_alignment": {
                 "modes": {"interference_free": {"samples": 1}}
@@ -740,6 +743,114 @@ def test_ragged_a2a_does_not_create_an_all_rank_rendezvous() -> None:
     assert result.step_time_us == pytest.approx(12.0)
 
 
+def test_cross_group_routed_collective_rendezvous_supports_unequal_groups() -> None:
+    participants = [0, 1, 2, 3, 4, 5]
+    source = _node(
+        "m_to_n.source",
+        {0: 2.0, 2: 3.0, 4: 4.0, 5: 5.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        device=[0, 2, 4, 5],
+        meta={"comm_id": "dispatch.mb0", "participants": participants},
+    )
+    destination = _node(
+        "m_to_n.destination",
+        {1: 6.0, 3: 7.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        device=[1, 3],
+        meta={"comm_id": "dispatch.mb0", "participants": participants},
+    )
+
+    result = simulate_training_step([_dag(source), _dag(destination)])
+
+    assert result.step_time_us == pytest.approx(7.0)
+    assert {
+        result.event(rank, "m_to_n.source").communication_id
+        for rank in (0, 2, 4, 5)
+    } == {"M_TO_N_COMM:dispatch.mb0"}
+    assert {
+        result.event(rank, "m_to_n.destination").communication_id
+        for rank in (1, 3)
+    } == {"M_TO_N_COMM:dispatch.mb0"}
+
+
+def test_cross_group_routed_collective_requires_matching_comm_id() -> None:
+    participants = [0, 1, 2]
+    source = _node(
+        "source",
+        {0: 2.0, 2: 2.0},
+        kind="N_TO_M_COMM",
+        device=[0, 2],
+        meta={"comm_id": "combine.source", "participants": participants},
+    )
+    destination = _node(
+        "destination",
+        {1: 2.0},
+        kind="N_TO_M_COMM",
+        device=[1],
+        meta={"comm_id": "combine.destination", "participants": participants},
+    )
+
+    with pytest.raises(SimulationValidationError, match="has ranks.*expected"):
+        simulate_training_step([_dag(source), _dag(destination)])
+
+
+def test_opposite_routed_directions_do_not_create_rendezvous_cycle() -> None:
+    participants = [0, 1]
+    dispatch_source = _node(
+        "dispatch.source",
+        {0: 3.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        device=[0],
+        meta={"comm_id": "dispatch", "participants": participants},
+    )
+    combine_destination = _node(
+        "combine.destination",
+        {0: 4.0},
+        stream="ep_stream",
+        kind="N_TO_M_COMM",
+        device=[0],
+        meta={"comm_id": "combine", "participants": participants},
+    )
+    combine_source = _node(
+        "combine.source",
+        {1: 5.0},
+        stream="ep_stream",
+        kind="N_TO_M_COMM",
+        device=[1],
+        meta={"comm_id": "combine", "participants": participants},
+    )
+    dispatch_destination = _node(
+        "dispatch.destination",
+        {1: 6.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        device=[1],
+        meta={"comm_id": "dispatch", "participants": participants},
+    )
+
+    result = simulate_training_step(
+        [
+            _dag(
+                dispatch_source,
+                combine_destination,
+                edges=(("dispatch.source", "combine.destination", "temporal"),),
+            ),
+            _dag(
+                combine_source,
+                dispatch_destination,
+                edges=(("combine.source", "dispatch.destination", "temporal"),),
+            ),
+        ]
+    )
+
+    assert result.event(0, "dispatch.source").start_us == pytest.approx(0.0)
+    assert result.event(1, "combine.source").start_us == pytest.approx(0.0)
+    assert result.step_time_us == pytest.approx(6.0)
+
+
 def test_missing_rank_profile_is_rejected() -> None:
     node = _node("a", {0: 2.0}, device=[0, 1])
     dag = _dag(node)
@@ -748,15 +859,21 @@ def test_missing_rank_profile_is_rejected() -> None:
         simulate_training_step([dag])
 
 
-def test_schedule_topology_rejects_device_sets_that_disagree_with_rank_math() -> None:
+def test_schedule_topology_rejects_device_sets_that_disagree_with_actor_groups() -> None:
     pp0 = _dag(_node("pp0", {1: 1.0, 3: 1.0}, device=[1, 3]))
     pp1 = _dag(_node("pp1", {0: 1.0, 2: 1.0}, device=[0, 2]))
     plan = SimpleNamespace(
         per_pp_dags=[pp0, pp1],
-        topology={"pp_degree": 2, "dp_degree": 2},
+        topology={
+            "pp_degree": 2,
+            "actor_groups": [
+                {"id": 0, "devices": [0, 2]},
+                {"id": 1, "devices": [1, 3]},
+            ],
+        },
     )
 
-    with pytest.raises(SimulationValidationError, match="global-rank arithmetic"):
+    with pytest.raises(SimulationValidationError, match="explicit ActorGroups"):
         simulate_training_step(plan)
 
 
@@ -812,7 +929,10 @@ def test_profiled_plan_json_round_trip_is_direct_simulator_input(tmp_path) -> No
         profile_configs={
             "interference_free": ProfileConfig(warmup_iters=0, repeat_iters=2)
         },
-        topology={"pp_degree": 1, "dp_degree": 1},
+        topology={
+            "pp_degree": 1,
+            "actor_groups": [{"id": 0, "devices": [0]}],
+        },
     )
     artifact = tmp_path / "profile.json"
     plan.save_json(artifact)

@@ -1,4 +1,5 @@
 import pytest
+import torch
 import torch.fx as fx
 
 from src.piper import (
@@ -49,6 +50,23 @@ def _dummy_gm() -> fx.GraphModule:
     graph = fx.Graph()
     x = graph.placeholder("x")
     graph.output(x)
+    return fx.GraphModule({}, graph)
+
+
+def _routed_output_gm() -> fx.GraphModule:
+    graph = fx.Graph()
+    passthrough = graph.placeholder("passthrough")
+    aux = graph.placeholder("aux")
+    counts = graph.placeholder("routing_counts")
+    payload = graph.placeholder("routed_payload")
+    for node in (passthrough, aux, payload):
+        node.meta["example_value"] = torch.empty(
+            2, 4, device="meta", requires_grad=True
+        )
+    counts.meta["example_value"] = torch.empty(
+        4, device="meta", dtype=torch.int64
+    )
+    graph.output((passthrough, aux, counts, payload))
     return fx.GraphModule({}, graph)
 
 
@@ -134,12 +152,87 @@ def test_indexed_edge_removal_preserves_parallel_edge_adjacency() -> None:
     assert dag.preds == {"a": set(), "c": {"a"}}
 
 
+def test_place_rejects_conflicting_repeated_compute_match() -> None:
+    dag = TrainingDAG()
+    node = _compute("a", {"REGION": 0})
+    node.device = None
+    dag.add_node(node)
+
+    with pytest.raises(ValueError, match="conflicting place directives"):
+        apply_schedule_directives(
+            dag,
+            [
+                {"op": "place", "filter": {"REGION": 0}, "devices": [0, 2]},
+                {"op": "place", "filter": {"REGION": "*"}, "devices": [1, 3]},
+            ],
+        )
+
+
+def test_place_accepts_repeated_normalized_device_set() -> None:
+    dag = TrainingDAG()
+    node = _compute("a", {"REGION": 0})
+    node.device = None
+    dag.add_node(node)
+
+    apply_schedule_directives(
+        dag,
+        [
+            {"op": "place", "filter": {"REGION": 0}, "devices": [2, 0]},
+            {"op": "place", "filter": {"REGION": "*"}, "devices": [0, 2]},
+        ],
+    )
+
+    assert dag.nodes["a"].device == [0, 2]
+
+
+def test_place_rejects_unplaced_compute_node() -> None:
+    dag = TrainingDAG()
+    placed = _compute("placed", {"REGION": 0})
+    unplaced = _compute("unplaced", {"REGION": 1})
+    placed.device = None
+    unplaced.device = None
+    dag.add_node(placed)
+    dag.add_node(unplaced)
+
+    with pytest.raises(ValueError, match="assign every COMPUTE node"):
+        apply_schedule_directives(
+            dag,
+            [{"op": "place", "filter": {"REGION": 0}, "devices": [0]}],
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_devices", "destination_devices", "error"),
+    [
+        ([0, 2], [1], "equal-width actor groups"),
+        ([0, 1], [1, 2], "disjoint actor groups"),
+    ],
+)
+def test_generic_p2p_rejects_invalid_actor_group_pair(
+    source_devices: list[int],
+    destination_devices: list[int],
+    error: str,
+) -> None:
+    dag = TrainingDAG()
+    source = _compute("source", {"REGION": 0})
+    destination = _compute("destination", {"REGION": 1})
+    source.device = source_devices
+    destination.device = destination_devices
+    dag.add_node(source)
+    dag.add_node(destination)
+    dag.add_edge(TrainingDAGEdge("source", "destination", "data", "activation"))
+
+    with pytest.raises(ValueError, match=error):
+        directives._insert_send_recv_comm_nodes(dag)
+
+
 def test_tag_index_matches_legacy_filter_semantics_and_node_order() -> None:
     dag = TrainingDAG()
     for uid, tag in (
         ("first", {"PP": 0, "EP": None, "PASS": "F"}),
         ("second", {"PP": 0, "EP": 3, "PASS": "F"}),
         ("third", {"PP": 1, "EP": 3, "PASS": "B"}),
+        ("fourth", {"PP": 1, "PASS": "F"}),
     ):
         dag.add_node(_compute(uid, tag))
 
@@ -148,6 +241,8 @@ def test_tag_index_matches_legacy_filter_semantics_and_node_order() -> None:
         {"PP": 0},
         {"EP": directives._ANY_TAG_INDEX},
         {"PP": 0, "EP": directives._ANY_TAG_INDEX},
+        {"EP": directives._ABSENT_TAG_INDEX},
+        {"PP": 1, "EP": directives._ABSENT_TAG_INDEX},
         {"PASS": "missing"},
     )
     for tag_filter in filters:
@@ -159,13 +254,49 @@ def test_tag_index_matches_legacy_filter_semantics_and_node_order() -> None:
         assert dag.matching_uids(
             tag_filter,
             wildcard_value=directives._ANY_TAG_INDEX,
+            absent_value=directives._ABSENT_TAG_INDEX,
         ) == expected
 
     dag.update_node_tag("first", {"PP": 1, "EP": 2, "PASS": "F"})
     assert dag.matching_uids(
         {"PP": 1},
         wildcard_value=directives._ANY_TAG_INDEX,
-    ) == ["first", "third"]
+        absent_value=directives._ABSENT_TAG_INDEX,
+    ) == ["first", "third", "fourth"]
+
+
+def test_place_filter_dash_matches_only_nodes_without_tag() -> None:
+    dag = TrainingDAG()
+    for uid, tag in (
+        ("input", {"PP": 0, "PASS": "F"}),
+        ("attn", {"PP": 0, "ATTN": 0, "PASS": "F"}),
+        ("ffn", {"PP": 0, "FFN": 0, "PASS": "F"}),
+        ("output", {"PP": 1, "PASS": "F"}),
+    ):
+        dag.add_node(_compute(uid, tag))
+
+    apply_schedule_directives(
+        dag,
+        [
+            {
+                "op": "place",
+                "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+                "devices": [0],
+            },
+            {
+                "op": "place",
+                "filter": {"PP": 1, "ATTN": "-", "FFN": "-"},
+                "devices": [1],
+            },
+            {"op": "place", "filter": {"ATTN": "*"}, "devices": [0]},
+            {"op": "place", "filter": {"FFN": "*"}, "devices": [1]},
+        ],
+    )
+
+    assert dag.nodes["input"].device == [0]
+    assert dag.nodes["attn"].device == [0]
+    assert dag.nodes["ffn"].device == [1]
+    assert dag.nodes["output"].device == [1]
 
 
 def test_unsharded_dp_accumulates_before_one_all_reduce_per_bucket() -> None:
@@ -557,6 +688,54 @@ def test_bucket_rewrite_resolves_split_microbatch_bwd_by_metadata(monkeypatch) -
     assert sorted(len(node.node_meta["bwd_uids"]) for node in reductions) == [2, 2]
 
 
+def test_bucket_rewrite_preserves_final_output_schema_and_routed_boundary(
+    monkeypatch,
+) -> None:
+    dag = TrainingDAG()
+    fwd = _compute("fwd", {"PP": 0, "PASS": "F"})
+    routed_gm = _routed_output_gm()
+    fwd.node_meta.update({
+        "stage_id": 0,
+        "segment_id": 0,
+        "gm": routed_gm,
+        "graphargs": [],
+        "input_idxs": [],
+        "param_idxs": [],
+        "a2a_boundary_after": {
+            "tensor_idx": 3,
+            "routing_counts_idx": 2,
+        },
+    })
+    dag.add_node(fwd)
+    dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
+    dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
+
+    monkeypatch.setattr(
+        directives,
+        "bucket_stage",
+        lambda *_args, **_kwargs: [
+            (_dummy_gm(), [], [], []),
+            (routed_gm, [], [], []),
+        ],
+    )
+
+    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 25)
+
+    final_meta = dag.nodes["fwd.bucket1"].node_meta
+    assert final_meta["output_names"] == [
+        "passthrough",
+        "aux",
+        "routing_counts",
+        "routed_payload",
+    ]
+    assert final_meta["tensor_output_indices"] == [0, 1, 2, 3]
+    assert final_meta["differentiable_output_indices"] == [0, 1, 3]
+    assert final_meta["a2a_boundary_after"] == {
+        "tensor_idx": 3,
+        "routing_counts_idx": 2,
+    }
+
+
 def test_apply_schedule_buckets_base_graph_before_microbatch_split(monkeypatch) -> None:
     dag = TrainingDAG()
     dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
@@ -670,7 +849,7 @@ def test_apply_order_directive_rejects_reverse_model_dataflow() -> None:
         )
 
 
-def test_apply_order_directive_rejects_cross_device_order_edge() -> None:
+def test_apply_order_directive_rejects_disjoint_device_order_edge() -> None:
     dag = TrainingDAG()
     dag.add_node(_compute("rank0", {"slot": 0}))
     dag.add_node(_compute("rank1", {"slot": 1}))
@@ -685,6 +864,30 @@ def test_apply_order_directive_rejects_cross_device_order_edge() -> None:
             ],
             directive_idx=4,
         )
+
+
+def test_apply_order_directive_allows_overlapping_device_sets() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("attention", {"slot": 0}))
+    dag.add_node(_compute("embedding", {"slot": 1}))
+    dag.nodes["attention"].device = [0, 2, 4, 5]
+    dag.nodes["embedding"].device = [0]
+
+    _apply_order_directive(
+        dag,
+        [
+            [{"slot": 0}],
+            [{"slot": 1}],
+        ],
+        directive_idx=4,
+    )
+
+    assert any(
+        edge.src_uid == "attention"
+        and edge.dst_uid == "embedding"
+        and edge.dep_kind == "temporal"
+        for edge in dag.edges
+    )
 
 
 def test_shard_retains_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
@@ -822,6 +1025,16 @@ def test_validate_schedule_tags_exist_ignores_runtime_tags() -> None:
             {"op": "split", "filter": {}, "dim_name": "MB", "num_microbatches": 2},
             {"op": "order", "filters": [[{"PP": 0, "MB": 0, "PASS": "F"}]]},
         ],
+    )
+
+
+def test_validate_schedule_tags_exist_allows_absent_tag_filter() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+
+    _validate_schedule_tags_exist(
+        dag,
+        [{"op": "place", "filter": {"EP": "-"}, "devices": [0]}],
     )
 
 

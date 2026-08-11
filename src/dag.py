@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import torch
 import torch.fx as fx
 
 from .fx import AnnotationSegment
@@ -36,7 +37,7 @@ class TrainingDAGEdge:
 @dataclass
 class TrainingDAGNode:
     uid: str
-    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "ORDER_DUMMY"
+    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "M_TO_N_COMM" | "N_TO_M_COMM" | "ORDER_DUMMY"
     compute_subkind: str | None  # "FWD" | "BWD" | "BWD_I" | "BWD_W" when node_kind == "COMPUTE"
     tag: dict[str, int | None]
     device: list[int] | None
@@ -174,11 +175,17 @@ class TrainingDAG:
         tag_filter: dict[str, Any],
         *,
         wildcard_value: Any,
+        absent_value: Any | None = None,
         exclude_node_kinds: set[str] | None = None,
     ) -> list[str]:
         candidates: set[str] | None = None
         for key, value in tag_filter.items():
-            if value == wildcard_value:
+            if absent_value is not None and value == absent_value:
+                present = self._tag_uids_non_none_by_key.get(key, set()) | (
+                    self._tag_uids_by_key_value.get((key, None), set())
+                )
+                matching = set(self.nodes) - present
+            elif value == wildcard_value:
                 matching = self._tag_uids_non_none_by_key.get(key, set())
             else:
                 matching = self._tag_uids_by_key_value.get((key, value), set())
@@ -258,13 +265,30 @@ def _flatten_output_nodes(out_arg: Any) -> list[fx.Node]:
 
 
 
-def _node_io_names(seg_gm: fx.GraphModule) -> tuple[list[str], list[str]]:
+def _node_io_names(
+    seg_gm: fx.GraphModule,
+) -> tuple[list[str], list[str], list[int], list[int]]:
     inputs = [n.name for n in seg_gm.graph.nodes if n.op == "placeholder"]
     out_node = next((n for n in seg_gm.graph.nodes if n.op == "output"), None)
     if out_node is None:
-        return inputs, []
-    outputs = [n.name for n in _flatten_output_nodes(out_node.args[0])]
-    return inputs, outputs
+        return inputs, [], [], []
+    output_nodes = _flatten_output_nodes(out_node.args[0])
+    outputs = [n.name for n in output_nodes]
+    tensor_output_indices: list[int] = []
+    differentiable_output_indices: list[int] = []
+    for index, node in enumerate(output_nodes):
+        example = node.meta.get("example_value", node.meta.get("val"))
+        if not isinstance(example, torch.Tensor):
+            continue
+        tensor_output_indices.append(index)
+        if bool(getattr(example, "requires_grad", False)):
+            differentiable_output_indices.append(index)
+    return (
+        inputs,
+        outputs,
+        tensor_output_indices,
+        differentiable_output_indices,
+    )
 
 def _with_pass_tag(tag: dict[str, Any], pass_value: str | None) -> dict[str, Any]:
     t = dict(tag)
@@ -282,7 +306,12 @@ def build_training_dag(
     for segment in annotation_segments:
         uid = f"s{segment.stage_id}.seg{segment.segment_id}"
         tag = _with_pass_tag(segment.tag, "F")
-        in_names, out_names = _node_io_names(segment.gm)
+        (
+            in_names,
+            out_names,
+            tensor_output_indices,
+            differentiable_output_indices,
+        ) = _node_io_names(segment.gm)
         node = TrainingDAGNode(
             uid=uid,
             node_kind="COMPUTE",
@@ -300,6 +329,8 @@ def build_training_dag(
                 "graphargs": list(segment.graphargs),
                 "input_names": in_names,
                 "output_names": out_names,
+                "tensor_output_indices": tensor_output_indices,
+                "differentiable_output_indices": differentiable_output_indices,
                 "a2a_boundary_after": segment.a2a_boundary_after,
                 "triton_constant_args": _collect_triton_constant_args(segment.gm),
             },

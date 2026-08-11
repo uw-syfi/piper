@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from examples.models.qwen3 import AnnotatedMoE, create_qwen3_config
+from examples.models.qwen3 import AFDQwen3Model, AnnotatedMoE, create_qwen3_config
 from src import directives
 from src.dag import build_training_dag
 from src.fx import split_gm_by_annotations
@@ -21,6 +21,16 @@ class _AnnotatedQwenMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with annotate("PP"):
             return self.moe(x)
+
+
+class _ToyExperts(nn.Module):
+    def forward(
+        self,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = num_tokens_per_expert.sum().to(routed_input.dtype) * 0 + 1
+        return routed_input * scale
 
 
 def test_qwen_uses_torchtitan_grouped_experts_and_exposes_routing_counts() -> None:
@@ -122,3 +132,59 @@ def test_qwen_uses_torchtitan_grouped_experts_and_exposes_routing_counts() -> No
         for node in ep2_dag.nodes.values()
         if node.node_kind == "A2A_COMM"
     ) == 1
+
+
+def test_afd_qwen_assigns_only_routed_experts_to_ffn_regions() -> None:
+    captured = {}
+
+    def backend(gm, example_inputs):
+        captured["gm"] = gm
+        return gm.forward
+
+    torch._dynamo.reset()
+    _reset_annotation_state()
+    with torch.device("meta"):
+        config = create_qwen3_config("9M")
+        model = AFDQwen3Model(config, num_stages=2).to(torch.bfloat16)
+        for layer in model.layers.values():
+            layer.moe.experts = _ToyExperts()
+        tokens = torch.zeros((1, 8), dtype=torch.int64, device="meta")
+        output = torch.compile(model, backend=backend, fullgraph=True)(tokens)
+
+    assert tuple(output.shape) == (1, 8, config.vocab_size)
+    _, segments = split_gm_by_annotations(captured["gm"])
+    assert [segment.tag for segment in segments] == [
+        {"PP": 0},
+        {"PP": 0, "ATTN": 0},
+        {"PP": 0, "FFN": 0},
+        {"PP": 0, "ATTN": 1},
+        {"PP": 0, "ATTN": 1},
+        {"PP": 0, "FFN": 1},
+        {"PP": 0, "ATTN": 2},
+        {"PP": 1, "ATTN": 2},
+        {"PP": 1, "FFN": 2},
+        {"PP": 1, "ATTN": 3},
+        {"PP": 1, "ATTN": 3},
+        {"PP": 1, "FFN": 3},
+        {"PP": 1, "ATTN": 4},
+        {"PP": 1},
+    ]
+    assert [
+        (segment.a2a_boundary_after or {}).get("routed_boundary")
+        for segment in segments
+    ] == [
+        None,
+        "dispatch",
+        "combine",
+        None,
+        "dispatch",
+        "combine",
+        None,
+        "dispatch",
+        "combine",
+        None,
+        "dispatch",
+        "combine",
+        None,
+        None,
+    ]

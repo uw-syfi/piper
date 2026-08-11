@@ -306,7 +306,9 @@ def _case_digest(
 
 
 LEGACY_DIGESTS: dict[str, str] = {
-    "bucketed_zero3_zerobubble": "e6250ab79c0c72294d78992726b21d75407c351cae9bec5d0813024215641437",
+    # Bucketing now preserves the bucket GraphModule's output and
+    # differentiability metadata. The executable graph structure is unchanged.
+    "bucketed_zero3_zerobubble": "1adb5801bd07d6442592aee4fedbea985ab661ea265e5c1c2718d4017869ebf3",
     "dp_only_unsharded": "5e248c6eb273dbb10c6261aafb3cee2fe55e0da998cb1e6f0977081986f72cf2",
     "interleaved_placement": "59a2117379e4e44a63e8599c001cf5e57841cbcc2dbdd07913a396e96aa8a6e8",
     "pp_dp_ep_1f1b": "6a3845d839c766795a4a799ae47d5dcfcf4111acbb931197f2fa60c6f07dcc2e",

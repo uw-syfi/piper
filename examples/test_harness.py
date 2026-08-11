@@ -30,6 +30,7 @@ sys.path.insert(0, _REPO_ROOT)
 
 import ray
 from ray.util.placement_group import placement_group_table
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from scripts.export_node_profile_ratios import export_node_profile_ratio_csvs
 from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
@@ -39,9 +40,11 @@ from src.visualization import visualize_order_directives
 
 from build_schedule import (
     build_1f1b_schedule,
+    build_afpipe_baseline_schedule,
     build_dualpipev_schedule,
     build_interleaved_1f1b_schedule,
     build_zerobubble_schedule,
+    infer_afpipe_num_layers,
 )
 
 
@@ -90,17 +93,30 @@ def main() -> None:
         "--schedule-name",
         dest="schedule",
         required=True,
-        choices=("1f1b", "interleaved_1f1b", "zerobubble", "dualpipev", "custom"),
+        choices=(
+            "1f1b",
+            "interleaved_1f1b",
+            "zerobubble",
+            "dualpipev",
+            "afpipe",
+            "afd",
+            "afpipe_baseline",
+            "custom",
+        ),
         help=(
             "Order directive schedule variant to append. Use 'custom' to keep the "
-            "split/order directives already in --base-schedule untouched."
+            "split/order directives already in --base-schedule untouched. "
+            "'afpipe'/'afd' use the conservative AF-Pipe baseline."
         ),
     )
     parser.add_argument(
         "--ranks",
         type=int,
         default=None,
-        help="Number of PP ranks. Required unless --schedule custom.",
+        help=(
+            "Number of physical PP ranks/actor groups. Required unless "
+            "--schedule custom."
+        ),
     )
     parser.add_argument(
         "--mbs",
@@ -113,6 +129,15 @@ def main() -> None:
         type=int,
         default=None,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--afd-layers",
+        type=int,
+        default=4,
+        help=(
+            "AFD transformer layer count when wildcard placement filters do not "
+            "encode it (default: 4). Exact ATTN/FFN placements take precedence."
+        ),
     )
     parser.add_argument(
         "--keep-existing-order",
@@ -134,6 +159,15 @@ def main() -> None:
         action="store_true",
         help="Run extra iterations under torch.profiler and combine the per-actor "
              "chrome traces into one trace per dp-rank under out/.",
+    )
+    parser.add_argument(
+        "--pytorch-profiler-iters",
+        type=int,
+        default=3,
+        help=(
+            "Number of profiler-phase iterations. Only the final iteration is "
+            "collected (default: 3)."
+        ),
     )
     parser.add_argument(
         "--profile-and-simulate",
@@ -188,6 +222,15 @@ def main() -> None:
         default=None,
         help="Ray namespace. Defaults to the selected test module name.",
     )
+    parser.add_argument(
+        "--placement-node-address",
+        action="append",
+        default=None,
+        help=(
+            "Restrict Piper placement to this live Ray node address. May be "
+            "specified more than once."
+        ),
+    )
     args, test_args = parser.parse_known_args()
 
     if args.schedule != "custom":
@@ -207,7 +250,7 @@ def main() -> None:
         args.virtual_stages = _virtual_stages_for_schedule(args.schedule)
 
     # Each run gets its own timestamped output directory under out/, holding its
-    # results.csv (one row per DP rank), schedule viz, and combined profiles.
+    # results.csv, schedule visualization, and combined actor profiles.
     run_dir = Path("out") / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,14 +291,20 @@ def main() -> None:
         # other nodes) write to the same place the harness later reads.
         profile_dir = (run_dir / "pytorch_profiles").resolve()
         if profile_dir.exists():
-            for stale in profile_dir.glob("dp*_pp*.json"):
+            for stale in profile_dir.glob("rank*.json"):
                 stale.unlink()
         profile_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
         dry_run_args = list(forwarded_args)
         if args.pytorch_profiler:
-            dry_run_args.append("--pytorch-profiler")
+            dry_run_args.extend(
+                [
+                    "--pytorch-profiler",
+                    "--pytorch-profiler-iters",
+                    str(args.pytorch_profiler_iters),
+                ]
+            )
         _validate_test_args(args.test_file, dry_run_args)
         cmd = [
             sys.executable,
@@ -279,14 +328,20 @@ def main() -> None:
         return
 
     if args.pytorch_profiler:
-        forwarded_args.append("--pytorch-profiler")
-    dp_metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
-    if dp_metrics:
+        forwarded_args.extend(
+            [
+                "--pytorch-profiler",
+                "--pytorch-profiler-iters",
+                str(args.pytorch_profiler_iters),
+            ]
+        )
+    program_metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
+    if program_metrics:
         (run_dir / "raw_metrics.json").write_text(
-            json.dumps(dp_metrics, indent=2, default=str) + "\n",
+            json.dumps(program_metrics, indent=2, default=str) + "\n",
             encoding="utf-8",
         )
-        rows = _metrics_rows(dp_metrics)
+        rows = _metrics_rows(program_metrics)
         results_csv = run_dir / "results.csv"
         _write_results_csv(results_csv, rows)
         print(f"metrics written to {results_csv}")
@@ -358,6 +413,7 @@ def _run_test_module(
         pg = create_piper_placement_group(
             test_ns.schedule_directives_file,
             pp_outer=pp_outer,
+            node_addresses=args.placement_node_address,
         )
         ray.get(pg.placement_group.ready(), timeout=600)
         pg_info = placement_group_table(pg.placement_group)
@@ -367,13 +423,18 @@ def _run_test_module(
             pg.plan.describe(),
             pg_info,
         )
-        coordinator = PiperProgramCoordinator.remote(
+        coordinator = PiperProgramCoordinator.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=pg.plan.bundles[0].node_id,
+                soft=False,
+            )
+        ).remote(
             schedule_directives_file=test_ns.schedule_directives_file,
             pp_outer=pp_outer,
         )
         handles = coordinator.run_program.remote(test_module.main, pg, test_ns, pg)
-        dp_metrics = ray.get(handles)
-        return dp_metrics
+        program_metrics = ray.get(handles)
+        return program_metrics
     finally:
         ray.shutdown()
 
@@ -385,69 +446,61 @@ def _combine_pytorch_profiles(
     pp: int | str,
     mbs: int | str,
 ) -> None:
-    """Group per-actor chrome traces (dp{dp}_pp{pp}.json) by dp-rank and merge
-    each group into one trace per dp-rank under out_dir. The combined filename
-    encodes the run configuration: schedule, pp degree, dp degree, mbs, dp-rank.
+    """Merge ``rank{global_rank}.json`` actor traces into one program trace.
 
-    Each pp-rank's events keep their own pid namespace via a collision-free
-    remap, and process_name metadata is prefixed with the pp rank so the merged
-    timeline groups work by stage. The intermediate per-actor traces and the
-    (now-empty) profile_dir are removed once combining succeeds.
+    Each actor's events keep a collision-free pid namespace and process-name
+    metadata is prefixed with its global rank. Intermediate traces and the
+    now-empty profile directory are removed once combining succeeds.
     """
-    name_re = re.compile(r"^dp(\d+)_pp(\d+)\.json$")
-    groups: dict[int, dict[int, Path]] = {}
-    for path in sorted(profile_dir.glob("dp*_pp*.json")):
+    name_re = re.compile(r"^rank(\d+)\.json$")
+    rank_paths: dict[int, Path] = {}
+    for path in sorted(profile_dir.glob("rank*.json")):
         m = name_re.match(path.name)
         if not m:
             continue
-        dp_rank, pp_rank = int(m.group(1)), int(m.group(2))
-        groups.setdefault(dp_rank, {})[pp_rank] = path
+        rank_paths[int(m.group(1))] = path
 
-    if not groups:
+    if not rank_paths:
         print(f"pytorch profiler: no trace files found in {profile_dir}")
         return
 
-    dp_degree = len(groups)
     out_dir.mkdir(parents=True, exist_ok=True)
     consumed: list[Path] = []
-    for dp_rank, pp_paths in sorted(groups.items()):
-        combined_events: list = []
-        next_pid = 0
-        for pp_rank, path in sorted(pp_paths.items()):
-            with path.open(encoding="utf-8") as f:
-                trace = json.load(f)
-            events = trace.get("traceEvents", [])
-            annotated = _annotate_cuda_events_with_dag_labels(events)
-            pid_map: dict = {}
-            for ev in events:
-                opid = ev.get("pid")
-                if opid is not None and opid not in pid_map:
-                    pid_map[opid] = next_pid
-                    next_pid += 1
-            for ev in events:
-                if "pid" in ev and ev["pid"] in pid_map:
-                    ev["pid"] = pid_map[ev["pid"]]
-                if ev.get("name") == "process_name":
-                    pname = ev.get("args", {}).get("name", "")
-                    ev["args"]["name"] = f"dp{dp_rank} pp{pp_rank}: {pname}"
-                combined_events.append(ev)
-            consumed.append(path)
-            if annotated:
-                print(
-                    f"pytorch profiler: annotated {annotated} CUDA event(s) "
-                    f"with DAG labels for dp{dp_rank} pp{pp_rank}"
-                )
-        out_name = (
-            f"pytorch_profile_{schedule}_pp{pp}_dp{dp_degree}"
-            f"_mbs{mbs}_dprank{dp_rank}.json"
-        )
-        out_path = out_dir / out_name
-        with out_path.open("w", encoding="utf-8") as f:
-            json.dump({"traceEvents": combined_events}, f)
-        print(
-            f"pytorch profiler: combined {len(pp_paths)} pp-rank trace(s) "
-            f"-> {out_path}"
-        )
+    combined_events: list = []
+    next_pid = 0
+    for rank, path in sorted(rank_paths.items()):
+        with path.open(encoding="utf-8") as f:
+            trace = json.load(f)
+        events = trace.get("traceEvents", [])
+        annotated = _annotate_cuda_events_with_dag_labels(events)
+        pid_map: dict = {}
+        for ev in events:
+            opid = ev.get("pid")
+            if opid is not None and opid not in pid_map:
+                pid_map[opid] = next_pid
+                next_pid += 1
+        for ev in events:
+            if "pid" in ev and ev["pid"] in pid_map:
+                ev["pid"] = pid_map[ev["pid"]]
+            if ev.get("name") == "process_name":
+                pname = ev.get("args", {}).get("name", "")
+                ev["args"]["name"] = f"rank{rank}: {pname}"
+            combined_events.append(ev)
+        consumed.append(path)
+        if annotated:
+            print(
+                f"pytorch profiler: annotated {annotated} CUDA event(s) "
+                f"with DAG labels for rank{rank}"
+            )
+    out_name = (
+        f"pytorch_profile_{schedule}_pp{pp}_world{len(rank_paths)}_mbs{mbs}.json"
+    )
+    out_path = out_dir / out_name
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump({"traceEvents": combined_events}, f)
+    print(
+        f"pytorch profiler: combined {len(rank_paths)} actor trace(s) -> {out_path}"
+    )
 
     for path in consumed:
         path.unlink(missing_ok=True)
@@ -644,32 +697,31 @@ def _contained_cuda_dag_label(
     return max(labels.items(), key=lambda item: item[1])[0]
 
 
-def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
-    """Summarize the raw metrics into one CSV row per DP rank (no averaging
-    across DP ranks).
-
-    Each row's timing scalars come from that DP rank's own iter times; peak
-    memory is taken from that DP rank's per-(global=pp)-rank values and emitted
-    as one peak_memory_pp{i}_gb column per pp rank.
-    """
+def _metrics_rows(program_metrics: list[dict]) -> list[dict]:
+    """Summarize each program driver's raw metrics into one CSV row."""
     rows: list[dict] = []
-    for m in sorted(dp_metrics, key=lambda d: int(d.get("dp_rank", 0))):
+    for m in sorted(program_metrics, key=lambda d: int(d.get("program_rank", 0))):
         iter_times = m.get("iter_times_s") or []
         mean_iter = statistics.fmean(iter_times) if iter_times else float("nan")
         std_iter = statistics.pstdev(iter_times) if len(iter_times) > 1 else 0.0
+        input_group_size = int(m.get("input_actor_group_size") or 1)
         tokens = (
             (m.get("batch_size") or 0)
             * (m.get("num_microbatches") or 1)
             * (m.get("seq_len") or 0)
+            * input_group_size
         )
         throughput = tokens / mean_iter if iter_times and mean_iter else float("nan")
 
         row: dict = {
-            "dp_rank": m.get("dp_rank"),
+            "program_rank": m.get("program_rank", 0),
             "model": m.get("model"),
             "schedule": m.get("schedule"),
             "pp": m.get("pp"),
-            "dp": m.get("dp"),
+            "actor_group_count": len(m.get("actor_groups") or ()),
+            "world_size": m.get("world_size"),
+            "input_actor_group_size": input_group_size,
+            "global_tokens_per_step": tokens,
             "batch_size": m.get("batch_size"),
             "num_microbatches": m.get("num_microbatches"),
             "seq_len": m.get("seq_len"),
@@ -753,13 +805,11 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
             row["interference_free_step_time_us"] = m.get(
                 "interference_free_step_time_us"
             )
-        # peak_memory_by_rank is keyed by global rank; within a DP replica the
-        # global ranks ascend with pp stage (both pp-inner and pp-outer layouts),
-        # so enumerate them as local stage indices for columns that align across
-        # DP-rank rows.
+        # Peak memory is keyed by global actor rank.
         peak = m.get("peak_memory_by_rank") or {}
-        for stage, rank in enumerate(sorted(peak, key=lambda r: int(r))):
-            row[f"peak_memory_pp{stage}_gb"] = float(peak[rank]) / (1024 ** 3)
+        for rank in sorted(peak, key=lambda r: int(r)):
+            peak_prefix = f"peak_memory_rank{int(rank)}"
+            row[f"{peak_prefix}_gb"] = float(peak[rank]) / (1024 ** 3)
             raw_peak_samples = (m.get("peak_memory_samples_by_rank") or {}).get(
                 rank,
                 (m.get("peak_memory_samples_by_rank") or {}).get(str(rank), ()),
@@ -769,7 +819,7 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
                     (float(sample) / (1024 ** 3) for sample in raw_peak_samples),
                     estimator="median",
                 )
-                prefix = f"peak_memory_pp{stage}"
+                prefix = peak_prefix
                 row[f"{prefix}_samples"] = peak_stats.samples
                 row[f"{prefix}_estimator"] = peak_stats.estimator
                 row[f"{prefix}_estimate_gb"] = peak_stats.estimate
@@ -808,7 +858,7 @@ def _add_timing_statistics_columns(row: dict, prefix: str, stats) -> None:
 
 
 def _write_results_csv(csv_path: Path, rows: list[dict]) -> None:
-    """Write ``rows`` (one per DP rank) to a fresh per-run results CSV."""
+    """Write program-level metric ``rows`` to a fresh per-run results CSV."""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: list[str] = []
     for row in rows:
@@ -832,13 +882,19 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
             if isinstance(d, dict) and d.get("op") == "order"
         ]
     else:
-        if args.keep_existing_order:
-            schedule = list(base)
-        else:
-            schedule = [
-                directive for directive in base
-                if not (isinstance(directive, dict) and directive.get("op") == "order")
-            ]
+        schedule = [
+            directive for directive in base
+            if not (
+                isinstance(directive, dict)
+                and (
+                    directive.get("op") == "split"
+                    or (
+                        directive.get("op") == "order"
+                        and not args.keep_existing_order
+                    )
+                )
+            )
+        ]
         _set_num_microbatches(schedule, args.mbs)
 
         if args.schedule == "1f1b":
@@ -847,6 +903,17 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
             order_directives = build_zerobubble_schedule(args.ranks, args.mbs)
         elif args.schedule == "dualpipev":
             order_directives = build_dualpipev_schedule(args.ranks, args.mbs)
+        elif args.schedule in ("afpipe", "afd", "afpipe_baseline"):
+            n_layers = infer_afpipe_num_layers(
+                schedule,
+                fallback=args.afd_layers,
+            )
+            order_directives = build_afpipe_baseline_schedule(
+                schedule,
+                args.mbs,
+                n_layers,
+                expected_actor_groups=args.ranks,
+            )
         else:
             order_directives = build_interleaved_1f1b_schedule(
                 args.ranks,
@@ -868,7 +935,11 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
         args.virtual_stages,
         base_schedule=args.base_schedule,
     )
-    run_schedule = run_dir / f"{schedule_stem}.json"
+    # Ray actors may start with a different working directory from the driver,
+    # even when every node sees the same shared workspace.  Pass an absolute
+    # schedule path so remote coordinators and program drivers load the file
+    # written here rather than resolving it relative to their worker cwd.
+    run_schedule = (run_dir / f"{schedule_stem}.json").resolve()
     with run_schedule.open("w", encoding="utf-8") as f:
         json.dump(schedule, f, indent=2)
         f.write("\n")
@@ -876,7 +947,7 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
     viz_path = None
     if args.viz:
         viz_output = run_dir / f"{schedule_stem}.png"
-        viz_path = visualize_order_directives(order_directives, viz_output)
+        viz_path = visualize_order_directives(schedule, viz_output)
     return run_schedule, viz_path
 
 

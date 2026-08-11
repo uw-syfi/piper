@@ -43,12 +43,11 @@ class PiperMetadata:
     visualize_dag: bool = False  # Whether to render per-rank DAG PNGs after compilation
     artifact_dir: str = "out"  # Directory for debug artifacts emitted during runs
     training_dag = None  # DAG of annotated model segments and transform-inserted nodes
-    per_pp_training_dags = None  # Per-PP-rank DAGs built by the TrainingDAG backend
-    compiled_data_store = None  # Ray actor used to share compiled DAGs across DP ranks
+    per_pp_training_dags = None  # One local DAG per schedule ActorGroup
+    compiled_data_store = None  # Ray actor providing profile clock calibration
     schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
     schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
-    schedule_info: dict = {}  # Derived schedule facts such as pp/dp/mbs
-    profile_generation: int = 0  # Last distributed profile generation consumed locally
+    schedule_info: dict = {}  # Derived ActorGroup and microbatch schedule facts
     profiled_training_plan = None  # Latest merged interference-free profile artifact
 
 piper_metadata = PiperMetadata()

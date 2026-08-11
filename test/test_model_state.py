@@ -2,16 +2,50 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
+import src.actor as actor_module
 import src.runtime as runtime_module
+from src.actor import PiperActor
 from src.model_state import (
     dynamo_buffer_name_to_state_dict_key,
     dynamo_parameter_name_to_state_dict_key,
     initialize_model_parameters_,
     initialize_parameter_,
 )
-from src.runtime import BucketState, ParamStorage, StageStore
+from src.runtime import BucketState, ParamStorage, RuntimeState, StageStore
+
+
+def _two_rank_runtime(**overrides) -> RuntimeState:
+    values = {
+        "global_rank": 0,
+        "pp_rank": 0,
+        "pp_degree": 1,
+        "world_size": 2,
+        "device": "cpu",
+        "actor_group_id": 0,
+        "actor_group_local_rank": 0,
+        "actor_group_devices": (0, 1),
+        "actor_groups": ((0, 1),),
+    }
+    values.update(overrides)
+    return RuntimeState(**values)
+
+
+def test_runtime_rejects_missing_actor_group_metadata() -> None:
+    with pytest.raises(ValueError, match="actor_groups must not be empty"):
+        RuntimeState(
+            global_rank=0,
+            pp_rank=0,
+            pp_degree=1,
+            world_size=1,
+        )
+
+
+def test_runtime_rejects_inconsistent_actor_group_local_rank() -> None:
+    with pytest.raises(ValueError, match="global_rank=0 does not match"):
+        _two_rank_runtime(actor_group_local_rank=1)
 
 
 def test_dynamo_parameter_name_to_state_dict_key() -> None:
@@ -89,9 +123,14 @@ def test_zero2_rebuilds_full_parameters_after_shard_update(monkeypatch) -> None:
         grad_sharded_ubids={"bucket"},
         param_sharded_ubids=set(),
     )
-    dp_group = object()
+    sync_group = object()
+    validate_metadata = Mock()
     storage = ParamStorage(
-        runtime=SimpleNamespace(dp_degree=2, dp_group=dp_group),
+        runtime=SimpleNamespace(
+            actor_group_size=2,
+            actor_group_sync_group=sync_group,
+            validate_actor_group_metadata=validate_metadata,
+        ),
         stages=stages,
         logger=Mock(),
     )
@@ -104,7 +143,7 @@ def test_zero2_rebuilds_full_parameters_after_shard_update(monkeypatch) -> None:
 
     def all_gather_into_tensor(output, input_tensor, *, group):
         assert input_tensor is shard_param
-        assert group is dp_group
+        assert group is sync_group
         output.copy_(gathered_values)
 
     monkeypatch.setattr(
@@ -118,3 +157,108 @@ def test_zero2_rebuilds_full_parameters_after_shard_update(monkeypatch) -> None:
     shard_optimizer.step.assert_called_once_with()
     assert bucket.shard_param.grad is None
     assert torch.equal(bucket.flat_params, gathered_values)
+    validate_metadata.assert_called_once_with(
+        context="rebuild ZeRO-2 parameters for ZeRO bucket 'bucket'"
+    )
+
+
+def test_zero_gradient_storage_uses_actor_group_size(monkeypatch) -> None:
+    param = torch.nn.Parameter(torch.ones(3))
+    bucket = BucketState(
+        param_shard_info=(0, 3, 5),
+        param_view_specs=[(param, 0, 3, (3,))],
+    )
+    stages = StageStore(
+        buckets={"bucket": bucket},
+        grad_sharded_ubids={"bucket"},
+        zero_managed_ubids={"bucket"},
+    )
+    storage = ParamStorage(
+        runtime=_two_rank_runtime(),
+        stages=stages,
+        logger=Mock(),
+    )
+    monkeypatch.setattr(
+        runtime_module.torch.cuda, "stream", lambda _stream: nullcontext()
+    )
+
+    storage.alloc_full_grads("bucket", object())
+
+    assert bucket.flat_grads.shape == (6,)
+    assert bucket.reduce_scatter_grads.shape == (3,)
+
+
+def test_zero_collective_errors_when_actor_group_communicator_is_missing(
+    monkeypatch,
+) -> None:
+    flat_params = torch.ones(4)
+    shard_param = flat_params[:2]
+    bucket = BucketState(
+        flat_params=flat_params,
+        shard_param=shard_param,
+        shard_optimizer=Mock(),
+        reduce_scatter_grads=torch.ones(2),
+    )
+    stages = StageStore(
+        buckets={"bucket": bucket},
+        grad_sharded_ubids={"bucket"},
+    )
+    storage = ParamStorage(
+        runtime=_two_rank_runtime(),
+        stages=stages,
+        logger=Mock(),
+    )
+    monkeypatch.setattr(
+        runtime_module.torch.cuda, "stream", lambda _stream: nullcontext()
+    )
+
+    with pytest.raises(RuntimeError, match="communicator was not initialized"):
+        storage.step_zero_shard_optimizers(Mock(), {})
+
+
+def test_nonrepresentative_participates_in_sharded_parameter_export(
+    monkeypatch,
+) -> None:
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    shard_param = torch.tensor([3.0, 4.0])
+    bucket = BucketState(
+        shard_param=shard_param,
+        param_shard_info=(2, 2, 4),
+        trainable_param_idxs=[0],
+        param_idxs=[0],
+        param_names=["l_self_parameters_weight_"],
+        param_view_specs=[(torch.nn.Parameter(torch.ones(4)), 0, 4, (4,))],
+    )
+    actor.stages = StageStore(
+        buckets={"bucket": bucket},
+        param_sharded_ubids={"bucket"},
+    )
+    stream = Mock()
+    actor.runtime = SimpleNamespace(
+        actor_group_size=2,
+        actor_group_sync_group="sync",
+        is_actor_group_representative=False,
+        default_stream=lambda: stream,
+    )
+    actor.params = SimpleNamespace(drain_pending_frees=Mock())
+    collective_calls = []
+
+    monkeypatch.setattr(actor_module.torch.cuda, "synchronize", Mock())
+    monkeypatch.setattr(
+        actor_module.torch.cuda, "stream", lambda _stream: nullcontext()
+    )
+
+    def fake_all_gather(output, input_tensor, *, group):
+        collective_calls.append((input_tensor, group))
+        output.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+    monkeypatch.setattr(
+        actor_module.dist,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+
+    assert actor.export_model_parameter_state() == {}
+    assert collective_calls == [(shard_param, "sync")]
+    stream.synchronize.assert_called_once_with()

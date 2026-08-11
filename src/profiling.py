@@ -1,7 +1,7 @@
 """Durable multi-mode node profiling records for stream simulation.
 
 This module intentionally contains no CUDA or Ray code.  Actors produce
-``ActorProfileResult`` shards, the coordinator merges those shards into the
+``ActorProfileResult`` records, the coordinator merges those records into the
 finalized DAGs, and the simulator consumes the resulting
 ``ProfiledTrainingPlan``.  Keeping the interchange types here prevents live FX,
 CUDA event, and executor state from leaking into saved profile artifacts.
@@ -299,13 +299,12 @@ class ProfileConfig:
 
 @dataclass(frozen=True)
 class ActorProfileResult:
-    """Detached profile shard returned by one global-rank actor."""
+    """Detached profile result returned by one global-rank actor."""
 
     graph_fingerprint: str
     global_rank: int
     node_profiles: dict[str, NodeProfile]
     profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE
-    dp_rank: int = 0
     pp_rank: int = 0
     device_metadata: dict[str, Any] = field(default_factory=dict)
     prologue_profile: NodeProfile | None = None
@@ -323,7 +322,6 @@ class ActorProfileResult:
             "graph_fingerprint": self.graph_fingerprint,
             "global_rank": int(self.global_rank),
             "profile_mode": self.profile_mode,
-            "dp_rank": int(self.dp_rank),
             "pp_rank": int(self.pp_rank),
             "device_metadata": _json_safe_value(self.device_metadata),
             "timeline_origin_samples_us": list(self.timeline_origin_samples_us),
@@ -345,7 +343,6 @@ class ActorProfileResult:
             graph_fingerprint=str(value["graph_fingerprint"]),
             global_rank=int(value["global_rank"]),
             profile_mode=str(value["profile_mode"]),
-            dp_rank=int(value.get("dp_rank", 0)),
             pp_rank=int(value.get("pp_rank", 0)),
             device_metadata=dict(value.get("device_metadata", {})),
             timeline_origin_samples_us=tuple(
@@ -846,10 +843,10 @@ def merge_actor_profiles(
     profile_configs: Mapping[str, ProfileConfig] | None = None,
     topology: Mapping[str, Any] | None = None,
 ) -> ProfiledTrainingPlan:
-    """Validate actor shards and attach rank-specific profiles to DAG nodes.
+    """Validate actor results and attach rank-specific profiles to DAG nodes.
 
-    The operation mutates ``per_pp_dags`` only after a shard has passed its
-    rank, fingerprint, and node-coverage checks.  Missing profile shards are
+    The operation mutates ``per_pp_dags`` only after a result has passed its
+    rank, fingerprint, and node-coverage checks.  Missing actor results are
     intentionally not filled with zero durations.
     """
 
@@ -938,20 +935,20 @@ def merge_actor_profiles(
                 global_offsets, profile.estimator
             ),
         )
-    seen_shards: set[tuple[str, int]] = set()
+    seen_results: set[tuple[str, int]] = set()
     device_metadata: dict[str, dict[str, Any]] = {}
     for result in sorted(
         results, key=lambda item: (item.profile_mode, item.global_rank)
     ):
         mode = normalize_profile_mode(result.profile_mode)
         rank = int(result.global_rank)
-        shard_key = (mode, rank)
-        if shard_key in seen_shards:
+        result_key = (mode, rank)
+        if result_key in seen_results:
             raise ValueError(
                 "duplicate actor profile result for "
                 f"profile_mode={mode}, global_rank={rank}"
             )
-        seen_shards.add(shard_key)
+        seen_results.add(result_key)
         dag = _dag_for_actor_rank(dags, result)
         expected_fingerprint = finalized_dag_fingerprint(dag)
         if result.graph_fingerprint != expected_fingerprint:

@@ -1,0 +1,46 @@
+[
+  {
+    "op": "place",
+    "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": "*"},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"PP": 1, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"FFN": "*"},
+    "devices": [2]
+  },
+  {
+    "op": "replicate",
+    "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": "*"},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"PP": 1, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {"FFN": "*"},
+    "devices": [2],
+    "stream": "ep_stream"
+  }
+]

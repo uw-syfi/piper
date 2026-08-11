@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import argparse
 import os
+from functools import partial
 
 import ray
 import torch
 
-from models.qwen3 import QWEN_MODEL_NAMES, PiperQwen3Model, create_qwen3_config
+from models.qwen3 import (
+    AFDQwen3Model,
+    QWEN_MODEL_NAMES,
+    PiperQwen3Model,
+    create_qwen3_config,
+)
 from src.compile import piper_setup
 from src.model_state import (
     DEFAULT_MODEL_SEED,
@@ -22,9 +28,14 @@ from src.state import LOG_LEVEL, create_logger, piper_metadata
 logger = create_logger("test_qwen_correctness", LOG_LEVEL)
 
 
-def _create_optimizer(parameters, **kwargs):
+def _create_optimizer(parameters, *, optimizer_name="adam", **kwargs):
     kwargs["fused"] = True
-    return torch.optim.Adam(parameters, **kwargs)
+    if optimizer_name == "adam":
+        return torch.optim.Adam(parameters, **kwargs)
+    if optimizer_name == "sgd":
+        kwargs.setdefault("lr", 1e-2)
+        return torch.optim.SGD(parameters, **kwargs)
+    raise ValueError(f"unsupported optimizer {optimizer_name!r}")
 
 
 def main(args, pg) -> dict:
@@ -33,8 +44,6 @@ def main(args, pg) -> dict:
         getattr(args, "num_stages", 0)
         or _derive_num_stages(args.schedule_directives_file)
     )
-    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
-
     input_generator = torch.Generator(device="cpu")
     input_generator.manual_seed(args.model_seed + 1)
     tokens = torch.randint(
@@ -64,10 +73,12 @@ def main(args, pg) -> dict:
             target.view(-1),
         )
 
+    model_cls = _model_class_for_schedule(args.schedule_directives_file)
+    logger.info("Using Qwen wrapper %s", model_cls.__name__)
     piper_setup(
-        PiperQwen3Model,
+        model_cls,
         model_args=(config, num_stages),
-        optim_fn=_create_optimizer,
+        optim_fn=partial(_create_optimizer, optimizer_name=args.optimizer),
         example_inputs=[tokens],
         example_outputs=labels,
         model_dtype=torch.bfloat16,
@@ -107,7 +118,7 @@ def main(args, pg) -> dict:
         loss_fn,
         steps=args.steps,
         num_microbatches=num_microbatches,
-        dp_degree=dp_degree,
+        optimizer_name=args.optimizer,
     )
     _assert_loss_samples_close(piper_loss_samples, reference_loss_samples)
     final_reference_state = _eager_parameter_state(reference_model)
@@ -116,6 +127,7 @@ def main(args, pg) -> dict:
         final_reference_state,
         rtol=args.rtol,
         atol=args.atol,
+        expert_atol=args.expert_atol,
         phase=f"after {args.steps} training step(s)",
         baseline=initial_reference_state,
     )
@@ -127,11 +139,15 @@ def main(args, pg) -> dict:
         max_abs_error,
     )
     return {
-        "dp_rank": int(os.environ["PIPER_DP_RANK"]),
+        "program_rank": 0,
         "model": args.model,
         "schedule": schedule_info.get("name"),
         "pp": schedule_info.get("pp_degree"),
-        "dp": dp_degree,
+        "actor_groups": schedule_info.get("actor_groups"),
+        "world_size": schedule_info.get("world_size"),
+        "input_actor_group_size": schedule_info.get(
+            "input_actor_group_size", 1
+        ),
         "batch_size": args.batch_size,
         "num_microbatches": num_microbatches,
         "seq_len": args.seq_len,
@@ -150,9 +166,11 @@ def _train_reference(
     *,
     steps: int,
     num_microbatches: int,
-    dp_degree: int,
+    optimizer_name: str,
 ) -> list[list[float]]:
-    optimizer = _create_optimizer(model.parameters())
+    optimizer = _create_optimizer(
+        model.parameters(), optimizer_name=optimizer_name
+    )
     loss_samples: list[list[float]] = []
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
@@ -165,12 +183,6 @@ def _train_reference(
             step_losses.append(float(loss.detach()))
             loss.backward()
         loss_samples.append(step_losses)
-        # Piper's DP collectives are sums rather than averages. Every replica
-        # receives the same deterministic batch in this correctness test.
-        if dp_degree > 1:
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(dp_degree)
         optimizer.step()
     torch.cuda.synchronize()
     return loss_samples
@@ -231,6 +243,7 @@ def _assert_parameter_states_close(
     *,
     rtol: float,
     atol: float,
+    expert_atol: float | None = None,
     phase: str,
     baseline: dict[str, torch.Tensor] | None = None,
 ) -> float:
@@ -258,12 +271,23 @@ def _assert_parameter_states_close(
             else 0.0
         )
         max_abs_error = max(max_abs_error, abs_error)
-        if not torch.allclose(
+        parameter_atol = (
+            expert_atol
+            if expert_atol is not None and ".moe.experts." in name
+            else atol
+        )
+        if not torch.isfinite(actual_tensor).all() or not torch.isfinite(
+            expected_tensor
+        ).all():
+            mismatches.append(
+                (float("inf"), name, f"{name}: contains non-finite values")
+            )
+        elif not torch.allclose(
             actual_tensor,
             expected_tensor,
             rtol=rtol,
-            atol=atol,
-            equal_nan=True,
+            atol=parameter_atol,
+            equal_nan=False,
         ):
             flat_error = (
                 actual_tensor.float() - expected_tensor.float()
@@ -292,7 +316,8 @@ def _assert_parameter_states_close(
         mismatch_names = [name for _error, name, _detail in mismatches]
         raise AssertionError(
             f"{len(mismatches)} parameter tensor(s) diverged during {phase} "
-            f"(rtol={rtol}, atol={atol}); {details}; "
+            f"(rtol={rtol}, atol={atol}, expert_atol={expert_atol}); "
+            f"{details}; "
             f"mismatched_names={mismatch_names}"
         )
     return max_abs_error
@@ -300,17 +325,40 @@ def _assert_parameter_states_close(
 
 def _derive_num_stages(schedule_directives_file: str) -> int:
     directives = load_schedule_directives(schedule_directives_file)
-    num_stages = sum(
-        1
+    pp_indices = {
+        int(directive["filter"]["PP"])
         for directive in directives
-        if isinstance(directive, dict) and directive.get("op") == "place"
-    )
-    if num_stages <= 0:
+        if isinstance(directive, dict)
+        and directive.get("op") == "place"
+        and isinstance(directive.get("filter"), dict)
+        and isinstance(directive["filter"].get("PP"), int)
+    }
+    if not pp_indices:
         raise ValueError(
-            "schedule directives file must contain at least one place directive: "
+            "schedule directives file must contain a place directive with an "
+            "exact PP filter: "
             f"{schedule_directives_file}"
         )
-    return num_stages
+    if min(pp_indices) != 0:
+        raise ValueError(
+            f"schedule PP indices must start at 0, got {sorted(pp_indices)}"
+        )
+    return max(pp_indices) + 1
+
+
+def _model_class_for_schedule(schedule_directives_file: str):
+    """Select the AFD wrapper when placement addresses ATTN/FFN regions."""
+    directives = load_schedule_directives(schedule_directives_file)
+    uses_afd_regions = any(
+        directive.get("op") == "place"
+        and isinstance(directive.get("filter"), dict)
+        and (
+            "ATTN" in directive["filter"]
+            or "FFN" in directive["filter"]
+        )
+        for directive in directives
+    )
+    return AFDQwen3Model if uses_afd_regions else PiperQwen3Model
 
 
 def parse_args(argv=None):
@@ -324,6 +372,10 @@ def parse_args(argv=None):
     parser.add_argument("--model-seed", type=int, default=DEFAULT_MODEL_SEED)
     parser.add_argument("--rtol", type=float, default=0.0)
     parser.add_argument("--atol", type=float, default=0.0)
+    parser.add_argument("--expert-atol", type=float, default=None)
+    parser.add_argument(
+        "--optimizer", choices=("adam", "sgd"), default="adam"
+    )
     parser.add_argument(
         "--schedule-directives-file",
         default="examples/base-schedules/pp2.json",
@@ -345,6 +397,10 @@ def parse_args(argv=None):
         parser.error("--steps must be positive")
     if args.batch_size <= 0 or args.seq_len <= 0:
         parser.error("--batch-size and --seq-len must be positive")
-    if args.rtol < 0 or args.atol < 0:
-        parser.error("--rtol and --atol must be non-negative")
+    if (
+        args.rtol < 0
+        or args.atol < 0
+        or (args.expert_atol is not None and args.expert_atol < 0)
+    ):
+        parser.error("correctness tolerances must be non-negative")
     return args

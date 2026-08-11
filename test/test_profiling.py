@@ -100,6 +100,25 @@ def test_profile_config_uses_fixed_iteration_count() -> None:
     assert config.repeat_iters == 30
 
 
+def test_actor_profile_result_has_no_legacy_dp_metadata() -> None:
+    result = ActorProfileResult(
+        graph_fingerprint="fingerprint",
+        global_rank=7,
+        pp_rank=2,
+        node_profiles={},
+    )
+
+    encoded = result.to_dict()
+    assert "dp_rank" not in encoded
+
+    # Older transient payloads may contain extra metadata.  It must not be
+    # restored into the ActorGroup-native result type.
+    encoded["dp_rank"] = 3
+    restored = ActorProfileResult.from_dict(encoded)
+    assert restored == result
+    assert not hasattr(restored, "dp_rank")
+
+
 def test_finalized_fingerprint_is_order_and_profile_invariant() -> None:
     dag = _two_node_dag()
     expected = finalized_dag_fingerprint(dag)

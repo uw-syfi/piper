@@ -18,6 +18,24 @@ try:
 except ImportError:  # Newer TorchTitan source layout.
     from torchtitan.models.common.moe.utils import _permute, _unpermute
 
+
+def _local_padded_expert_counts(
+    counts: torch.Tensor,
+    source_degree: int,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Normalize the padded counts returned by TorchTitan's ``_permute``."""
+    if counts.numel() == num_local_experts:
+        return counts
+    if counts.numel() == source_degree * num_local_experts:
+        return counts.view(source_degree, num_local_experts).sum(dim=0)
+    raise ValueError(
+        "TorchTitan _permute returned an invalid padded-count layout: "
+        f"got {counts.numel()} values for source_degree={source_degree}, "
+        f"num_local_experts={num_local_experts}"
+    )
+
+
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
 from .execution_plan import (
     PlannedOperation,
@@ -80,6 +98,28 @@ class _ExpertA2AState:
 
 
 @dataclass
+class _RoutedCrossGroupState:
+    """Per-microbatch layout state for one cross-ActorGroup expert boundary."""
+
+    source_devices: tuple[int, ...]
+    destination_devices: tuple[int, ...]
+    participants: tuple[int, ...]
+    layout_group: Any
+    m_to_n_group: Any
+    n_to_m_group: Any
+    layout_work: Any = None
+    layout_output: torch.Tensor | None = None
+    input_splits: list[int] | None = None
+    output_splits: list[int] | None = None
+    input_shape: torch.Size | None = None
+    permuted_indices: torch.Tensor | None = None
+    payload_shape: tuple[int, ...] | None = None
+    payload_dtype: torch.dtype | None = None
+    retained_forward_buffer: dict[str, Any] | None = None
+    retained_backward_buffer: dict[str, Any] | None = None
+
+
+@dataclass
 class CommunicationExecutor:
     """Actor-local communication operations used by the DAG dispatcher."""
 
@@ -87,17 +127,32 @@ class CommunicationExecutor:
     stages: StageStore
     logger: Any
 
-    def send(self, send_data: Any, peer_pp_rank: int, stream: torch.cuda.Stream) -> None:
+    def send(
+        self,
+        send_data: Any,
+        peer_pp_rank: int,
+        stream: torch.cuda.Stream,
+        *,
+        task: Any | None = None,
+    ) -> None:
         global_dst_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
         with torch.cuda.stream(stream):
             tensors = send_data if isinstance(send_data, (list, tuple)) else [send_data]
-            use_lo_hi = global_dst_rank > self.runtime.global_rank
-            pp_group = self.runtime.pp_lo_hi if use_lo_hi else self.runtime.pp_hi_lo
+            if task is None:
+                raise ValueError("ActorGroup P2P send requires its DAG task")
+            pp_group = self.runtime.p2p_process_group_for_task(task)
             for tensor in tensors:
                 dist.send(tensor, dst=global_dst_rank, group=pp_group)
 
-    def recv_fwd(self, recv_ubid: Any, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
+    def recv_fwd(
+        self,
+        recv_ubid: Any,
+        peer_pp_rank: int,
+        stream: torch.cuda.Stream,
+        *,
+        task: Any | None = None,
+    ) -> list:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
         buf = [
@@ -110,13 +165,21 @@ class CommunicationExecutor:
             for shape, dtype, requires_grad in self.stages.bucket(recv_ubid).forward_input_meta
         ]
         with torch.cuda.stream(stream):
-            use_hi_lo = global_src_rank > self.runtime.global_rank
-            pp_group = self.runtime.pp_hi_lo if use_hi_lo else self.runtime.pp_lo_hi
+            if task is None:
+                raise ValueError("ActorGroup P2P receive requires its DAG task")
+            pp_group = self.runtime.p2p_process_group_for_task(task)
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
-    def recv_bwd(self, shape_meta: list, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
+    def recv_bwd(
+        self,
+        shape_meta: list,
+        peer_pp_rank: int,
+        stream: torch.cuda.Stream,
+        *,
+        task: Any | None = None,
+    ) -> list:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
         buf = [
@@ -124,8 +187,9 @@ class CommunicationExecutor:
             for shape, dtype in shape_meta
         ]
         with torch.cuda.stream(stream):
-            use_hi_lo = global_src_rank > self.runtime.global_rank
-            pp_group = self.runtime.pp_hi_lo if use_hi_lo else self.runtime.pp_lo_hi
+            if task is None:
+                raise ValueError("ActorGroup P2P receive requires its DAG task")
+            pp_group = self.runtime.p2p_process_group_for_task(task)
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
@@ -147,9 +211,26 @@ class CommunicationExecutor:
             grad_tensors.append(param.grad)
 
         total_bytes = sum(grad.numel() * grad.element_size() for grad in grad_tensors)
+        replica_degree = int(self.runtime.actor_group_size)
+        if replica_degree <= 0:
+            raise ValueError(
+                f"all_reduce_grads requires a positive replica group width, "
+                f"got {replica_degree}"
+            )
+        sync_group = self.runtime.actor_group_sync_group
+        if replica_degree > 1 and sync_group is None:
+            raise RuntimeError(
+                "all_reduce_grads requires an initialized ActorGroup "
+                "synchronization communicator"
+            )
         with torch.cuda.stream(stream):
             for grad in grad_tensors:
-                dist.all_reduce(grad, group=self.runtime.dp_group)
+                dist.all_reduce(
+                    grad,
+                    group=sync_group,
+                )
+                if replica_degree > 1:
+                    grad.div_(replica_degree)
         return total_bytes
 
     def reduce_scatter(self, ubid: Any, stream: torch.cuda.Stream) -> int:
@@ -172,10 +253,28 @@ class CommunicationExecutor:
         assert rs_out is not None, (
             f"reduce_scatter: missing reduce_scatter_grads buffer for ubid={ubid}"
         )
+        replica_degree = int(self.runtime.actor_group_size)
+        if replica_degree <= 0:
+            raise ValueError(
+                f"reduce_scatter requires a positive replica group width, "
+                f"got {replica_degree}"
+            )
+        sync_group = self.runtime.actor_group_sync_group
+        if replica_degree > 1 and sync_group is None:
+            raise RuntimeError(
+                "reduce_scatter requires an initialized ActorGroup "
+                "synchronization communicator"
+            )
         with torch.cuda.stream(stream):
             total_bytes = flat_grads.numel() * flat_grads.element_size()
             tmp = torch.empty_like(rs_out)
-            dist.reduce_scatter_tensor(tmp, flat_grads, group=self.runtime.dp_group)
+            dist.reduce_scatter_tensor(
+                tmp,
+                flat_grads,
+                group=sync_group,
+            )
+            if replica_degree > 1:
+                tmp.div_(replica_degree)
             rs_out.add_(tmp)
             return total_bytes
 
@@ -246,12 +345,16 @@ class ComputeExecutor:
         for i, tensor in zip(input_idxs, input_tensors):
             if isinstance(tensor, (list, tuple)):
                 tensor = tensor[0]
-            if tensor.requires_grad:
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
                 tensor = tensor.detach().requires_grad_(True)
             fwd_args[i] = tensor
 
         fwd_inputs = [fwd_args[i] for i in input_idxs]
-        inp_with_grad = [t for t in fwd_inputs if t is not None and t.requires_grad]
+        inp_with_grad = [
+            t
+            for t in fwd_inputs
+            if isinstance(t, torch.Tensor) and t.requires_grad
+        ]
 
         with torch.cuda.stream(compute_stream):
             output = fwd_fn(fwd_args)
@@ -526,6 +629,9 @@ class DagExecutor:
     expert_a2a_states: dict[str, _ExpertA2AState] = field(
         default_factory=dict
     )
+    routed_cross_group_states: dict[str, _RoutedCrossGroupState] = field(
+        default_factory=dict
+    )
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
@@ -613,7 +719,17 @@ class DagExecutor:
             self._wait_for_all_gather(node, compute_stream)
 
         a2a_pred = next(
-            (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
+            (
+                p
+                for p in node.data_preds
+                if p.task_type
+                in (
+                    TaskType.BWD_A2A,
+                    TaskType.BWD_M_TO_N,
+                    TaskType.BWD_N_TO_M,
+                )
+            ),
+            None,
         )
         if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
             a2a_event = self.events.a2a.pop(a2a_pred.uid)
@@ -762,10 +878,30 @@ class DagExecutor:
         routed_input: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if routed_input.ndim != 2:
+            raise ValueError(
+                "routed expert payload must have shape [tokens, hidden], got "
+                f"shape={tuple(routed_input.shape)}"
+            )
         if num_tokens_per_expert.ndim != 1:
             raise ValueError(
                 "num_tokens_per_expert must be one-dimensional, got "
                 f"shape={tuple(num_tokens_per_expert.shape)}"
+            )
+        if torch.is_floating_point(num_tokens_per_expert) or torch.is_complex(
+            num_tokens_per_expert
+        ):
+            raise TypeError(
+                "num_tokens_per_expert must use an integer dtype, got "
+                f"{num_tokens_per_expert.dtype}"
+            )
+        if bool(torch.any(num_tokens_per_expert < 0).item()):
+            raise ValueError("num_tokens_per_expert cannot contain negative counts")
+        routed_tokens = int(num_tokens_per_expert.sum().item())
+        if int(routed_input.shape[0]) != routed_tokens:
+            raise ValueError(
+                f"routed expert payload has {routed_input.shape[0]} rows, but "
+                f"routing counts sum to {routed_tokens}"
             )
         if num_tokens_per_expert.shape[0] % state.ep_degree:
             raise ValueError(
@@ -784,7 +920,7 @@ class DagExecutor:
                     num_tokens_per_expert,
                     None,
                     None,
-                    group=self.runtime.ep_group,
+                    group=self.runtime.actor_group_routed_group,
                 )
                 grouped_counts = torch.ops._c10d_functional.wait_tensor(
                     grouped_counts
@@ -806,7 +942,7 @@ class DagExecutor:
                 routed_input,
                 state.output_splits,
                 state.input_splits,
-                self.runtime.ep_group,
+                self.runtime.actor_group_routed_group,
             )
         else:
             grouped_counts = num_tokens_per_expert
@@ -829,6 +965,11 @@ class DagExecutor:
         # counts select only the local rank's contiguous expert range.
         global_counts = torch.zeros_like(num_tokens_per_expert)
         local_start = state.ep_rank * num_local_experts
+        local_counts = _local_padded_expert_counts(
+            local_counts,
+            state.ep_degree,
+            num_local_experts,
+        )
         global_counts[local_start : local_start + num_local_experts] = (
             local_counts
         )
@@ -845,7 +986,7 @@ class DagExecutor:
                 tensor,
                 state.output_splits,
                 state.input_splits,
-                self.runtime.ep_group,
+                self.runtime.actor_group_routed_group,
             )
 
         # Reapply the forward source-major -> expert-major permutation. The
@@ -870,8 +1011,606 @@ class DagExecutor:
             tensor,
             state.input_splits,
             state.output_splits,
-            self.runtime.ep_group,
+            self.runtime.actor_group_routed_group,
         )
+
+    def _routed_cross_group_state(
+        self,
+        node: Any,
+    ) -> _RoutedCrossGroupState:
+        """Find or initialize the shared dispatch/combine layout state."""
+        meta = self._node_meta(node)
+        expert_fwd_uid = meta.get("expert_fwd_uid")
+        if not isinstance(expert_fwd_uid, str):
+            raise ValueError(
+                f"Routed node {getattr(node, 'uid', '<unknown>')} is missing "
+                "expert_fwd_uid"
+            )
+
+        state = self.routed_cross_group_states.get(expert_fwd_uid)
+        if state is not None:
+            return state
+
+        if meta.get("direction") != "incoming" or getattr(
+            node, "task_type", None
+        ) != TaskType.FWD_M_TO_N:
+            raise RuntimeError(
+                f"Routed node {getattr(node, 'uid', '<unknown>')} ran before "
+                f"forward M-to-N dispatch for expert {expert_fwd_uid}"
+            )
+
+        source_devices = tuple(sorted(int(d) for d in meta["source_devices"]))
+        destination_devices = tuple(
+            sorted(int(d) for d in meta["destination_devices"])
+        )
+        if not source_devices or not destination_devices:
+            raise ValueError(
+                f"Routed node {node.uid} requires non-empty source and "
+                "destination device sets"
+            )
+        if set(source_devices) & set(destination_devices):
+            raise ValueError(
+                f"Routed node {node.uid} requires disjoint groups, got "
+                f"source={source_devices}, destination={destination_devices}"
+            )
+        participants = tuple(sorted((*source_devices, *destination_devices)))
+        state = _RoutedCrossGroupState(
+            source_devices=source_devices,
+            destination_devices=destination_devices,
+            participants=participants,
+            layout_group=self.runtime.process_group_for_participants(
+                participants, channel="routed_layout"
+            ),
+            m_to_n_group=self.runtime.process_group_for_participants(
+                participants, channel="m_to_n"
+            ),
+            n_to_m_group=self.runtime.process_group_for_participants(
+                participants, channel="n_to_m"
+            ),
+        )
+        self.routed_cross_group_states[expert_fwd_uid] = state
+        return state
+
+    def _empty_routed_input(
+        self,
+        node: Any,
+        input_idx: int,
+        *,
+        leading_dim: int | None = None,
+    ) -> torch.Tensor:
+        """Allocate an actor-local placeholder from the expert input schema."""
+        bucket_key = self._node_meta(node).get("bucket_key")
+        if bucket_key is None:
+            raise ValueError(f"Routed node {node.uid} is missing bucket_key")
+        input_meta = self.stages.bucket(bucket_key).forward_input_meta
+        if input_idx < 0 or input_idx >= len(input_meta):
+            raise ValueError(
+                f"Routed node {node.uid} input index {input_idx} is outside "
+                f"the expert input schema of length {len(input_meta)}"
+            )
+        shape, dtype, _requires_grad = input_meta[input_idx]
+        shape = tuple(shape)
+        if leading_dim is not None:
+            if not shape:
+                raise ValueError(
+                    f"Routed input index {input_idx} for node {node.uid} is scalar"
+                )
+            shape = (leading_dim, *shape[1:])
+        return torch.empty(shape, dtype=dtype, device=self.runtime.device)
+
+    def _empty_routed_payload(
+        self,
+        node: Any,
+        state: _RoutedCrossGroupState,
+        tensor_idx: int,
+    ) -> torch.Tensor:
+        """Allocate a zero-token payload on either side of the boundary."""
+        if state.payload_shape is not None and state.payload_dtype is not None:
+            return torch.empty(
+                (0, *state.payload_shape[1:]),
+                dtype=state.payload_dtype,
+                device=self.runtime.device,
+            )
+        # The expert-side actor owns the destination bucket and can recover
+        # the schema locally before it has seen a payload.
+        return self._empty_routed_input(node, tensor_idx, leading_dim=0)
+
+    @staticmethod
+    def _require_routed_cross_group_layout(
+        state: _RoutedCrossGroupState,
+        *,
+        require_permutation: bool,
+    ) -> None:
+        if (
+            state.input_splits is None
+            or state.output_splits is None
+        ):
+            raise RuntimeError(
+                "M-to-N/N-to-M communication ran before forward dispatch "
+                "established its split layout"
+            )
+        if require_permutation and (
+            state.input_shape is None or state.permuted_indices is None
+        ):
+            raise RuntimeError(
+                "Expert-side M-to-N/N-to-M communication ran before forward "
+                "dispatch established its permutation layout"
+            )
+
+    def _initialize_routed_cross_group_layout(
+        self,
+        node: Any,
+        state: _RoutedCrossGroupState,
+        routing_counts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Exchange routing counts and derive this rank's union-A2A splits."""
+        meta = self._node_meta(node)
+        role = meta.get("role")
+        counts_idx = int(meta["routing_counts_idx"])
+        if role == "source":
+            if routing_counts is None:
+                raise ValueError(
+                    f"Forward M-to-N source {node.uid} is missing routing counts"
+                )
+            local_counts = routing_counts
+        elif role == "destination":
+            local_counts = self._empty_routed_input(node, counts_idx)
+            local_counts.zero_()
+        else:
+            raise ValueError(
+                f"Routed node {node.uid} has invalid role={role!r}"
+            )
+
+        if local_counts.ndim != 1:
+            raise ValueError(
+                "num_tokens_per_expert must be one-dimensional, got "
+                f"shape={tuple(local_counts.shape)}"
+            )
+        if torch.is_floating_point(local_counts) or torch.is_complex(local_counts):
+            raise TypeError(
+                "num_tokens_per_expert must use an integer dtype, got "
+                f"{local_counts.dtype}"
+            )
+        if bool(torch.any(local_counts < 0).item()):
+            raise ValueError("num_tokens_per_expert cannot contain negative counts")
+        num_experts = int(local_counts.shape[0])
+        destination_degree = len(state.destination_devices)
+        if num_experts % destination_degree:
+            raise ValueError(
+                f"num_experts={num_experts} must be divisible by routed "
+                f"destination degree={destination_degree}"
+            )
+        num_local_experts = num_experts // destination_degree
+
+        with torch.no_grad():
+            participant_index = {
+                rank: index for index, rank in enumerate(state.participants)
+            }
+            input_splits = [0] * len(state.participants)
+            output_splits = [0] * len(state.participants)
+            global_rank = self.runtime.global_rank
+            if global_rank in state.source_devices:
+                # Derive source-local send sizes before enqueuing the layout
+                # collective.  In particular, the scalar reads below must not
+                # accidentally synchronize behind that collective on a backend
+                # that launches NCCL work on the current stream.
+                for destination_index, rank in enumerate(state.destination_devices):
+                    start = destination_index * num_local_experts
+                    stop = start + num_local_experts
+                    input_splits[participant_index[rank]] = int(
+                        local_counts[start:stop].sum().item()
+                    )
+            elif global_rank not in state.destination_devices:
+                raise ValueError(
+                    f"Actor rank {global_rank} is not a participant in routed "
+                    f"boundary {state.participants}"
+                )
+
+            gathered_counts = torch.empty(
+                len(state.participants) * num_experts,
+                dtype=local_counts.dtype,
+                device=local_counts.device,
+            )
+            layout_work = dist.all_gather_into_tensor(
+                gathered_counts,
+                local_counts.contiguous(),
+                group=state.layout_group,
+                async_op=True,
+            )
+            grouped_counts: torch.Tensor | None = None
+            if global_rank in state.source_devices:
+                # Sources need only their local row to derive send splits. Keep
+                # the asynchronous gather alive without waiting so a later
+                # microbatch can be enqueued before the reverse routed transfer.
+                state.layout_work = layout_work
+                state.layout_output = gathered_counts
+            else:
+                # Destinations need every source row before they can derive
+                # receive splits and the source-major expert permutation.
+                layout_work.wait()
+                gathered_counts = gathered_counts.view(
+                    len(state.participants), num_experts
+                )
+                source_counts = torch.stack(
+                    [
+                        gathered_counts[participant_index[rank]]
+                        for rank in state.source_devices
+                    ]
+                )
+                destination_index = state.destination_devices.index(global_rank)
+                start = destination_index * num_local_experts
+                stop = start + num_local_experts
+                grouped_counts = source_counts[:, start:stop].contiguous().view(-1)
+                for source_index, rank in enumerate(state.source_devices):
+                    output_splits[participant_index[rank]] = int(
+                        source_counts[source_index, start:stop].sum().item()
+                    )
+            state.input_splits = input_splits
+            state.output_splits = output_splits
+
+        return local_counts, grouped_counts
+
+    def _routed_cross_group_boundary(
+        self,
+        node: Any,
+        tensor: torch.Tensor | None,
+        stream: torch.cuda.Stream,
+        *,
+        routing_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """Execute a disjoint-group routed transfer over the union group.
+
+        Every rank in both ActorGroups participates in one variable-split
+        all-to-all.  For M-to-N only dense ranks send and expert ranks receive;
+        N-to-M swaps those split vectors.  The operation is therefore not an
+        expert-parallel all-to-all even when the two group sizes are equal.
+        """
+        with torch.cuda.stream(stream):
+            meta = self._node_meta(node)
+            direction = meta.get("direction")
+            role = meta.get("role")
+            task_type = getattr(node, "task_type", None)
+            if direction not in {"incoming", "outgoing"}:
+                raise ValueError(
+                    f"Routed node {node.uid} has invalid direction={direction!r}"
+                )
+            if role not in {"source", "destination"}:
+                raise ValueError(
+                    f"Routed node {node.uid} has invalid role={role!r}"
+                )
+
+            state = self._routed_cross_group_state(node)
+            tensor_idx = int(meta["a2a_tensor_idx"])
+            if task_type == TaskType.FWD_M_TO_N:
+                local_counts, grouped_counts = (
+                    self._initialize_routed_cross_group_layout(
+                        node, state, routing_counts
+                    )
+                )
+            else:
+                self._require_routed_cross_group_layout(
+                    state,
+                    require_permutation=(
+                        (direction == "incoming" and role == "destination")
+                        or (direction == "outgoing" and role == "source")
+                    ),
+                )
+                grouped_counts = None
+
+            if direction == "incoming":
+                if role == "source":
+                    if tensor is None:
+                        raise ValueError(f"Routed source node {node.uid} has no tensor")
+                    if tensor.ndim != 2:
+                        raise ValueError(
+                            f"Routed source node {node.uid} payload must have "
+                            f"shape [tokens, hidden], got {tuple(tensor.shape)}"
+                        )
+                    if task_type == TaskType.FWD_M_TO_N:
+                        routed_tokens = int(local_counts.sum().item())
+                        if tensor.ndim < 1 or int(tensor.shape[0]) != routed_tokens:
+                            raise ValueError(
+                                f"Forward M-to-N source {node.uid} has payload "
+                                f"shape={tuple(tensor.shape)} but routing counts "
+                                f"sum to {routed_tokens} tokens"
+                            )
+                        state.payload_shape = tuple(tensor.shape)
+                        state.payload_dtype = tensor.dtype
+                    collective_input = tensor.contiguous()
+                else:
+                    collective_input = self._empty_routed_payload(
+                        node, state, tensor_idx
+                    )
+                collective_output = all_to_all_single_autograd(
+                    collective_input,
+                    state.output_splits,
+                    state.input_splits,
+                    state.m_to_n_group,
+                )
+                if role == "source":
+                    return None
+                if task_type == TaskType.FWD_M_TO_N:
+                    assert grouped_counts is not None
+                    num_local_experts = int(grouped_counts.numel()) // len(
+                        state.source_devices
+                    )
+                    (
+                        state.input_shape,
+                        collective_output,
+                        state.permuted_indices,
+                        source_major_padded_counts,
+                    ) = _permute(
+                        collective_output,
+                        grouped_counts,
+                        len(state.source_devices),
+                        num_local_experts,
+                    )
+                    # GroupedExperts consumes the aligned layout emitted by
+                    # _permute, so pass its padded counts rather than the raw
+                    # routing counts used to size the network transfer.
+                    local_counts = _local_padded_expert_counts(
+                        source_major_padded_counts,
+                        len(state.source_devices),
+                        num_local_experts,
+                    )
+                    global_counts = self._empty_routed_input(
+                        node, int(meta["routing_counts_idx"])
+                    )
+                    global_counts.zero_()
+                    destination_index = state.destination_devices.index(
+                        self.runtime.global_rank
+                    )
+                    start = destination_index * num_local_experts
+                    global_counts[start : start + num_local_experts] = local_counts
+                    return collective_output, global_counts
+
+                # Backward M-to-N carries the gradient of the forward combine.
+                collective_output = torch.vstack(
+                    (
+                        collective_output,
+                        collective_output.new_zeros((collective_output.shape[-1],)),
+                    )
+                )
+                return collective_output[state.permuted_indices, :]
+
+            # N-to-M is exactly the reverse of the saved dispatch layout.
+            if role == "source":
+                if tensor is None:
+                    raise ValueError(f"Routed source node {node.uid} has no tensor")
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"Routed source node {node.uid} payload must have "
+                        f"shape [tokens, hidden], got {tuple(tensor.shape)}"
+                    )
+                collective_input = _unpermute(
+                    tensor,
+                    state.input_shape,
+                    state.permuted_indices,
+                ).contiguous()
+            else:
+                collective_input = self._empty_routed_payload(
+                    node, state, tensor_idx
+                )
+            collective_output = all_to_all_single_autograd(
+                collective_input,
+                state.input_splits,
+                state.output_splits,
+                state.n_to_m_group,
+            )
+            return collective_output if role == "destination" else None
+
+    def _run_forward_routed_cross_group(
+        self,
+        node: Any,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        meta = self._node_meta(node)
+        role = meta["role"]
+        direction = meta["direction"]
+        tensor_idx = int(meta["a2a_tensor_idx"])
+        state = self._routed_cross_group_state(node)
+
+        tensor: torch.Tensor | None = None
+        routing_counts: torch.Tensor | None = None
+        if role == "source":
+            fwd_pred = next(
+                pred for pred in node.data_preds if pred.task_type == TaskType.FWD
+            )
+            fwd_buf = dict(self.buffers.task[fwd_pred.uid])
+            self.buffers.release(fwd_pred.uid)
+            detached_outs = list(fwd_buf["detached_outs"])
+            tensor = detached_outs[tensor_idx]
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Routed source node {node.uid} payload index {tensor_idx} "
+                    f"is {type(tensor).__name__}, not a Tensor"
+                )
+            if direction == "incoming":
+                counts_idx = int(meta["routing_counts_idx"])
+                routing_counts = detached_outs[counts_idx]
+                state.retained_forward_buffer = fwd_buf
+
+        result = self._routed_cross_group_boundary(
+            node,
+            tensor,
+            stream,
+            routing_counts=routing_counts,
+        )
+
+        if role == "destination":
+            if direction == "incoming":
+                if not isinstance(result, tuple):
+                    raise RuntimeError(
+                        f"Forward M-to-N destination {node.uid} did not return "
+                        "a routed tensor and local counts"
+                    )
+                routed_tensor, local_counts = result
+                inputs = [None] * int(meta["expert_input_arity"])
+                inputs[tensor_idx] = routed_tensor.requires_grad_(True)
+                inputs[int(meta["routing_counts_idx"])] = local_counts
+                self.buffers.task[node.uid] = {"detached_outs": inputs}
+            else:
+                if not isinstance(result, torch.Tensor):
+                    raise RuntimeError(
+                        f"Forward N-to-M destination {node.uid} did not return "
+                        "a routed tensor"
+                    )
+                retained = state.retained_forward_buffer
+                if retained is None:
+                    raise RuntimeError(
+                        f"Forward N-to-M destination {node.uid} has no retained "
+                        "dense-side buffer"
+                    )
+                output_arity = int(meta["expert_output_arity"])
+                detached_outs = list(retained["detached_outs"][:output_arity])
+                if len(detached_outs) != output_arity:
+                    raise RuntimeError(
+                        f"Forward N-to-M destination {node.uid} expected "
+                        f"{output_arity} retained outputs, got {len(detached_outs)}"
+                    )
+                detached_outs[tensor_idx] = result.requires_grad_(True)
+                retained["detached_outs"] = detached_outs
+                # A cross-Attention-stage combine is followed by an ordinary
+                # SEND/RECV relay.  The routed state owner has reconstructed
+                # the complete dense boundary here, so expose that patched
+                # boundary through the same buffer field used by generic P2P.
+                retained["send_output"] = tuple(detached_outs)
+                self.buffers.task[node.uid] = retained
+                state.retained_forward_buffer = None
+        elif result is not None:
+            raise RuntimeError(
+                f"Routed source node {node.uid} unexpectedly received a tensor"
+            )
+
+        event = torch.cuda.Event()
+        event.record(stream)
+        self.events.a2a[node.uid] = event
+
+    def _run_backward_routed_cross_group(
+        self,
+        node: Any,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        meta = self._node_meta(node)
+        role = meta["role"]
+        direction = meta["direction"]
+        tensor_idx = int(meta["a2a_tensor_idx"])
+        state = self._routed_cross_group_state(node)
+
+        tensor: torch.Tensor | None = None
+        if role == "source":
+            bwd_pred = next(
+                pred
+                for pred in node.data_preds
+                if pred.task_type in (TaskType.BWD, TaskType.BWD_I, TaskType.RECV)
+            )
+            bwd_buf = dict(self.buffers.task[bwd_pred.uid])
+            self.buffers.release(bwd_pred.uid)
+            inp_grads = list(bwd_buf["inp_grads"])
+            tensor = inp_grads[tensor_idx]
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError(
+                    f"Routed backward source {node.uid} has no tensor gradient "
+                    f"at index {tensor_idx}"
+                )
+            if direction == "incoming":
+                state.retained_backward_buffer = bwd_buf
+
+        result = self._routed_cross_group_boundary(node, tensor, stream)
+
+        if role == "destination":
+            if not isinstance(result, torch.Tensor):
+                raise RuntimeError(
+                    f"Routed backward destination {node.uid} did not receive "
+                    "a tensor gradient"
+                )
+            if direction == "incoming":
+                inp_grads = [None] * int(meta["expert_output_arity"])
+                inp_grads[tensor_idx] = result
+                self.buffers.task[node.uid] = {"inp_grads": inp_grads}
+            else:
+                retained = state.retained_backward_buffer
+                if retained is None:
+                    raise RuntimeError(
+                        f"Backward N-to-M destination {node.uid} has no retained "
+                        "dense-side gradient buffer"
+                    )
+                input_arity = int(meta["expert_input_arity"])
+                inp_grads = list(retained["inp_grads"][:input_arity])
+                if len(inp_grads) < input_arity:
+                    inp_grads.extend([None] * (input_arity - len(inp_grads)))
+                inp_grads[tensor_idx] = result
+                retained["inp_grads"] = inp_grads
+                self.buffers.task[node.uid] = retained
+                state.retained_backward_buffer = None
+        elif result is not None:
+            raise RuntimeError(
+                f"Routed backward source node {node.uid} unexpectedly received "
+                "a tensor"
+            )
+
+        event = torch.cuda.Event()
+        event.record(stream)
+        self.events.a2a[node.uid] = event
+
+    def _recv_backward_dense_relay(
+        self,
+        node: Any,
+        stream: torch.cuda.Stream,
+    ) -> dict[str, list[Any | None]]:
+        """Receive relay gradients and restore the dense boundary arity."""
+        meta = self._node_meta(node)
+        payload_arity = meta.get("payload_arity")
+        tensor_indices = meta.get("backward_tensor_indices")
+        shape_bucket_key = meta.get("shape_reference_bucket_key")
+        shape_fwd_uid = meta.get("shape_reference_fwd_uid")
+        if (
+            isinstance(payload_arity, bool)
+            or not isinstance(payload_arity, int)
+            or payload_arity < 0
+            or not isinstance(tensor_indices, list)
+            or not isinstance(shape_fwd_uid, str)
+            or shape_bucket_key is None
+        ):
+            raise ValueError(
+                f"Backward dense relay {node.uid} has invalid "
+                "payload/shape-reference metadata"
+            )
+        shape_key = ("shape_ref", shape_bucket_key, shape_fwd_uid)
+        shape_meta = self.buffers.task.get(shape_key)
+        if shape_meta is None:
+            raise RuntimeError(
+                f"Backward dense relay {node.uid} is missing shape reference "
+                f"{shape_key!r}"
+            )
+        if len(shape_meta) != len(tensor_indices):
+            raise RuntimeError(
+                f"Backward dense relay {node.uid} expected "
+                f"{len(tensor_indices)} gradient tensors from "
+                f"indices={tensor_indices}, but shape reference contains "
+                f"{len(shape_meta)} entries"
+            )
+        recv_tensors = self.communication.recv_bwd(
+            shape_meta,
+            node.peer_pp_rank,
+            stream=stream,
+            task=node,
+        )
+        inp_grads: list[Any | None] = [None] * payload_arity
+        for tensor_index, tensor in zip(tensor_indices, recv_tensors):
+            if (
+                isinstance(tensor_index, bool)
+                or not isinstance(tensor_index, int)
+                or tensor_index < 0
+                or tensor_index >= payload_arity
+            ):
+                raise ValueError(
+                    f"Backward dense relay {node.uid} has invalid gradient "
+                    f"tensor index={tensor_index!r} for "
+                    f"payload_arity={payload_arity}"
+                )
+            inp_grads[tensor_index] = tensor
+        return {"inp_grads": inp_grads}
 
     def prepare(
         self,
@@ -1060,7 +1799,12 @@ class DagExecutor:
                 case TaskType.SEND:
                     compute_node = node.data_preds[0]
                     send_data = self.buffers.task[compute_node.uid]["send_output"]
-                    self.communication.send(send_data, node.peer_pp_rank, stream=node_stream)
+                    self.communication.send(
+                        send_data,
+                        node.peer_pp_rank,
+                        stream=node_stream,
+                        task=node,
+                    )
                     send_buf = self.buffers.task.get(compute_node.uid)
                     if isinstance(send_buf, dict):
                         send_buf["send_output"] = None
@@ -1068,19 +1812,35 @@ class DagExecutor:
 
                 case TaskType.RECV:
                     compute_node = node.data_succs[0]
-                    if compute_node.task_type == TaskType.FWD:
+                    node_meta = self._node_meta(node)
+                    is_backward_dense_relay = (
+                        bool(node_meta.get("dense_relay"))
+                        and node_meta.get("direction") == "backward"
+                    )
+                    if is_backward_dense_relay:
+                        self.buffers.task[node.uid] = (
+                            self._recv_backward_dense_relay(node, node_stream)
+                        )
+                    elif compute_node.task_type == TaskType.FWD:
                         recv_ubid = self._node_bucket_key(compute_node)
                         recv_tensors = self.communication.recv_fwd(
-                            recv_ubid, node.peer_pp_rank, stream=node_stream
+                            recv_ubid,
+                            node.peer_pp_rank,
+                            stream=node_stream,
+                            task=node,
                         )
+                        self.buffers.task[node.uid] = recv_tensors
                     else:
                         fwd_uid = compute_node.node_meta.get("fwd_uid")
                         fwd_key = (compute_node.node_meta.get("bucket_key"), fwd_uid)
                         shape_meta = self.buffers.task[("shape_ref",) + fwd_key]
                         recv_tensors = self.communication.recv_bwd(
-                            shape_meta, node.peer_pp_rank, stream=node_stream
+                            shape_meta,
+                            node.peer_pp_rank,
+                            stream=node_stream,
+                            task=node,
                         )
-                    self.buffers.task[node.uid] = recv_tensors
+                        self.buffers.task[node.uid] = recv_tensors
                     recv_evt = torch.cuda.Event()
                     recv_evt.record(node_stream)
                     self.events.recv[node.uid] = recv_evt
@@ -1152,6 +1912,12 @@ class DagExecutor:
                     a2a_evt.record(node_stream)
                     self.events.a2a[node.uid] = a2a_evt
 
+                case TaskType.FWD_M_TO_N | TaskType.FWD_N_TO_M:
+                    self._run_forward_routed_cross_group(node, node_stream)
+
+                case TaskType.BWD_M_TO_N | TaskType.BWD_N_TO_M:
+                    self._run_backward_routed_cross_group(node, node_stream)
+
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
                     ar_ubids = self._sync_payload_ubids(node)
@@ -1199,14 +1965,29 @@ class DagExecutor:
                         self.events.recv.pop(recv_pred.uid)
 
                     a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
+                        (
+                            p
+                            for p in node.data_preds
+                            if p.task_type
+                            in (
+                                TaskType.FWD_A2A,
+                                TaskType.FWD_M_TO_N,
+                                TaskType.FWD_N_TO_M,
+                            )
+                        ),
+                        None,
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
                         self.events.a2a.pop(a2a_pred.uid)
 
                     fwd_data_pred = next(
                         (p for p in node.data_preds
-                         if p.task_type in (TaskType.FWD, TaskType.FWD_A2A)), None
+                         if p.task_type in (
+                             TaskType.FWD,
+                             TaskType.FWD_A2A,
+                             TaskType.FWD_M_TO_N,
+                             TaskType.FWD_N_TO_M,
+                         )), None
                     )
                     if fwd_data_pred is not None:
                         input_tensors = self.buffers.task[fwd_data_pred.uid]["detached_outs"]

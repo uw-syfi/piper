@@ -62,6 +62,10 @@ _COLLECTIVE_KINDS = frozenset(
         "ALL_REDUCE_COMM",
         "ALL_GATHER_COMM",
         "REDUCE_SCATTER_COMM",
+        # Cross-ActorGroup routed transfers are implemented as one collective
+        # rendezvous over the union of unequal source/destination groups.
+        "M_TO_N_COMM",
+        "N_TO_M_COMM",
     }
 )
 # Piper's ragged A2A node is implemented as independently tagged peer sends
@@ -438,6 +442,13 @@ def _explicit_ranks_by_pp(
     if raw is None:
         raw = topology.get("pp_rank_members")
     if raw is None:
+        raw_actor_groups = topology.get("actor_groups")
+        if raw_actor_groups is not None:
+            raw = [
+                group.get("devices") if isinstance(group, Mapping) else group
+                for group in raw_actor_groups
+            ]
+    if raw is None:
         return None
     if isinstance(raw, Mapping):
         groups = [raw.get(i, raw.get(str(i))) for i in range(num_pp_dags)]
@@ -455,11 +466,9 @@ def _build_rank_layout(
     topology: Mapping[str, Any],
     *,
     pp_degree: int | None,
-    dp_degree: int | None,
     profile_mode: str,
 ) -> _RankLayout:
     topology_pp = _mapping_int(topology, "pp_degree")
-    topology_dp = _mapping_int(topology, "dp_degree")
     topology_world = _mapping_int(topology, "world_size")
     pp_degree = int(pp_degree if pp_degree is not None else topology_pp or len(dags))
     if pp_degree != len(dags):
@@ -470,6 +479,19 @@ def _build_rank_layout(
     explicit = _explicit_ranks_by_pp(topology, len(dags))
     device_layouts = tuple(_dag_device_ranks(dag) for dag in dags)
     if explicit is not None:
+        mismatches = [
+            (index, explicit[index], device_ranks)
+            for index, device_ranks in enumerate(device_layouts)
+            if device_ranks is not None and explicit[index] != device_ranks
+        ]
+        if mismatches:
+            raise SimulationValidationError(
+                "DAG device sets do not match explicit ActorGroups: "
+                + ", ".join(
+                    f"group {index}: topology={expected!r}, DAG={actual!r}"
+                    for index, expected, actual in mismatches
+                )
+            )
         ranks_by_pp = explicit
     elif all(ranks is not None for ranks in device_layouts):
         ranks_by_pp = tuple(ranks for ranks in device_layouts if ranks is not None)
@@ -478,49 +500,17 @@ def _build_rank_layout(
         if all(profile_layouts):
             ranks_by_pp = profile_layouts
         else:
-            inferred_dp = dp_degree if dp_degree is not None else topology_dp
-            if inferred_dp is None and topology_world is not None:
-                if topology_world % pp_degree:
-                    raise SimulationValidationError(
-                        f"world_size={topology_world} is not divisible by pp_degree={pp_degree}"
-                    )
-                inferred_dp = topology_world // pp_degree
-            if inferred_dp is None:
-                inferred_dp = 1
-            ranks_by_pp = tuple(
-                tuple(pp_index + lane * pp_degree for lane in range(int(inferred_dp)))
-                for pp_index in range(pp_degree)
-            )
+            # Bare DAG input without placement or profile metadata represents
+            # one actor per local DAG.  Replicated/sharded execution must make
+            # its ActorGroups explicit; a rectangular world size is not enough
+            # to recover schedule-defined group membership.
+            ranks_by_pp = tuple((pp_index,) for pp_index in range(pp_degree))
 
     lengths = {len(ranks) for ranks in ranks_by_pp}
-    if len(lengths) != 1 or not lengths or next(iter(lengths)) <= 0:
+    if not lengths or 0 in lengths:
         raise SimulationValidationError(
-            f"all PP rank groups must have the same non-zero size, got {ranks_by_pp!r}"
+            f"all ActorGroup rank lists must be non-empty, got {ranks_by_pp!r}"
         )
-    layout_dp = next(iter(lengths))
-    requested_dp = dp_degree if dp_degree is not None else topology_dp
-    if requested_dp is not None and int(requested_dp) != layout_dp:
-        raise SimulationValidationError(
-            f"dp_degree={requested_dp} does not match rank-group size {layout_dp}"
-        )
-
-    # Piper's runtime maps (pp_rank, dp_rank) to
-    # ``pp_rank + dp_rank * pp_degree``.  Device lists are otherwise just
-    # integers in schedule JSON, so validate that they encode the same mapping.
-    # A caller that intentionally uses another mapping must make it explicit
-    # with topology.ranks_by_pp instead of relying on device-list inference.
-    if explicit is None and (topology_pp is not None or topology_dp is not None):
-        expected_ranks_by_pp = tuple(
-            tuple(pp_index + lane * pp_degree for lane in range(layout_dp))
-            for pp_index in range(pp_degree)
-        )
-        if ranks_by_pp != expected_ranks_by_pp:
-            raise SimulationValidationError(
-                "DAG device sets do not match Piper global-rank arithmetic: "
-                f"actual={ranks_by_pp!r}, expected={expected_ranks_by_pp!r}; "
-                "provide topology.ranks_by_pp for an explicit custom mapping"
-            )
-
     flat = [rank for ranks in ranks_by_pp for rank in ranks]
     if len(flat) != len(set(flat)):
         raise SimulationValidationError(f"global ranks occur in multiple PP groups: {ranks_by_pp!r}")
@@ -808,7 +798,6 @@ def simulate_training_step(
     plan_or_dags: Any,
     *,
     pp_degree: int | None = None,
-    dp_degree: int | None = None,
     prologue_profile_times: Mapping[int, Any] | None = None,
     profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE,
     sample_iteration_id: int | None = None,
@@ -820,7 +809,6 @@ def simulate_training_step(
         plan_or_dags: A ``ProfiledTrainingPlan`` (or compatible object) or a
             sequence of finalized per-PP ``TrainingDAG`` objects.
         pp_degree: Optional physical pipeline degree for bare DAG input.
-        dp_degree: Optional number of rank replicas per per-PP DAG.
         prologue_profile_times: Optional rank-keyed profiles for gradient-buffer
             initialization.  DAG-local profiles are merged with this mapping.
         strict: Reject surplus rank profiles and incomplete prologue profile
@@ -851,7 +839,6 @@ def simulate_training_step(
         dags,
         topology,
         pp_degree=pp_degree,
-        dp_degree=dp_degree,
         profile_mode=profile_mode,
     )
     warnings: list[str] = []

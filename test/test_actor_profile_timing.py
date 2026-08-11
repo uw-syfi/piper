@@ -113,6 +113,54 @@ def test_actor_normal_run_uses_execution_prepared_during_setup() -> None:
     assert "stream_override" not in captured
 
 
+def test_pytorch_profiler_warms_up_before_recording(monkeypatch) -> None:
+    class _FakeProfiler:
+        def __init__(self) -> None:
+            self.entered = False
+            self.steps = 0
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def step(self) -> None:
+            self.steps += 1
+
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor.runtime = SimpleNamespace(
+        torch_profiler=None,
+        pytorch_profiler_enabled=False,
+        global_rank=0,
+    )
+    actor.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+    profiler = _FakeProfiler()
+    captured_kwargs = {}
+
+    def _profile(**kwargs):
+        captured_kwargs.update(kwargs)
+        return profiler
+
+    monkeypatch.setattr(actor_module.torch.profiler, "profile", _profile)
+
+    actor.start_pytorch_profiler(warmup_iters=2)
+
+    schedule = captured_kwargs["schedule"]
+    action = actor_module.torch.profiler.ProfilerAction
+    assert [schedule(step) for step in range(4)] == [
+        action.WARMUP,
+        action.WARMUP,
+        action.RECORD_AND_SAVE,
+        action.NONE,
+    ]
+    assert profiler.entered
+    assert actor.runtime.pytorch_profiler_enabled
+
+    actor.step_pytorch_profiler()
+    actor.step_pytorch_profiler()
+    assert profiler.steps == 2
+
+
 def test_actor_result_keeps_normal_duration_and_offset_samples_paired(
     monkeypatch,
 ) -> None:
@@ -131,7 +179,7 @@ def test_actor_result_keeps_normal_duration_and_offset_samples_paired(
     )
     actor.dag = dag
     actor.runtime = SimpleNamespace(
-        device="cuda:0", global_rank=0, dp_rank=0, pp_rank=0
+        device="cuda:0", global_rank=0, pp_rank=0
     )
     actor._profile_node_samples = {"normal": {"node": [7.0, 8.0]}}
     actor._profile_node_start_offsets = {

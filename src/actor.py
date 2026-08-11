@@ -149,30 +149,51 @@ def _disable_functorch_donated_buffers() -> None:
     config.donated_buffer = False
 
 
-def _get_rank(pp_rank, dp_rank, pp_degree):
-    return pp_rank + dp_rank * pp_degree
-
-
 def _create_actors(
-    num_actors,
+    actor_groups: tuple[tuple[int, ...], ...],
     optim_class,
     profile=False,
     no_nvtx: bool = False,
     pg=None,
     temp_dir: str = None,
     use_inductor: bool = False,
-    pp_outer: bool = False,
     model_seed: int = DEFAULT_MODEL_SEED,
 ):
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
-    world_size = int(os.environ["PIPER_WORLD_SIZE"])
-    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
-    pp_degree = int(os.environ["PIPER_PP_DEGREE"])
-
     from .state import piper_metadata
 
-    for pp_rank in range(num_actors):
-        global_rank = _get_rank(pp_rank, dp_rank, pp_degree)
+    actor_groups = tuple(
+        tuple(sorted(int(global_rank) for global_rank in group))
+        for group in actor_groups
+    )
+    if not actor_groups or any(not group for group in actor_groups):
+        raise ValueError(f"actor_groups must contain non-empty groups, got {actor_groups}")
+    global_ranks = [rank for group in actor_groups for rank in group]
+    if len(global_ranks) != len(set(global_ranks)):
+        raise ValueError(
+            "each global rank must belong to exactly one ActorGroup, got "
+            f"{actor_groups}"
+        )
+    world_size = len(global_ranks)
+    if sorted(global_ranks) != list(range(world_size)):
+        raise ValueError(
+            f"ActorGroups must cover global ranks [0, {world_size}), got "
+            f"{sorted(global_ranks)}"
+        )
+    pp_degree = len(actor_groups)
+    actor_specs = [
+        (group_id, global_rank, local_rank, group, actor_groups)
+        for group_id, group in enumerate(actor_groups)
+        for local_rank, global_rank in enumerate(group)
+    ]
+
+    piper_metadata.actors = {}
+    for (
+        pp_rank,
+        global_rank,
+        local_rank,
+        actor_group_devices,
+        all_actor_groups,
+    ) in actor_specs:
         nsight_env = {"nsight": {
             "t": "cuda,cudnn,cublas,nvtx",
             "sample": "process-tree",
@@ -218,9 +239,9 @@ def _create_actors(
         ray_pg = getattr(pg, "placement_group", pg)
         placement_plan = getattr(pg, "plan", None)
         bundle_index = (
-            placement_plan.actor_bundle_index(pp_rank, dp_rank)
+            placement_plan.actor_global_rank_bundle_index(global_rank)
             if placement_plan is not None
-            else (pp_rank if pp_outer else dp_rank)
+            else global_rank
         )
         actor = PiperActor.options(
             num_gpus=0.6,
@@ -233,14 +254,17 @@ def _create_actors(
             pp_rank,
             optim_class,
             world_size,
-            dp_rank=dp_rank,
-            dp_degree=dp_degree,
+            global_rank=global_rank,
             pp_degree=pp_degree,
             no_nvtx=no_nvtx,
             use_inductor=use_inductor,
             model_seed=model_seed,
+            actor_group_id=pp_rank,
+            actor_group_local_rank=local_rank,
+            actor_group_devices=actor_group_devices,
+            actor_groups=all_actor_groups,
         )
-        piper_metadata.actors[pp_rank] = actor
+        piper_metadata.actors[global_rank] = actor
 
 
 @ray.remote
@@ -250,12 +274,15 @@ class PiperActor:
         pp_rank,
         optim_class,
         world_size,
-        dp_rank=0,
-        dp_degree=1,
+        global_rank: int,
         pp_degree=1,
         no_nvtx: bool = False,
         use_inductor: bool = False,
         model_seed: int = DEFAULT_MODEL_SEED,
+        actor_group_id: int = 0,
+        actor_group_local_rank: int = 0,
+        actor_group_devices: tuple[int, ...] = (),
+        actor_groups: tuple[tuple[int, ...], ...] = (),
     ):
         self.logger = create_logger("actor", LOG_LEVEL)
 
@@ -270,12 +297,15 @@ class PiperActor:
         if self.use_inductor:
             _disable_functorch_donated_buffers()
         self.runtime = RuntimeState(
+            global_rank=global_rank,
             pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            dp_degree=dp_degree,
             pp_degree=pp_degree,
             world_size=world_size,
             no_nvtx=no_nvtx,
+            actor_group_id=actor_group_id,
+            actor_group_local_rank=actor_group_local_rank,
+            actor_group_devices=tuple(actor_group_devices),
+            actor_groups=tuple(tuple(group) for group in actor_groups),
         )
 
         self.logger.debug(
@@ -348,35 +378,54 @@ class PiperActor:
     def _nvtx_pop(self) -> None:
         self.runtime.nvtx_pop()
 
-    def start_pytorch_profiler(self) -> None:
-        """Begin a torch.profiler session spanning the next run_dag iterations.
+    def start_pytorch_profiler(self, warmup_iters: int = 0) -> None:
+        """Begin a torch.profiler session spanning warmup and one active iteration.
 
         Each node's execution in DagExecutor is wrapped in a record_function
         labelled the same as its NVTX range, so the resulting trace identifies
         per-node work.
         """
-        self.runtime.torch_profiler = torch.profiler.profile(
-            activities=[
+        if warmup_iters < 0:
+            raise ValueError("PyTorch profiler warmup iterations cannot be negative")
+        if self.runtime.torch_profiler is not None:
+            raise RuntimeError("PyTorch profiler is already running")
+
+        profile_kwargs = {
+            "activities": [
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-        )
+        }
+        if warmup_iters:
+            profile_kwargs["schedule"] = torch.profiler.schedule(
+                wait=0,
+                warmup=warmup_iters,
+                active=1,
+                repeat=1,
+            )
+        self.runtime.torch_profiler = torch.profiler.profile(**profile_kwargs)
         self.runtime.torch_profiler.__enter__()
         self.runtime.pytorch_profiler_enabled = True
-        self.logger.debug(f"Actor {self.runtime.global_rank}: PyTorch profiler started")
+        self.logger.debug(
+            f"Actor {self.runtime.global_rank}: PyTorch profiler started with "
+            f"{warmup_iters} warmup iterations"
+        )
+
+    def step_pytorch_profiler(self) -> None:
+        """Finish one profiler warmup iteration and advance its schedule."""
+        if self.runtime.torch_profiler is None:
+            raise RuntimeError("PyTorch profiler is not running")
+        self.runtime.torch_profiler.step()
 
     def stop_pytorch_profiler(self, profile_dir: str) -> str:
         """End the profiler session and export a chrome trace.
 
-        The file is named ``dp{dp_rank}_pp{pp_rank}.json`` inside *profile_dir*
-        so the harness can group same-dp-rank actors. Returns the written path.
+        The file is named by its authoritative global actor rank.
         """
         self.runtime.pytorch_profiler_enabled = False
         self.runtime.torch_profiler.__exit__(None, None, None)
         os.makedirs(profile_dir, exist_ok=True)
-        filepath = os.path.join(
-            profile_dir, f"dp{self.runtime.dp_rank}_pp{self.runtime.pp_rank}.json"
-        )
+        filepath = os.path.join(profile_dir, f"rank{self.runtime.global_rank}.json")
         self.runtime.torch_profiler.export_chrome_trace(filepath)
         self.runtime.torch_profiler = None
         self.logger.info(
@@ -404,11 +453,12 @@ class PiperActor:
         """Return this actor's current eager-compatible parameter state.
 
         ZeRO-3 parameters are reconstructed collectively from the shards held
-        by the same PP rank in every DP replica. All DP workers must therefore
-        invoke this method in the same bucket order.
+        by one ActorGroup. Every group member enters each all-gather in the same
+        bucket order, while only local rank zero returns the reconstructed state.
         """
         self.params.drain_pending_frees()
         torch.cuda.synchronize()
+        representative = self.runtime.is_actor_group_representative
         state: dict[str, torch.Tensor] = {}
         stream = self.runtime.default_stream()
 
@@ -417,6 +467,13 @@ class PiperActor:
         ):
             name_by_arg_idx = dict(zip(bucket.param_idxs, bucket.param_names))
             if ubid in self.stages.param_sharded_ubids:
+                group_size = self.runtime.actor_group_size
+                sync_group = self.runtime.actor_group_sync_group
+                if group_size > 1 and sync_group is None:
+                    raise RuntimeError(
+                        f"cannot export sharded parameters for bucket {ubid}: "
+                        "ActorGroup synchronization communicator is missing"
+                    )
                 shard_param = bucket.shard_param
                 shard_info = bucket.param_shard_info
                 if shard_param is None or shard_info is None:
@@ -426,15 +483,17 @@ class PiperActor:
                     )
                 _shard_start, shard_size, orig_numel = shard_info
                 gathered = torch.empty(
-                    shard_size * self.runtime.dp_degree,
+                    shard_size * group_size,
                     dtype=shard_param.dtype,
                     device=shard_param.device,
                 )
                 with torch.cuda.stream(stream):
                     dist.all_gather_into_tensor(
-                        gathered, shard_param, group=self.runtime.dp_group
+                        gathered, shard_param, group=sync_group
                     )
                 stream.synchronize()
+                if not representative:
+                    continue
                 for arg_idx, (_param, offset, numel, shape) in zip(
                     bucket.trainable_param_idxs, bucket.param_view_specs
                 ):
@@ -449,6 +508,8 @@ class PiperActor:
                     )
                 continue
 
+            if not representative:
+                continue
             for arg_idx in bucket.trainable_param_idxs:
                 value = bucket.forward_args[arg_idx]
                 if value is None:
@@ -497,7 +558,7 @@ class PiperActor:
         self.runtime.device = f"cuda:{self.runtime.global_rank % torch.cuda.device_count()}"
         torch.cuda.set_device(self.runtime.device)
 
-        if self.runtime.pp_degree > 1 or self.runtime.dp_degree > 1:
+        if self.runtime.world_size > 1:
             timeout_minutes = float(
                 os.environ.get("PIPER_PROCESS_GROUP_TIMEOUT_MINUTES", "10")
             )
@@ -515,57 +576,59 @@ class PiperActor:
                 timeout=self._process_group_timeout,
             )
 
-            if self.runtime.dp_degree > 1:
-                self._join_dp_process_group()
-            if self.runtime.pp_degree > 1:
-                self._join_pp_process_group()
+            self._join_actor_group_process_groups()
 
             self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
-    def _join_dp_process_group(self):
-        num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
-        for dp_group_id in range(num_dp_groups):
-            group_ranks = [
-                (dp_group_id + num_dp_groups * i) for i in range(self.runtime.dp_degree)
-            ]
-            # Two separate NCCL communicators over the same ranks: one for allreduce,
-            # one for all2all.  Sharing a communicator causes both op types to run on
-            # the same internal NCCL proxy stream, which prevents true overlap.
+    def _join_actor_group_process_groups(self):
+        """Create deterministic communicators for AFD ActorGroups.
+
+        The DAG is not loaded yet when distributed initialization runs, so the
+        schedule topology is the source of truth. Create one communicator for
+        every within-group participant set, three routed communicators for every
+        pairwise group union, and two P2P communicators for each aligned rank
+        pair of equal-width groups. Lowering can then request exact participants
+        and a traffic channel. All global ranks call ``new_group`` in the same
+        deterministic order.
+        """
+        actor_groups = tuple(
+            tuple(sorted(int(rank) for rank in group))
+            for group in self.runtime.actor_groups
+        )
+        # Metadata exchange and opposite AF directions may execute concurrently.
+        # Give layout, M-to-N, and N-to-M independent NCCL communicators so their
+        # collective sequence numbers cannot conflict even though the participant
+        # set is equal.
+        for participants, channel in self.runtime.process_group_creation_specs():
             process_group = dist.new_group(
-                ranks=group_ranks,
+                ranks=list(participants),
                 backend="nccl",
                 timeout=self._process_group_timeout,
             )
-            ep_process_group = dist.new_group(
-                ranks=group_ranks,
-                backend="nccl",
-                timeout=self._process_group_timeout,
-            )
-            if self.runtime.global_rank % num_dp_groups == dp_group_id:
-                self.runtime.dp_group = process_group
-                self.runtime.ep_group = ep_process_group
+            if self.runtime.global_rank in participants:
+                key = (
+                    participants
+                    if channel is None
+                    else (participants, channel)
+                )
+                self.runtime.process_groups_by_participants[key] = process_group
 
-    def _join_pp_process_group(self):
-        num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
-
-        for pp_group_id in range(num_pp_groups):
-            group_ranks = [
-                (pp_group_id * self.runtime.pp_degree + i) for i in range(self.runtime.pp_degree)
-            ]
-            lo_hi_group = dist.new_group(
-                ranks=group_ranks,
-                backend="nccl",
-                timeout=self._process_group_timeout,
-            )
-            hi_lo_group = dist.new_group(
-                ranks=group_ranks,
-                backend="nccl",
-                timeout=self._process_group_timeout,
+        own_group = tuple(sorted(self.runtime.actor_group_devices))
+        if own_group:
+            self.runtime.actor_group_routed_group = (
+                self.runtime.process_group_for_participants(own_group)
             )
 
-            if self.runtime.global_rank in group_ranks:
-                self.runtime.pp_lo_hi = lo_hi_group
-                self.runtime.pp_hi_lo = hi_lo_group
+        # Replicated dense weights and routed expert traffic use distinct NCCL
+        # communicators so reductions and activation collectives can overlap.
+        for participants in sorted(actor_groups):
+            sync_group = dist.new_group(
+                ranks=list(participants),
+                backend="nccl",
+                timeout=self._process_group_timeout,
+            )
+            if self.runtime.global_rank in participants:
+                self.runtime.actor_group_sync_group = sync_group
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
@@ -819,12 +882,17 @@ class PiperActor:
             ]
             bucket.trainable_param_idxs = trainable_idxs
 
-            zero_managed = (
-                self.runtime.dp_degree > 1
-                and apply_zero
+            zero_requested = (
+                apply_zero
                 and bool(trainable_idxs)
                 and ubid in self.stages.zero_managed_ubids
             )
+            if zero_requested:
+                self.runtime.validate_actor_group_metadata(
+                    context=f"load ZeRO bucket {ubid!r}"
+                )
+            actor_group_size = self.runtime.actor_group_size
+            zero_managed = zero_requested and actor_group_size > 1
             params_sharded = ubid in self.stages.param_sharded_ubids
             grads_sharded = ubid in self.stages.grad_sharded_ubids
 
@@ -833,9 +901,10 @@ class PiperActor:
                 flat_params = torch.cat([p.detach().view(-1) for p in trainable]).contiguous()
                 flat_params.requires_grad_(False)
                 orig_numel = flat_params.numel()
-                dp = self.runtime.dp_degree
-                shard_size = (orig_numel + dp - 1) // dp
-                padded_numel = shard_size * dp
+                shard_size = (
+                    orig_numel + actor_group_size - 1
+                ) // actor_group_size
+                padded_numel = shard_size * actor_group_size
                 if padded_numel > orig_numel:
                     padded = flat_params.new_zeros(padded_numel)
                     padded[:orig_numel].copy_(flat_params)
@@ -852,7 +921,7 @@ class PiperActor:
                     view_specs.append((realized[idx], offset, numel, tuple(p.shape)))
                     offset += numel
 
-                shard_start = self.runtime.dp_rank * shard_size
+                shard_start = self.runtime.actor_group_local_rank * shard_size
                 if params_sharded:
                     shard_param = flat_params[shard_start:shard_start + shard_size].detach().clone()
                 else:
@@ -921,6 +990,16 @@ class PiperActor:
         # Clear any prior module state before loading a new training DAG.
         self.stages.clear_loaded_modules()
         self.dag_executor.expert_a2a_states.clear()
+        self.dag_executor.routed_cross_group_states.clear()
+
+        routed_expert_fwd_uids = {
+            meta["expert_fwd_uid"]
+            for dag_node in training_dag.nodes.values()
+            for meta in [getattr(dag_node, "node_meta", {}) or {}]
+            if getattr(dag_node, "node_kind", None)
+            in {"A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"}
+            and isinstance(meta.get("expert_fwd_uid"), str)
+        }
 
         stage_to_modules: dict[int, list[dict]] = defaultdict(list)
 
@@ -979,7 +1058,10 @@ class PiperActor:
                 "ac_num_subgraphs": 1,
                 "ac_requested_subgraphs": 1,
                 "apply_zero": bool(meta.get("apply_zero", True)),
-                "is_expert": "EP" in getattr(node, "tag", {}),
+                # Routed/expert identity comes from the communication
+                # contract inserted by `shard`, never from a tag spelling.
+                "is_expert": getattr(node, "uid", None)
+                in routed_expert_fwd_uids,
                 "training_dag_uid": getattr(node, "uid", None),
                 "triton_constant_args": dict(meta.get("triton_constant_args", {})),
             }
@@ -1278,6 +1360,11 @@ class PiperActor:
                 )
             if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
                 isolation_scope = "normal_directional_p2p"
+            elif getattr(node, "node_kind", None) in {
+                "M_TO_N_COMM",
+                "N_TO_M_COMM",
+            }:
+                isolation_scope = "normal_directional_routed"
             elif mode == "interference_free":
                 isolation_scope = DEFAULT_ISOLATION_SCOPE
             else:
@@ -1308,7 +1395,6 @@ class PiperActor:
             profile_mode=mode,
             graph_fingerprint=finalized_dag_fingerprint(self.dag),
             global_rank=self.runtime.global_rank,
-            dp_rank=self.runtime.dp_rank,
             pp_rank=self.runtime.pp_rank,
             device_metadata={
                 "name": props.name,

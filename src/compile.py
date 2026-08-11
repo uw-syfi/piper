@@ -1,7 +1,6 @@
 import ray
 import torch
 import copy
-import os
 import time
 from pathlib import Path
 
@@ -20,79 +19,16 @@ from .schedule import (
 )
 logger = create_logger("compile", LOG_LEVEL)
 
-_RANK0_ADDR_ACTOR = "piper_rank0_addr"
 _COMPILED_DATA_ACTOR = "piper_compiled_data"
 
 @ray.remote
-class _Rank0AddrStore:
-    """Named actor used to share global rank-0's IP+port across independent dp_rank workers."""
-    def __init__(self, addr: str, port: int):
-        self._addr = addr
-        self._port = port
-    def get(self):
-        return self._addr, self._port
-
-
-@ray.remote
 class _CompiledDataStore:
-    """Named actor used to share compiled training-DAG data from dp_rank=0 to dp_rank>0."""
-    def __init__(self):
-        self._training_dag_data = None
-        self._training_dag_ready = False
-        self._profile_generation = 0
-        self._profile_shards = {}
-
-    def publish_training_dag_data(self, data: dict):
-        self._training_dag_data = data
-        self._training_dag_ready = True
-
-    def is_ready(self) -> bool:
-        return self._training_dag_ready
-
-    def is_training_dag_ready(self) -> bool:
-        return self._training_dag_ready
-
-    def get(self) -> dict:
-        if not self.is_ready():
-            return None
-        return dict(self._training_dag_data)
-
-    def get_training_dag_data(self) -> dict:
-        return self._training_dag_data
+    """Coordinator-owned monotonic clock used to align actor profiles."""
 
     def monotonic_time_ns(self) -> int:
         """Return the coordinator's monotonic clock for actor calibration."""
 
         return time.monotonic_ns()
-
-    def begin_profile_generation(self) -> int:
-        """Start a fresh distributed profile collection and return its id."""
-        self._profile_generation += 1
-        self._profile_shards = {}
-        return self._profile_generation
-
-    def current_profile_generation(self) -> int:
-        return self._profile_generation
-
-    def publish_profile_shard(self, generation: int, dp_rank: int, shard) -> None:
-        if generation != self._profile_generation:
-            raise ValueError(
-                f"stale profile generation {generation}; current={self._profile_generation}"
-            )
-        self._profile_shards[int(dp_rank)] = shard
-
-    def profile_shards_ready(self, generation: int, dp_degree: int) -> bool:
-        return (
-            generation == self._profile_generation
-            and len(self._profile_shards) == int(dp_degree)
-        )
-
-    def get_profile_shards(self, generation: int) -> dict:
-        if generation != self._profile_generation:
-            raise ValueError(
-                f"stale profile generation {generation}; current={self._profile_generation}"
-            )
-        return dict(self._profile_shards)
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -123,16 +59,83 @@ def _prepare_training_dags_for_rpc(per_pp_training_dags: list) -> list:
     return rpc_dags
 
 
-def _compute_loss_pp_ranks(per_pp_training_dags: list) -> list[int]:
-    ranks: list[int] = []
-    for pp_rank, dag in enumerate(per_pp_training_dags):
-        if any(
-            isinstance(getattr(node, "node_meta", None), dict)
-            and bool(node.node_meta.get("compute_loss", False))
-            for node in dag.nodes.values()
-        ):
-            ranks.append(pp_rank)
-    return ranks
+def _dag_device_key(dag) -> tuple[int, ...]:
+    keys = {
+        tuple(sorted(int(rank) for rank in node.device))
+        for node in dag.nodes.values()
+        if getattr(node, "device", None) is not None
+    }
+    if len(keys) != 1:
+        raise ValueError(
+            "Each local ActorGroup DAG must have exactly one place.devices set; "
+            f"got {sorted(keys)}"
+        )
+    return next(iter(keys))
+
+
+def _actor_group_dags_by_id(per_group_training_dags: list, schedule_info: dict) -> dict[int, object]:
+    """Match local DAGs to schedule ActorGroups by exact device set."""
+    group_id_by_devices = {
+        tuple(group["devices"]): int(group["id"])
+        for group in schedule_info.get("actor_groups", [])
+    }
+    result = {}
+    for dag in per_group_training_dags:
+        device_key = _dag_device_key(dag)
+        try:
+            group_id = group_id_by_devices[device_key]
+        except KeyError as exc:
+            raise ValueError(
+                f"Local DAG placement {device_key} does not match a schedule ActorGroup; "
+                f"known={sorted(group_id_by_devices)}"
+            ) from exc
+        if group_id in result:
+            raise ValueError(
+                f"ActorGroup {group_id} produced multiple disconnected local DAGs; "
+                "add schedule order edges to connect its chunks"
+            )
+        result[group_id] = dag
+    expected = set(group_id_by_devices.values())
+    if set(result) != expected:
+        raise ValueError(
+            "Local DAGs do not cover every schedule ActorGroup; "
+            f"missing={sorted(expected - set(result))}"
+        )
+    return result
+
+
+def _load_training_dags_on_actors(per_group_training_dags: list, schedule_info: dict) -> None:
+    """Load one local DAG onto every actor in its schedule-defined group."""
+    actor_groups = schedule_info.get("actor_groups", [])
+    dag_by_group = _actor_group_dags_by_id(per_group_training_dags, schedule_info)
+    ray.get([
+        piper_metadata.actors[int(global_rank)].load_training_dag.remote(
+            dag_by_group[int(group["id"])]
+        )
+        for group in actor_groups
+        for global_rank in group["devices"]
+    ])
+
+
+def _input_actor_group_id(dag_by_group: dict[int, object]) -> int:
+    """Find the group owning the first traced forward segment."""
+    candidates = []
+    for group_id, dag in dag_by_group.items():
+        for node in dag.nodes.values():
+            if node.node_kind != "COMPUTE" or node.compute_subkind != "FWD":
+                continue
+            meta = node.node_meta if isinstance(node.node_meta, dict) else {}
+            candidates.append(
+                (
+                    int(meta.get("stage_id", 1 << 30)),
+                    int(meta.get("segment_id", 1 << 30)),
+                    str(node.uid),
+                    int(group_id),
+                )
+            )
+    if not candidates:
+        raise ValueError("ActorGroup DAGs contain no forward compute node")
+    return min(candidates)[-1]
 
 
 def _resolve_model_constructor_value(value, schedule_info: dict):
@@ -181,8 +184,8 @@ def piper_setup(
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
         schedule_directives_file: JSON schedule description consumed by the
-            TrainingDAG backend. When provided, Piper derives pp/dp/mbs
-            schedule metadata internally.
+            TrainingDAG backend. Piper derives its ActorGroups and microbatch
+            metadata from this file.
         model_seed: Shared seed used to initialize every lifted model parameter
             deterministically by its eager ``state_dict`` name.
     """
@@ -210,75 +213,46 @@ def piper_setup(
     piper_metadata.training_dag = None
     piper_metadata.per_pp_training_dags = None
     piper_metadata.compiled_data_store = None
-    piper_metadata.profile_generation = 0
     piper_metadata.profiled_training_plan = None
 
-    pp_degree = int(schedule_info["pp_degree"])
-
-    # All dp_ranks must agree on a single master_addr: the IP of the actor with
-    # global_rank=0 (pp_rank=0, dp_rank=0).  dp_rank=0 publishes it via a named
-    # Ray actor; other dp_ranks wait until it's available.
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
+    actor_groups = tuple(
+        tuple(int(rank) for rank in group["devices"])
+        for group in schedule_info["actor_groups"]
+    )
+    pp_degree = len(actor_groups)
     _create_actors(
-        pp_degree, optim_fn,
+        actor_groups,
+        optim_fn,
         profile=nsight,
-        no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
+        no_nvtx=no_nvtx,
+        pg=pg,
+        temp_dir=temp_dir,
         use_inductor=use_inductor,
-        pp_outer=pp_outer,
         model_seed=model_seed,
     )
 
-    if dp_rank == 0:
-        # Create the compiled-data store early so dp_rank>0 can poll for it.
-        piper_metadata.compiled_data_store = _CompiledDataStore.options(
-            name=_COMPILED_DATA_ACTOR,
-            lifetime="detached",
-            num_cpus=0,
-            get_if_exists=True,
-        ).remote()
-        ray.get(piper_metadata.compiled_data_store.is_ready.remote())
+    piper_metadata.compiled_data_store = _CompiledDataStore.options(
+        name=_COMPILED_DATA_ACTOR,
+        lifetime="detached",
+        num_cpus=0,
+        get_if_exists=True,
+    ).remote()
 
-        # Get IP and a free port from actor 0's node — it will be the TCPStore server.
-        master_addr, master_port = ray.get(piper_metadata.actors[0].get_node_ip_and_free_port.remote())
-        addr_store = _Rank0AddrStore.options(
-            name=_RANK0_ADDR_ACTOR,
-            lifetime="detached",
-            num_cpus=0,
-        ).remote(master_addr, master_port)
-        ray.get(addr_store.get.remote())
-    else:
-        master_addr = master_port = None
-        deadline = time.monotonic() + 600
-        while master_addr is None:
-            try:
-                store = ray.get_actor(_RANK0_ADDR_ACTOR)
-                master_addr, master_port = ray.get(store.get.remote())
-            except ValueError:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for Ray actor {_RANK0_ADDR_ACTOR}"
-                    )
-                time.sleep(0.05)
-            except Exception:
-                logger.exception("Failed while waiting for Ray actor %s", _RANK0_ADDR_ACTOR)
-                raise
-
-    logger.debug(f"DP rank {dp_rank}: Master address for process groups: {master_addr}:{master_port}")
-
-    ray.get([actor._join_process_groups.remote(master_addr, master_port) for actor in piper_metadata.actors.values()])
-
-    if dp_rank == 0:
-        try:
-            ray.kill(ray.get_actor(_RANK0_ADDR_ACTOR))
-        except ValueError:
-            logger.debug("Ray actor %s already absent during cleanup", _RANK0_ADDR_ACTOR)
-        except Exception:
-            logger.exception("Failed to clean up Ray actor %s", _RANK0_ADDR_ACTOR)
-            raise
+    # The sole program driver controls every actor, so it can obtain the
+    # process-group rendezvous endpoint directly from global rank zero.
+    master_addr, master_port = ray.get(
+        piper_metadata.actors[0].get_node_ip_and_free_port.remote()
+    )
+    logger.debug(
+        "Actor process-group master address: %s:%s", master_addr, master_port
+    )
+    ray.get([
+        actor._join_process_groups.remote(master_addr, master_port)
+        for actor in piper_metadata.actors.values()
+    ])
 
     # Push non-trainable constant tensor attributes (e.g. freqs_cis, rope_cache, mask)
     # to all actors so _load_stage can initialize them correctly instead of zero-filling.
-    # Must happen on every dp_rank since each dp_rank owns its own actors.
     _const_attrs = {
         k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
         for k, v in (const_attrs or {}).items()
@@ -289,95 +263,84 @@ def piper_setup(
             for actor in piper_metadata.actors.values()
         ])
 
-    if dp_rank == 0:
-        # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---
-
-        # Build the model directly on meta device.
-        resolved_model_args = _resolve_model_constructor_value(model_args, piper_metadata.schedule_info)
-        resolved_model_kwargs = _resolve_model_constructor_value(model_kwargs, piper_metadata.schedule_info)
-        with torch.device("meta"):
-            model = model_class(*tuple(resolved_model_args or ()), **dict(resolved_model_kwargs or {}))
-            if model_dtype is not None:
-                model = model.to(model_dtype)
-
-        num_params = sum(p.numel() for p in model.parameters())
-        if model_dtype == torch.bfloat16:
-            param_size_gb = num_params * 2 / (1024**3)
-        elif model_dtype == torch.float32:
-            param_size_gb = num_params * 4 / (1024**3)
-        else:
-            raise ValueError(f"Unsupported model dtype: {model_dtype}")
-        logger.info(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_gb:.2f} GB), dtype: {model_dtype}")
-
-        compiled = torch.compile(model, backend=piper, fullgraph=True)
-        compile_inputs = [x.to(device="meta") for x in example_inputs]
-        _reset_annotation_state()
-        _ = compiled(*compile_inputs)
-
-        per_pp_training_dags = getattr(piper_metadata, "per_pp_training_dags", None)
-        if not per_pp_training_dags:
-            raise RuntimeError(
-                "piper backend did not produce per_pp_training_dags; backend transition incomplete"
-            )
-        if len(per_pp_training_dags) != pp_degree:
-            raise RuntimeError(
-                f"Expected {pp_degree} per-PP DAGs, got {len(per_pp_training_dags)}"
-            )
-        per_pp_training_dags_rpc = _prepare_training_dags_for_rpc(per_pp_training_dags)
-        piper_metadata.per_pp_training_dags = per_pp_training_dags_rpc
-
-        ray.get([
-            piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
-            for pp_rank, pp_dag in enumerate(per_pp_training_dags_rpc)
-        ])
-        ray.get(
-            piper_metadata.compiled_data_store.publish_training_dag_data.remote(
-                {"per_pp_training_dags": per_pp_training_dags_rpc}
-            )
+    # Build and compile once, then distribute each local DAG to every member
+    # of the exact ActorGroup selected by its place directive.
+    resolved_model_args = _resolve_model_constructor_value(
+        model_args, piper_metadata.schedule_info
+    )
+    resolved_model_kwargs = _resolve_model_constructor_value(
+        model_kwargs, piper_metadata.schedule_info
+    )
+    with torch.device("meta"):
+        model = model_class(
+            *tuple(resolved_model_args or ()),
+            **dict(resolved_model_kwargs or {}),
         )
+        if model_dtype is not None:
+            model = model.to(model_dtype)
 
+    num_params = sum(p.numel() for p in model.parameters())
+    if model_dtype == torch.bfloat16:
+        param_size_gb = num_params * 2 / (1024**3)
+    elif model_dtype == torch.float32:
+        param_size_gb = num_params * 4 / (1024**3)
     else:
-        logger.debug(f"DP rank {dp_rank} waiting for dp_rank=0 training-DAG data...")
-        training_dag_data = None
-        deadline = time.monotonic() + 600
-        while training_dag_data is None:
-            try:
-                store = ray.get_actor(_COMPILED_DATA_ACTOR)
-                piper_metadata.compiled_data_store = store
-                if ray.get(store.is_training_dag_ready.remote()):
-                    training_dag_data = ray.get(store.get_training_dag_data.remote())
-            except ValueError:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for Ray actor {_COMPILED_DATA_ACTOR}"
-                    )
-            except Exception:
-                logger.exception("Failed while waiting for Ray actor %s", _COMPILED_DATA_ACTOR)
-                raise
-            if training_dag_data is None:
-                time.sleep(0.2)
+        raise ValueError(f"Unsupported model dtype: {model_dtype}")
+    logger.info(
+        "Model size: %.0f M parameters (%.2f GB), dtype: %s",
+        num_params / 1e6,
+        param_size_gb,
+        model_dtype,
+    )
 
-        per_pp_training_dags = training_dag_data["per_pp_training_dags"]
-        if len(per_pp_training_dags) != pp_degree:
-            raise RuntimeError(
-                f"Expected {pp_degree} per-PP DAGs from dp_rank=0, got {len(per_pp_training_dags)}"
-            )
-        piper_metadata.per_pp_training_dags = per_pp_training_dags
+    compiled = torch.compile(model, backend=piper, fullgraph=True)
+    compile_inputs = [x.to(device="meta") for x in example_inputs]
+    _reset_annotation_state()
+    _ = compiled(*compile_inputs)
 
-        ray.get([
-            piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
-            for pp_rank, pp_dag in enumerate(per_pp_training_dags)
-        ])
-
-    loss_pp_ranks = _compute_loss_pp_ranks(per_pp_training_dags)
-    if not loss_pp_ranks:
-        loss_pp_ranks = [pp_degree - 1]
-        logger.warning(
-            "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
-            loss_pp_ranks[0],
+    local_training_dags = getattr(piper_metadata, "per_pp_training_dags", None)
+    if not local_training_dags:
+        raise RuntimeError(
+            "piper backend did not produce per_pp_training_dags; "
+            "backend transition incomplete"
         )
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    if len(local_training_dags) != pp_degree:
+        raise RuntimeError(
+            f"Expected {pp_degree} ActorGroup DAGs, got {len(local_training_dags)}"
+        )
+    dag_by_group = _actor_group_dags_by_id(local_training_dags, schedule_info)
+    ordered_training_dags = [
+        dag_by_group[group_id] for group_id in range(pp_degree)
+    ]
+    training_dags_rpc = _prepare_training_dags_for_rpc(ordered_training_dags)
+    piper_metadata.per_pp_training_dags = training_dags_rpc
+    _load_training_dags_on_actors(training_dags_rpc, schedule_info)
+
+    dag_by_group = _actor_group_dags_by_id(training_dags_rpc, schedule_info)
+    input_group_id = _input_actor_group_id(dag_by_group)
+    input_group = schedule_info["actor_groups"][input_group_id]
+    piper_metadata.schedule_info["input_actor_group_id"] = input_group_id
+    piper_metadata.schedule_info["input_actor_group_size"] = len(
+        input_group["devices"]
+    )
     ray.get([
-        piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
-        for pp_rank in loss_pp_ranks
+        piper_metadata.actors[int(global_rank)].load_input.remote(example_inputs)
+        for global_rank in input_group["devices"]
+    ])
+    loss_group_ids = {
+        group_id
+        for group_id, dag in dag_by_group.items()
+        if any(
+            isinstance(getattr(node, "node_meta", None), dict)
+            and bool(node.node_meta.get("compute_loss", False))
+            for node in dag.nodes.values()
+        )
+    }
+    if not loss_group_ids:
+        raise ValueError("ActorGroup DAGs contain no compute_loss node")
+    ray.get([
+        piper_metadata.actors[int(global_rank)].load_labels.remote(example_outputs)
+        for group in schedule_info["actor_groups"]
+        if int(group["id"]) in loss_group_ids
+        for global_rank in group["devices"]
     ])

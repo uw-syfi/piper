@@ -1,0 +1,233 @@
+from pathlib import Path
+
+import pytest
+import torch
+import torch.nn as nn
+
+from examples.build_schedule import (
+    build_afpipe_baseline_schedule,
+    infer_afpipe_num_layers,
+)
+from examples.models.qwen3 import AFDQwen3Model, create_qwen3_config
+from src.dag import TrainingDAG, build_training_dag
+from src.directives import _validate_schedule_tags_exist, apply_schedule_directives
+from src.fx import split_gm_by_annotations
+from src.ordering import resolve_total_order_per_stream
+from src.piper import (
+    _reset_annotation_state,
+    _split_global_training_dag_by_pp_rank,
+    _validate_dense_relay_sequences,
+    _validate_p2p_sequences,
+    _validate_routed_collective_sequences,
+)
+from src.schedule import load_schedule_directives
+from src.zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
+
+
+_BASE_SCHEDULES = Path(__file__).parents[1] / "examples" / "base-schedules"
+_ROUTED_KINDS = {"M_TO_N_COMM", "N_TO_M_COMM"}
+
+
+class _ToyExperts(nn.Module):
+    def forward(
+        self,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = num_tokens_per_expert.sum().to(routed_input.dtype) * 0 + 1
+        return routed_input * scale
+
+
+def _trace_afd_segments(num_stages: int):
+    captured = {}
+
+    def backend(gm, example_inputs):
+        del example_inputs
+        captured["gm"] = gm
+        return gm.forward
+
+    torch._dynamo.reset()
+    _reset_annotation_state()
+    with torch.device("meta"):
+        config = create_qwen3_config("9M")
+        model = AFDQwen3Model(config, num_stages=num_stages).to(torch.bfloat16)
+        for layer in model.layers.values():
+            layer.moe.experts = _ToyExperts()
+        tokens = torch.zeros((1, 8), dtype=torch.int64, device="meta")
+        output = torch.compile(model, backend=backend, fullgraph=True)(tokens)
+
+    assert tuple(output.shape) == (1, 8, config.vocab_size)
+    _top_level, segments = split_gm_by_annotations(captured["gm"])
+    return segments
+
+
+def _full_afd_schedule(base_name: str, *, actor_groups: int) -> list[dict]:
+    base = load_schedule_directives(str(_BASE_SCHEDULES / base_name))
+    n_layers = infer_afpipe_num_layers(base, fallback=4)
+    return [
+        *base,
+        {
+            "op": "split",
+            "filter": {},
+            "dim_name": "MB",
+            "num_microbatches": 2,
+        },
+        *build_afpipe_baseline_schedule(
+            base,
+            n_mbs=2,
+            n_layers=n_layers,
+            expected_actor_groups=actor_groups,
+        ),
+    ]
+
+
+def _lower_afd_schedule(base_name: str, *, actor_groups: int) -> tuple[TrainingDAG, list[TrainingDAG]]:
+    directives = _full_afd_schedule(base_name, actor_groups=actor_groups)
+    segments = _trace_afd_segments(num_stages=actor_groups)
+    global_dag = build_training_dag(segments)
+    _validate_schedule_tags_exist(global_dag, directives)
+    apply_schedule_directives(global_dag, directives)
+
+    # This intentionally exercises the default path: order edges must connect
+    # repeated local A/F chunks, without placement-based component merging.
+    local_dags = _split_global_training_dag_by_pp_rank(global_dag)
+    for local_dag in local_dags:
+        zero_chains = _prune_zero_lifetime_metadata(local_dag)
+        resolve_total_order_per_stream(local_dag)
+        _add_inter_chain_temporal_edges(local_dag, zero_chains)
+    _validate_routed_collective_sequences(local_dags)
+    _validate_dense_relay_sequences(local_dags)
+    _validate_p2p_sequences(local_dags)
+    return global_dag, local_dags
+
+
+def _device_key(dag: TrainingDAG) -> tuple[int, ...]:
+    keys = {
+        tuple(sorted(int(device) for device in node.device))
+        for node in dag.nodes.values()
+        if node.device is not None
+    }
+    assert len(keys) == 1
+    return next(iter(keys))
+
+
+def _assert_connected(dag: TrainingDAG) -> None:
+    assert dag.nodes
+    first_uid = next(iter(dag.nodes))
+    visited = {first_uid}
+    pending = [first_uid]
+    while pending:
+        uid = pending.pop()
+        neighbors = dag.preds.get(uid, set()) | dag.succs.get(uid, set())
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                pending.append(neighbor)
+    assert visited == set(dag.nodes)
+
+
+@pytest.mark.parametrize(
+    (
+        "base_name",
+        "actor_groups",
+        "expected_devices",
+        "dense_degree",
+        "routed_degree",
+    ),
+    [
+        (
+            "afd_placement_pp2.json",
+            2,
+            [(0, 2, 4, 5), (1, 3)],
+            4,
+            2,
+        ),
+        (
+            "afd_placement_pp4.json",
+            4,
+            [(0, 4, 8, 10), (1, 5), (2, 6, 9, 11), (3, 7)],
+            4,
+            2,
+        ),
+        (
+            "afd_e2e_pp2.json",
+            2,
+            [(0, 1), (2,)],
+            2,
+            1,
+        ),
+        (
+            "afd_e2e_pp4.json",
+            4,
+            [(0, 1), (2,), (3, 4), (5,)],
+            2,
+            1,
+        ),
+    ],
+)
+def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
+    base_name: str,
+    actor_groups: int,
+    expected_devices: list[tuple[int, ...]],
+    dense_degree: int,
+    routed_degree: int,
+) -> None:
+    global_dag, local_dags = _lower_afd_schedule(
+        base_name,
+        actor_groups=actor_groups,
+    )
+
+    assert len(local_dags) == actor_groups
+    assert [_device_key(dag) for dag in local_dags] == expected_devices
+    for dag in local_dags:
+        _assert_connected(dag)
+
+    routed = [
+        node for node in global_dag.nodes.values() if node.node_kind in _ROUTED_KINDS
+    ]
+    # Four layers x two routed boundaries x two passes x two microbatches,
+    # represented by one local node on each side of every collective.
+    assert len(routed) == 64
+    assert sum(node.node_kind == "M_TO_N_COMM" for node in routed) == 32
+    assert sum(node.node_kind == "N_TO_M_COMM" for node in routed) == 32
+    assert not any(
+        node.node_kind == "A2A_COMM" for node in global_dag.nodes.values()
+    )
+    p2p_nodes = [
+        node
+        for node in global_dag.nodes.values()
+        if node.node_kind in {"SEND_COMM", "RECV_COMM"}
+    ]
+    assert all(node.node_meta.get("dense_relay") for node in p2p_nodes)
+    assert len(p2p_nodes) == (0 if actor_groups == 2 else 32)
+
+    by_comm_id: dict[str, list] = {}
+    for node in routed:
+        by_comm_id.setdefault(node.node_meta["comm_id"], []).append(node)
+        source = node.node_meta["source_devices"]
+        destination = node.node_meta["destination_devices"]
+        if node.node_kind == "M_TO_N_COMM":
+            assert len(source) == dense_degree
+            assert len(destination) == routed_degree
+        else:
+            assert len(source) == routed_degree
+            assert len(destination) == dense_degree
+
+    assert len(by_comm_id) == 32
+    assert all(
+        {node.node_meta["role"] for node in pair} == {"source", "destination"}
+        for pair in by_comm_id.values()
+    )
+
+    expected_local_routed = 32 if actor_groups == 2 else 16
+    for dag in local_dags:
+        local_routed = [
+            node for node in dag.nodes.values() if node.node_kind in _ROUTED_KINDS
+        ]
+        assert len(local_routed) == expected_local_routed
+        assert sum(node.node_kind == "M_TO_N_COMM" for node in local_routed) == (
+            expected_local_routed // 2
+        )
+        assert sum(node.node_kind == "N_TO_M_COMM" for node in local_routed) == (
+            expected_local_routed // 2
+        )

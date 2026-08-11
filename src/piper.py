@@ -1,5 +1,4 @@
 import time
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Iterator, Mapping, Sequence
@@ -77,18 +76,30 @@ def _reset_annotation_state() -> None:
 
 
 @contextmanager
-def annotate(name: str) -> Iterator[dict[str, int]]:
+def annotate(name: str, *, index: int | None = None) -> Iterator[dict[str, int]]:
     """Annotate traced model code with a Piper schedule tag.
 
-    Piper assigns the integer index for each tag name automatically in the
-    order annotation scopes are entered during tracing.
+    Piper normally assigns the integer index for each tag name automatically
+    in the order annotation scopes are entered during tracing.  ``index`` may
+    be supplied when two distinct Python scopes are fragments of the same
+    logical schedule region.  Each scope still receives a unique ``uid`` so
+    FX splitting can preserve its lexical boundaries.
     """
     if not isinstance(name, str) or not name:
         raise ValueError(f"piper.annotate requires a non-empty string tag name, got {name!r}")
+    if index is not None and (
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+    ):
+        raise ValueError(
+            "piper.annotate index must be a non-negative int or None, "
+            f"got {index!r}"
+        )
 
     global _ANNOTATION_UID
-    index = _ANNOTATION_COUNTS.get(name, 0)
-    _ANNOTATION_COUNTS[name] = index + 1
+    next_index = _ANNOTATION_COUNTS.get(name, 0)
+    if index is None:
+        index = next_index
+    _ANNOTATION_COUNTS[name] = max(next_index, index + 1)
     uid = _ANNOTATION_UID
     _ANNOTATION_UID += 1
 
@@ -239,6 +250,959 @@ def _split_global_training_dag_by_pp_rank(
     return subdags
 
 
+_ROUTED_CROSS_GROUP_KINDS = frozenset({"M_TO_N_COMM", "N_TO_M_COMM"})
+
+
+def _validate_routed_collective_sequences(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    """Reject actor-local routed-collective orders that would mismatch NCCL.
+
+    Cross-group communication is represented by one local node on each side
+    of a collective.  Nodes with the same actor-group pair, physical
+    direction, and routed node kind share one communicator channel.  NCCL
+    requires both sides to enter collectives on that channel in exactly the
+    same order, so compare the actor execution orders after all split/order and
+    per-stream ordering transforms have run.
+
+    M-to-N and N-to-M intentionally use distinct channels.  Their sequences
+    are therefore validated independently and may interleave differently.
+    """
+
+    def dag_device_key(dag: TrainingDAG) -> tuple[int, ...]:
+        keys = {
+            tuple(sorted(int(device) for device in node.device))
+            for node in dag.nodes.values()
+            if node.device is not None
+        }
+        if len(keys) != 1:
+            raise ValueError(
+                "routed collective validation requires one device set per "
+                f"actor DAG, got {sorted(keys)}"
+            )
+        return next(iter(keys))
+
+    # channel -> role -> (local actor-group devices, ordered comm ids)
+    channel_sequences: dict[
+        tuple[
+            tuple[tuple[int, ...], tuple[int, ...]],
+            str,
+            str,
+        ],
+        dict[str, tuple[tuple[int, ...], list[str]]],
+    ] = {}
+    transactions: dict[
+        str,
+        list[
+            tuple[
+                tuple[
+                    tuple[tuple[int, ...], tuple[int, ...]],
+                    str,
+                    str,
+                ],
+                str,
+                str,
+                TrainingDAGNode,
+            ]
+        ],
+    ] = {}
+    microbatches_by_expert_fwd_uid: dict[str, set[int]] = {}
+
+    for dag in actor_group_dags:
+        local_devices = dag_device_key(dag)
+        ordered_uids = _serial_topological_order(dag)
+        local_by_channel: dict[
+            tuple[
+                tuple[tuple[int, ...], tuple[int, ...]],
+                str,
+                str,
+            ],
+            tuple[str, list[str]],
+        ] = {}
+        for uid in ordered_uids:
+            node = dag.nodes[uid]
+            if node.node_kind not in _ROUTED_CROSS_GROUP_KINDS:
+                continue
+            meta = node.node_meta
+            role = meta.get("role")
+            if role not in {"source", "destination"}:
+                raise ValueError(
+                    f"routed collective node {uid} has invalid role={role!r}"
+                )
+            direction = meta.get("direction")
+            expected_direction = (
+                "incoming" if node.node_kind == "M_TO_N_COMM" else "outgoing"
+            )
+            if direction != expected_direction:
+                raise ValueError(
+                    f"routed collective node {uid} kind={node.node_kind} must "
+                    f"have direction={expected_direction!r}, got {direction!r}"
+                )
+            try:
+                source_devices = tuple(
+                    sorted(int(device) for device in meta["source_devices"])
+                )
+                destination_devices = tuple(
+                    sorted(int(device) for device in meta["destination_devices"])
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"routed collective node {uid} has invalid source/destination "
+                    "device metadata"
+                ) from error
+            if not source_devices or not destination_devices:
+                raise ValueError(
+                    f"routed collective node {uid} requires non-empty source "
+                    "and destination device sets"
+                )
+            if set(source_devices) & set(destination_devices):
+                raise ValueError(
+                    f"routed collective node {uid} requires disjoint groups, got "
+                    f"source={source_devices}, destination={destination_devices}"
+                )
+            expected_local_devices = (
+                source_devices if role == "source" else destination_devices
+            )
+            if local_devices != expected_local_devices:
+                raise ValueError(
+                    f"routed collective node {uid} role={role} is in actor DAG "
+                    f"devices={local_devices}, expected {expected_local_devices}"
+                )
+            participants = tuple(
+                sorted(int(device) for device in meta.get("participants", ()))
+            )
+            expected_participants = tuple(
+                sorted((*source_devices, *destination_devices))
+            )
+            if participants != expected_participants:
+                raise ValueError(
+                    f"routed collective node {uid} has participants={participants}, "
+                    f"expected {expected_participants}"
+                )
+            comm_id = meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"routed collective node {uid} has invalid comm_id={comm_id!r}"
+                )
+            expert_fwd_uid = meta.get("expert_fwd_uid")
+            if not isinstance(expert_fwd_uid, str) or not expert_fwd_uid:
+                raise ValueError(
+                    f"routed collective node {uid} has invalid "
+                    f"expert_fwd_uid={expert_fwd_uid!r}"
+                )
+            for arity_name in ("expert_input_arity", "expert_output_arity"):
+                arity = meta.get(arity_name)
+                if (
+                    isinstance(arity, bool)
+                    or not isinstance(arity, int)
+                    or arity < 0
+                ):
+                    raise ValueError(
+                        f"routed collective node {uid} has invalid "
+                        f"{arity_name}={arity!r}"
+                    )
+            tensor_idx = meta.get("a2a_tensor_idx")
+            if (
+                isinstance(tensor_idx, bool)
+                or not isinstance(tensor_idx, int)
+                or tensor_idx < 0
+            ):
+                raise ValueError(
+                    f"routed collective node {uid} has invalid "
+                    f"a2a_tensor_idx={tensor_idx!r}"
+                )
+            is_forward = node.tag.get("PASS") == "F"
+            uses_expert_inputs = (
+                node.node_kind == "M_TO_N_COMM" and is_forward
+            ) or (
+                node.node_kind == "N_TO_M_COMM" and not is_forward
+            )
+            tensor_arity_name = (
+                "expert_input_arity"
+                if uses_expert_inputs
+                else "expert_output_arity"
+            )
+            tensor_arity = meta[tensor_arity_name]
+            if tensor_idx >= tensor_arity:
+                raise ValueError(
+                    f"routed collective node {uid} has a2a_tensor_idx="
+                    f"{tensor_idx}, outside {tensor_arity_name}={tensor_arity}"
+                )
+            if meta.get("bucket_key") is None:
+                raise ValueError(
+                    f"routed collective node {uid} is missing bucket_key"
+                )
+            if meta.get("comm_group_kind") != "routed_cross_group":
+                raise ValueError(
+                    f"routed collective node {uid} has invalid comm_group_kind="
+                    f"{meta.get('comm_group_kind')!r}"
+                )
+            if meta.get("source_degree") != len(source_devices):
+                raise ValueError(
+                    f"routed collective node {uid} has source_degree="
+                    f"{meta.get('source_degree')!r}, expected {len(source_devices)}"
+                )
+            if meta.get("destination_degree") != len(destination_devices):
+                raise ValueError(
+                    f"routed collective node {uid} has destination_degree="
+                    f"{meta.get('destination_degree')!r}, expected "
+                    f"{len(destination_devices)}"
+                )
+            if node.node_kind == "M_TO_N_COMM" and node.tag.get("PASS") == "F":
+                counts_idx = meta.get("routing_counts_idx")
+                if (
+                    isinstance(counts_idx, bool)
+                    or not isinstance(counts_idx, int)
+                    or counts_idx < 0
+                ):
+                    raise ValueError(
+                        f"forward M_TO_N node {uid} has invalid "
+                        f"routing_counts_idx={counts_idx!r}"
+                    )
+                if counts_idx >= meta["expert_input_arity"]:
+                    raise ValueError(
+                        f"forward M_TO_N node {uid} has routing_counts_idx="
+                        f"{counts_idx}, outside expert_input_arity="
+                        f"{meta['expert_input_arity']}"
+                    )
+                if counts_idx == tensor_idx:
+                    raise ValueError(
+                        f"forward M_TO_N node {uid} must use distinct routed "
+                        f"payload/count indices, both are {tensor_idx}"
+                    )
+            microbatch = node.tag.get("MB")
+            if isinstance(microbatch, int) and not isinstance(microbatch, bool):
+                microbatches_by_expert_fwd_uid.setdefault(
+                    expert_fwd_uid, set()
+                ).add(microbatch)
+
+            actor_pair = tuple(sorted((source_devices, destination_devices)))
+            channel = (actor_pair, node.node_kind, direction)
+            transactions.setdefault(comm_id, []).append(
+                (channel, role, uid, node)
+            )
+            previous = local_by_channel.get(channel)
+            if previous is None:
+                local_by_channel[channel] = (role, [comm_id])
+            else:
+                previous_role, sequence = previous
+                if previous_role != role:
+                    raise ValueError(
+                        f"actor DAG devices={local_devices} appears as both roles "
+                        f"on routed channel {channel}"
+                    )
+                sequence.append(comm_id)
+
+        for channel, (role, sequence) in local_by_channel.items():
+            roles = channel_sequences.setdefault(channel, {})
+            if role in roles:
+                previous_devices, _previous_sequence = roles[role]
+                raise ValueError(
+                    f"routed channel {channel} has multiple {role} actor DAGs: "
+                    f"{previous_devices} and {local_devices}"
+                )
+            roles[role] = (local_devices, sequence)
+
+    for expert_fwd_uid, microbatches in microbatches_by_expert_fwd_uid.items():
+        if len(microbatches) > 1:
+            raise ValueError(
+                f"routed expert state key {expert_fwd_uid!r} is reused across "
+                f"microbatches={sorted(microbatches)}"
+            )
+
+    shared_meta_fields = (
+        "source_devices",
+        "destination_devices",
+        "source_degree",
+        "destination_degree",
+        "participants",
+        "expert_fwd_uid",
+        "expert_input_arity",
+        "expert_output_arity",
+        "a2a_tensor_idx",
+        "routing_counts_idx",
+        "bucket_key",
+        "comm_group_kind",
+        "direction",
+    )
+    for comm_id, endpoints in transactions.items():
+        if len(endpoints) != 2 or {endpoint[1] for endpoint in endpoints} != {
+            "source",
+            "destination",
+        }:
+            raise ValueError(
+                f"routed transaction {comm_id!r} requires exactly one source "
+                f"and destination endpoint, got "
+                f"{[(role, uid) for _channel, role, uid, _node in endpoints]}"
+            )
+        source = next(endpoint for endpoint in endpoints if endpoint[1] == "source")
+        destination = next(
+            endpoint for endpoint in endpoints if endpoint[1] == "destination"
+        )
+        if source[0] != destination[0]:
+            raise ValueError(
+                f"routed transaction {comm_id!r} endpoints disagree on channel: "
+                f"source={source[0]}, destination={destination[0]}"
+            )
+        source_node = source[3]
+        destination_node = destination[3]
+        for field in shared_meta_fields:
+            if source_node.node_meta.get(field) != destination_node.node_meta.get(field):
+                raise ValueError(
+                    f"routed transaction {comm_id!r} endpoints disagree on "
+                    f"{field}: source={source_node.node_meta.get(field)!r}, "
+                    f"destination={destination_node.node_meta.get(field)!r}"
+                )
+        for tag_name in ("PASS", "MB"):
+            if source_node.tag.get(tag_name) != destination_node.tag.get(tag_name):
+                raise ValueError(
+                    f"routed transaction {comm_id!r} endpoints disagree on "
+                    f"{tag_name}: source={source_node.tag.get(tag_name)!r}, "
+                    f"destination={destination_node.tag.get(tag_name)!r}"
+                )
+
+    for channel, roles in channel_sequences.items():
+        if set(roles) != {"source", "destination"}:
+            raise ValueError(
+                f"routed channel {channel} requires source and destination actor "
+                f"DAGs, got roles={sorted(roles)}"
+            )
+        source_devices, source_sequence = roles["source"]
+        destination_devices, destination_sequence = roles["destination"]
+        if source_sequence != destination_sequence:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (source_id, destination_id) in enumerate(
+                        zip(source_sequence, destination_sequence)
+                    )
+                    if source_id != destination_id
+                ),
+                min(len(source_sequence), len(destination_sequence)),
+            )
+            raise ValueError(
+                "routed collective call-sequence mismatch on shared channel "
+                f"{channel}: source actor {source_devices} sequence="
+                f"{source_sequence}, destination actor {destination_devices} "
+                f"sequence={destination_sequence}; first mismatch at index "
+                f"{mismatch_index}"
+            )
+
+
+def _validate_p2p_sequences(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    """Validate transactions and call order for every SEND/RECV channel."""
+
+    actor_devices: list[tuple[int, ...]] = []
+    for dag in actor_group_dags:
+        keys = {
+            tuple(sorted(int(device) for device in node.device))
+            for node in dag.nodes.values()
+            if node.device is not None
+        }
+        if len(keys) != 1:
+            raise ValueError(
+                "P2P validation requires one device set per actor DAG, got "
+                f"{sorted(keys)}"
+            )
+        actor_devices.append(next(iter(keys)))
+    ordered_actor_devices = sorted(actor_devices)
+    if len(set(ordered_actor_devices)) != len(ordered_actor_devices):
+        raise ValueError("P2P validation requires distinct actor-group device sets")
+    device_to_pp_rank = {
+        devices: rank for rank, devices in enumerate(ordered_actor_devices)
+    }
+
+    transactions: dict[str, list[tuple[str, str, TrainingDAGNode]]] = {}
+    sequences: dict[
+        tuple[tuple[tuple[int, ...], tuple[int, ...]], str],
+        dict[str, tuple[tuple[int, ...], list[str]]],
+    ] = {}
+    for dag, local_devices in zip(actor_group_dags, actor_devices):
+        local_rank = device_to_pp_rank[local_devices]
+        local_sequences: dict[
+            tuple[tuple[tuple[int, ...], tuple[int, ...]], str],
+            tuple[str, list[str]],
+        ] = {}
+        for uid in _serial_topological_order(dag):
+            node = dag.nodes[uid]
+            if node.node_kind not in {"SEND_COMM", "RECV_COMM"}:
+                continue
+            meta = node.node_meta
+            peer_rank = meta.get("peer_pp_rank")
+            if (
+                isinstance(peer_rank, bool)
+                or not isinstance(peer_rank, int)
+                or peer_rank < 0
+                or peer_rank >= len(ordered_actor_devices)
+                or peer_rank == local_rank
+            ):
+                raise ValueError(
+                    f"P2P node {uid} has invalid peer_pp_rank={peer_rank!r}"
+                )
+            peer_devices = ordered_actor_devices[peer_rank]
+            if set(local_devices) & set(peer_devices):
+                raise ValueError(
+                    f"P2P node {uid} requires disjoint actor groups, got "
+                    f"local={local_devices}, peer={peer_devices}"
+                )
+            if len(local_devices) != len(peer_devices):
+                raise ValueError(
+                    f"P2P node {uid} requires equal-width actor groups, got "
+                    f"local={local_devices}, peer={peer_devices}"
+                )
+
+            role = "source" if node.node_kind == "SEND_COMM" else "destination"
+            source_rank = local_rank if role == "source" else peer_rank
+            destination_rank = peer_rank if role == "source" else local_rank
+            expected_group_kind = (
+                "pp_lo_hi" if source_rank < destination_rank else "pp_hi_lo"
+            )
+            group_kind = meta.get("comm_group_kind")
+            if group_kind != expected_group_kind:
+                raise ValueError(
+                    f"P2P node {uid} has comm_group_kind={group_kind!r}, "
+                    f"expected {expected_group_kind!r}"
+                )
+            participants = tuple(
+                sorted(int(device) for device in meta.get("participants", ()))
+            )
+            expected_participants = tuple(
+                sorted((*local_devices, *peer_devices))
+            )
+            if participants != expected_participants:
+                raise ValueError(
+                    f"P2P node {uid} has participants={participants}, expected "
+                    f"{expected_participants}"
+                )
+            comm_id = meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"P2P node {uid} has invalid comm_id={comm_id!r}"
+                )
+
+            actor_pair = tuple(sorted((local_devices, peer_devices)))
+            channel = (actor_pair, group_kind)
+            transactions.setdefault(comm_id, []).append((role, uid, node))
+            previous = local_sequences.get(channel)
+            if previous is None:
+                local_sequences[channel] = (role, [comm_id])
+            else:
+                previous_role, sequence = previous
+                if previous_role != role:
+                    raise ValueError(
+                        f"actor DAG devices={local_devices} appears as both "
+                        f"roles on P2P channel {channel}"
+                    )
+                sequence.append(comm_id)
+
+        for channel, (role, sequence) in local_sequences.items():
+            roles = sequences.setdefault(channel, {})
+            if role in roles:
+                previous_devices, _previous_sequence = roles[role]
+                raise ValueError(
+                    f"P2P channel {channel} has multiple {role} actor DAGs: "
+                    f"{previous_devices} and {local_devices}"
+                )
+            roles[role] = (local_devices, sequence)
+
+    for comm_id, endpoints in transactions.items():
+        if len(endpoints) != 2 or {endpoint[0] for endpoint in endpoints} != {
+            "source",
+            "destination",
+        }:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} requires exactly one SEND and "
+                f"one RECV endpoint, got "
+                f"{[(role, uid) for role, uid, _node in endpoints]}"
+            )
+        source = next(endpoint[2] for endpoint in endpoints if endpoint[0] == "source")
+        destination = next(
+            endpoint[2] for endpoint in endpoints if endpoint[0] == "destination"
+        )
+        for field in ("comm_group_kind", "participants"):
+            if source.node_meta.get(field) != destination.node_meta.get(field):
+                raise ValueError(
+                    f"P2P transaction {comm_id!r} endpoints disagree on "
+                    f"{field}"
+                )
+        if source.tag.get("MB") != destination.tag.get("MB"):
+            raise ValueError(
+                f"P2P transaction {comm_id!r} endpoints disagree on MB"
+            )
+        source_pass = source.tag.get("PASS")
+        destination_pass = destination.tag.get("PASS")
+        # A backward activation may cross from a fused B region into a split BI
+        # region (or vice versa). PASS describes local compute decomposition,
+        # not the identity of the P2P transaction. Reject only a true
+        # forward/backward direction mismatch.
+        backward_passes = {"B", "BI", "BW"}
+        same_direction = (
+            source_pass == destination_pass
+            or source_pass in backward_passes
+            and destination_pass in backward_passes
+        )
+        if not same_direction:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} endpoints disagree on PASS "
+                f"direction: source={source_pass!r}, "
+                f"destination={destination_pass!r}"
+            )
+
+    for channel, roles in sequences.items():
+        if set(roles) != {"source", "destination"}:
+            raise ValueError(
+                f"P2P channel {channel} requires source and destination actor "
+                f"DAGs, got roles={sorted(roles)}"
+            )
+        source_devices, source_sequence = roles["source"]
+        destination_devices, destination_sequence = roles["destination"]
+        if source_sequence != destination_sequence:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (source_id, destination_id) in enumerate(
+                        zip(source_sequence, destination_sequence)
+                    )
+                    if source_id != destination_id
+                ),
+                min(len(source_sequence), len(destination_sequence)),
+            )
+            raise ValueError(
+                "P2P call-sequence mismatch on shared channel "
+                f"{channel}: source actor {source_devices} sequence="
+                f"{source_sequence}, destination actor {destination_devices} "
+                f"sequence={destination_sequence}; first mismatch at index "
+                f"{mismatch_index}"
+            )
+
+
+def _validate_dense_relay_sequences(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    """Validate paired dense-relay P2P endpoints and their call order."""
+
+    def dag_device_key(dag: TrainingDAG) -> tuple[int, ...]:
+        keys = {
+            tuple(sorted(int(device) for device in node.device))
+            for node in dag.nodes.values()
+            if node.device is not None
+        }
+        if len(keys) != 1:
+            raise ValueError(
+                "dense relay validation requires one device set per actor "
+                f"DAG, got {sorted(keys)}"
+            )
+        return next(iter(keys))
+
+    actor_devices = [dag_device_key(dag) for dag in actor_group_dags]
+    device_to_pp_rank = {
+        devices: rank for rank, devices in enumerate(sorted(actor_devices))
+    }
+    if len(device_to_pp_rank) != len(actor_devices):
+        raise ValueError(
+            "dense relay validation requires distinct actor-group device sets"
+        )
+
+    channel_sequences: dict[
+        tuple[tuple[int, ...], tuple[int, ...], str],
+        dict[str, tuple[tuple[int, ...], list[str]]],
+    ] = {}
+    transactions: dict[
+        str,
+        list[
+            tuple[
+                tuple[tuple[int, ...], tuple[int, ...], str],
+                str,
+                str,
+                TrainingDAGNode,
+            ]
+        ],
+    ] = {}
+
+    for dag, local_devices in zip(actor_group_dags, actor_devices):
+        local_by_channel: dict[
+            tuple[tuple[int, ...], tuple[int, ...], str],
+            tuple[str, list[str]],
+        ] = {}
+        for uid in _serial_topological_order(dag):
+            node = dag.nodes[uid]
+            meta = node.node_meta
+            if (
+                node.node_kind not in {"SEND_COMM", "RECV_COMM"}
+                or not bool(meta.get("dense_relay"))
+            ):
+                continue
+
+            role = meta.get("role")
+            expected_role = (
+                "source" if node.node_kind == "SEND_COMM" else "destination"
+            )
+            if role != expected_role:
+                raise ValueError(
+                    f"dense relay node {uid} kind={node.node_kind} must have "
+                    f"role={expected_role!r}, got {role!r}"
+                )
+            try:
+                source_devices = tuple(
+                    sorted(int(device) for device in meta["source_devices"])
+                )
+                destination_devices = tuple(
+                    sorted(int(device) for device in meta["destination_devices"])
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"dense relay node {uid} has invalid source/destination "
+                    "device metadata"
+                ) from error
+            if not source_devices or not destination_devices:
+                raise ValueError(
+                    f"dense relay node {uid} requires non-empty device sets"
+                )
+            if set(source_devices) & set(destination_devices):
+                raise ValueError(
+                    f"dense relay node {uid} requires disjoint actor groups, "
+                    f"got source={source_devices}, destination="
+                    f"{destination_devices}"
+                )
+            if len(source_devices) != len(destination_devices):
+                raise ValueError(
+                    f"dense relay node {uid} currently requires equal actor "
+                    f"degrees, got {len(source_devices)} and "
+                    f"{len(destination_devices)}"
+                )
+            expected_local = (
+                source_devices if role == "source" else destination_devices
+            )
+            if local_devices != expected_local:
+                raise ValueError(
+                    f"dense relay node {uid} role={role} is in actor DAG "
+                    f"devices={local_devices}, expected {expected_local}"
+                )
+
+            participants = tuple(
+                sorted(int(device) for device in meta.get("participants", ()))
+            )
+            expected_participants = tuple(
+                sorted((*source_devices, *destination_devices))
+            )
+            if participants != expected_participants:
+                raise ValueError(
+                    f"dense relay node {uid} has participants={participants}, "
+                    f"expected {expected_participants}"
+                )
+            if meta.get("source_degree") != len(source_devices):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid source_degree="
+                    f"{meta.get('source_degree')!r}"
+                )
+            if meta.get("destination_degree") != len(destination_devices):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid destination_degree="
+                    f"{meta.get('destination_degree')!r}"
+                )
+
+            direction = meta.get("direction")
+            if direction not in {"forward", "backward"}:
+                raise ValueError(
+                    f"dense relay node {uid} has invalid direction="
+                    f"{direction!r}"
+                )
+            node_pass = node.tag.get("PASS")
+            if (direction == "forward" and node_pass != "F") or (
+                direction == "backward" and node_pass not in {"B", "BI"}
+            ):
+                raise ValueError(
+                    f"dense relay node {uid} direction={direction!r} is "
+                    f"incompatible with PASS={node_pass!r}"
+                )
+
+            payload_arity = meta.get("payload_arity")
+            if (
+                isinstance(payload_arity, bool)
+                or not isinstance(payload_arity, int)
+                or payload_arity <= 0
+            ):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid payload_arity="
+                    f"{payload_arity!r}"
+                )
+            forward_indices = meta.get("forward_tensor_indices")
+            backward_indices = meta.get("backward_tensor_indices")
+            if forward_indices != list(range(payload_arity)):
+                raise ValueError(
+                    f"dense relay node {uid} must prove every forward payload "
+                    f"slot is a tensor, got indices={forward_indices!r} for "
+                    f"payload_arity={payload_arity}"
+                )
+            if (
+                not isinstance(backward_indices, list)
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int)
+                    for index in backward_indices
+                )
+                or sorted(set(backward_indices)) != backward_indices
+                or any(index < 0 or index >= payload_arity for index in backward_indices)
+            ):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid backward tensor "
+                    f"indices={backward_indices!r}"
+                )
+
+            rank_pairs = meta.get("rank_pairs")
+            expected_rank_pairs = [
+                [source_rank, destination_rank]
+                for source_rank, destination_rank in zip(
+                    source_devices, destination_devices
+                )
+            ]
+            if meta.get("relay_mode") != "ordinal_one_to_one" or (
+                rank_pairs != expected_rank_pairs
+            ):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid ordinal rank mapping="
+                    f"{rank_pairs!r}, expected {expected_rank_pairs!r}"
+                )
+
+            source_pp_rank = device_to_pp_rank.get(source_devices)
+            destination_pp_rank = device_to_pp_rank.get(destination_devices)
+            if source_pp_rank is None or destination_pp_rank is None:
+                raise ValueError(
+                    f"dense relay node {uid} references an unknown actor group"
+                )
+            expected_group_kind = (
+                "pp_lo_hi"
+                if source_pp_rank < destination_pp_rank
+                else "pp_hi_lo"
+            )
+            if meta.get("comm_group_kind") != expected_group_kind:
+                raise ValueError(
+                    f"dense relay node {uid} has comm_group_kind="
+                    f"{meta.get('comm_group_kind')!r}, expected "
+                    f"{expected_group_kind!r}"
+                )
+            expected_peer_pp_rank = (
+                destination_pp_rank if role == "source" else source_pp_rank
+            )
+            expected_peer_devices = (
+                destination_devices if role == "source" else source_devices
+            )
+            if meta.get("peer_pp_rank") != expected_peer_pp_rank:
+                raise ValueError(
+                    f"dense relay node {uid} has peer_pp_rank="
+                    f"{meta.get('peer_pp_rank')!r}, expected "
+                    f"{expected_peer_pp_rank}"
+                )
+            if tuple(meta.get("peer_devices", ())) != expected_peer_devices:
+                raise ValueError(
+                    f"dense relay node {uid} has peer_devices="
+                    f"{meta.get('peer_devices')!r}, expected "
+                    f"{expected_peer_devices}"
+                )
+
+            for field in (
+                "bucket_key",
+                "state_owner_bucket_key",
+                "source_bucket_key",
+                "destination_bucket_key",
+                "shape_reference_bucket_key",
+            ):
+                if meta.get(field) is None:
+                    raise ValueError(
+                        f"dense relay node {uid} is missing {field}"
+                    )
+            shape_reference_fwd_uid = meta.get("shape_reference_fwd_uid")
+            if not isinstance(shape_reference_fwd_uid, str):
+                raise ValueError(
+                    f"dense relay node {uid} has invalid "
+                    f"shape_reference_fwd_uid={shape_reference_fwd_uid!r}"
+                )
+            if node.node_kind == "RECV_COMM" and direction == "backward":
+                shape_node = dag.nodes.get(shape_reference_fwd_uid)
+                if (
+                    shape_node is None
+                    or shape_node.node_kind != "COMPUTE"
+                    or shape_node.compute_subkind != "FWD"
+                ):
+                    raise ValueError(
+                        f"backward dense relay RECV {uid} requires local FWD "
+                        f"shape reference {shape_reference_fwd_uid!r}"
+                    )
+                if (
+                    shape_node.node_meta.get("bucket_key")
+                    != meta.get("shape_reference_bucket_key")
+                ):
+                    raise ValueError(
+                        f"backward dense relay RECV {uid} shape reference "
+                        "bucket does not match its local FWD node"
+                    )
+
+            comm_id = meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"dense relay node {uid} has invalid comm_id={comm_id!r}"
+                )
+            channel = (source_devices, destination_devices, direction)
+            transactions.setdefault(comm_id, []).append(
+                (channel, role, uid, node)
+            )
+            previous = local_by_channel.get(channel)
+            if previous is None:
+                local_by_channel[channel] = (role, [comm_id])
+            else:
+                previous_role, sequence = previous
+                if previous_role != role:
+                    raise ValueError(
+                        f"actor DAG devices={local_devices} appears as both "
+                        f"roles on dense relay channel {channel}"
+                    )
+                sequence.append(comm_id)
+
+        for channel, (role, sequence) in local_by_channel.items():
+            roles = channel_sequences.setdefault(channel, {})
+            if role in roles:
+                previous_devices, _previous_sequence = roles[role]
+                raise ValueError(
+                    f"dense relay channel {channel} has multiple {role} actor "
+                    f"DAGs: {previous_devices} and {local_devices}"
+                )
+            roles[role] = (local_devices, sequence)
+
+    shared_meta_fields = (
+        "direction",
+        "source_devices",
+        "destination_devices",
+        "source_degree",
+        "destination_degree",
+        "participants",
+        "expert_fwd_uid",
+        "payload_arity",
+        "forward_tensor_indices",
+        "backward_tensor_indices",
+        "bucket_key",
+        "state_owner_bucket_key",
+        "source_bucket_key",
+        "destination_bucket_key",
+        "shape_reference_fwd_uid",
+        "shape_reference_bucket_key",
+        "comm_group_kind",
+        "relay_mode",
+        "rank_pairs",
+        "from_uid",
+        "to_uid",
+    )
+    relay_lifecycles: dict[
+        tuple[str, object],
+        dict[str, TrainingDAGNode],
+    ] = {}
+    for comm_id, endpoints in transactions.items():
+        if len(endpoints) != 2 or {endpoint[1] for endpoint in endpoints} != {
+            "source",
+            "destination",
+        }:
+            raise ValueError(
+                f"dense relay transaction {comm_id!r} requires exactly one "
+                "SEND source and RECV destination endpoint"
+            )
+        source = next(endpoint for endpoint in endpoints if endpoint[1] == "source")
+        destination = next(
+            endpoint for endpoint in endpoints if endpoint[1] == "destination"
+        )
+        if source[0] != destination[0]:
+            raise ValueError(
+                f"dense relay transaction {comm_id!r} endpoints disagree on "
+                f"channel: source={source[0]}, destination={destination[0]}"
+            )
+        source_node = source[3]
+        destination_node = destination[3]
+        for field in shared_meta_fields:
+            if source_node.node_meta.get(field) != destination_node.node_meta.get(field):
+                raise ValueError(
+                    f"dense relay transaction {comm_id!r} endpoints disagree "
+                    f"on {field}: source={source_node.node_meta.get(field)!r}, "
+                    f"destination={destination_node.node_meta.get(field)!r}"
+                )
+        for tag_name in ("PASS", "MB"):
+            if source_node.tag.get(tag_name) != destination_node.tag.get(tag_name):
+                raise ValueError(
+                    f"dense relay transaction {comm_id!r} endpoints disagree "
+                    f"on {tag_name}"
+                )
+        expert_fwd_uid = source_node.node_meta.get("expert_fwd_uid")
+        if not isinstance(expert_fwd_uid, str) or not expert_fwd_uid:
+            raise ValueError(
+                f"dense relay transaction {comm_id!r} has invalid "
+                f"expert_fwd_uid={expert_fwd_uid!r}"
+            )
+        direction = source_node.node_meta["direction"]
+        lifecycle_key = (expert_fwd_uid, source_node.tag.get("MB"))
+        directions = relay_lifecycles.setdefault(lifecycle_key, {})
+        if direction in directions:
+            raise ValueError(
+                f"dense relay lifecycle {lifecycle_key} has multiple "
+                f"{direction} transactions"
+            )
+        directions[direction] = source_node
+
+    for lifecycle_key, directions in relay_lifecycles.items():
+        if set(directions) != {"forward", "backward"}:
+            raise ValueError(
+                f"dense relay lifecycle {lifecycle_key} requires paired "
+                f"forward/backward transactions, got {sorted(directions)}"
+            )
+        forward = directions["forward"].node_meta
+        backward = directions["backward"].node_meta
+        if (
+            forward.get("source_devices") != backward.get("destination_devices")
+            or forward.get("destination_devices") != backward.get("source_devices")
+        ):
+            raise ValueError(
+                f"dense relay lifecycle {lifecycle_key} backward transaction "
+                "must reverse the forward actor-group pair"
+            )
+        for field in (
+            "payload_arity",
+            "forward_tensor_indices",
+            "backward_tensor_indices",
+            "state_owner_bucket_key",
+            "shape_reference_fwd_uid",
+            "shape_reference_bucket_key",
+        ):
+            if forward.get(field) != backward.get(field):
+                raise ValueError(
+                    f"dense relay lifecycle {lifecycle_key} forward/backward "
+                    f"transactions disagree on {field}"
+                )
+
+    for channel, roles in channel_sequences.items():
+        if set(roles) != {"source", "destination"}:
+            raise ValueError(
+                f"dense relay channel {channel} requires source and destination "
+                f"actor DAGs, got roles={sorted(roles)}"
+            )
+        source_devices, source_sequence = roles["source"]
+        destination_devices, destination_sequence = roles["destination"]
+        if source_sequence != destination_sequence:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (source_id, destination_id) in enumerate(
+                        zip(source_sequence, destination_sequence)
+                    )
+                    if source_id != destination_id
+                ),
+                min(len(source_sequence), len(destination_sequence)),
+            )
+            raise ValueError(
+                "dense relay call-sequence mismatch on shared channel "
+                f"{channel}: source actor {source_devices} sequence="
+                f"{source_sequence}, destination actor {destination_devices} "
+                f"sequence={destination_sequence}; first mismatch at index "
+                f"{mismatch_index}"
+            )
+
+
 @register_backend
 def piper(gm, example_inputs, **kwargs):
     """TrainingDAG backend: split by Piper annotations and lower schedule directives."""
@@ -279,6 +1243,9 @@ def piper(gm, example_inputs, **kwargs):
             log_training_dag_dependencies(subdag)
             print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
             # render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
+    _validate_routed_collective_sequences(per_pp_training_dags)
+    _validate_dense_relay_sequences(per_pp_training_dags)
+    _validate_p2p_sequences(per_pp_training_dags)
     piper_metadata.per_pp_training_dags = per_pp_training_dags
 
     logger.debug(
@@ -311,8 +1278,21 @@ def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
     if log_stats:
         _log_step_stats(step_time, log_stats, actors)
 
+    schedule_info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
+    actor_ranks = list(actors)
+    representative_ranks = {
+        int(group["devices"][0])
+        for group in schedule_info.get("actor_groups", [])
+    }
+    if not representative_ranks:
+        raise RuntimeError("schedule metadata contains no ActorGroups")
     losses = []
-    for result in results:
+    for actor_rank, result in zip(actor_ranks, results):
+        # Every rank in a schedule ActorGroup executes the same DAG, including
+        # replicated loss computation. Report one loss sample per group rather
+        # than multiplying it by the group's SPMD width.
+        if int(actor_rank) not in representative_ranks:
+            continue
         if isinstance(result, dict):
             losses.extend(result.get("losses", []))
         elif result:
@@ -330,8 +1310,8 @@ def piper_measure_dags(
 ) -> TimingResult:
     """Measure exactly ``iterations`` normal training steps.
 
-    Every data-parallel worker receives the same iteration count from the
-    distributed program, preserving collective operation alignment.
+    Every actor receives the same iteration count from the single program
+    driver, preserving collective operation alignment.
     """
 
     iterations = int(iterations)
@@ -387,8 +1367,8 @@ def piper_profile_dags(
 ) -> ProfiledTrainingPlan:
     """Collect and merge one or more timing modes across every actor.
 
-    Every DP worker must call this function as part of the same distributed
-    program. Each worker collects the exact configured iteration count.
+    The program driver launches all actors for every configured iteration and
+    merges their rank-local profile results into one durable plan.
     """
     base_config = config or ProfileConfig()
     requested_modes = tuple(
@@ -425,25 +1405,8 @@ def piper_profile_dags(
         store = ray.get_actor(_COMPILED_DATA_ACTOR)
         piper_metadata.compiled_data_store = store
 
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
-    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
-    if dp_rank == 0:
-        generation = ray.get(store.begin_profile_generation.remote())
-    else:
-        previous_generation = int(
-            getattr(piper_metadata, "profile_generation", 0)
-        )
-        deadline = time.monotonic() + 600.0
-        generation = ray.get(store.current_profile_generation.remote())
-        while generation <= previous_generation:
-            if time.monotonic() > deadline:
-                raise TimeoutError("timed out waiting for profile generation to begin")
-            time.sleep(0.05)
-            generation = ray.get(store.current_profile_generation.remote())
-    piper_metadata.profile_generation = generation
-
-    local_results = []
-    local_step_samples_us: dict[str, list[float]] = {}
+    actor_results = []
+    step_samples_us_by_mode: dict[str, list[float]] = {}
     for mode in requested_modes:
         mode_config = configs[mode]
         # Give every actor a mapping to the same coordinator-owned monotonic
@@ -487,8 +1450,8 @@ def piper_profile_dags(
             ])
             step_samples_us.append((time.perf_counter() - started) * 1_000_000.0)
 
-        local_step_samples_us[mode] = step_samples_us
-        local_results.extend(
+        step_samples_us_by_mode[mode] = step_samples_us
+        actor_results.extend(
             ray.get([
                 actor.get_profile_result.remote(
                     estimator=mode_config.estimator,
@@ -504,9 +1467,9 @@ def piper_profile_dags(
     # allocator/cache drift is balanced instead of being attributed to one
     # mode.  Actor-side synchronization makes each driver wall sample cover
     # the work just launched rather than the preceding asynchronous step.
-    local_uninstrumented_step_samples_us: dict[str, list[float]] = {}
+    uninstrumented_step_samples_us_by_mode: dict[str, list[float]] = {}
     if measure_uninstrumented_modes:
-        local_uninstrumented_step_samples_us = {
+        uninstrumented_step_samples_us_by_mode = {
             mode: [] for mode in requested_modes
         }
         max_warmups = max(configs[mode].warmup_iters for mode in requested_modes)
@@ -549,99 +1512,34 @@ def piper_profile_dags(
                     )
                     for actor in actors.values()
                 ])
-                local_uninstrumented_step_samples_us[mode].append(
+                uninstrumented_step_samples_us_by_mode[mode].append(
                     (time.perf_counter() - started) * 1_000_000.0
                 )
 
-    ray.get(
-        store.publish_profile_shard.remote(
-            generation,
-            dp_rank,
-            {
-                "results": local_results,
-                "step_samples_us": local_step_samples_us,
-                "uninstrumented_step_samples_us": (
-                    local_uninstrumented_step_samples_us
-                ),
-            },
-        )
-    )
-    deadline = time.monotonic() + 600.0
-    while not ray.get(
-        store.profile_shards_ready.remote(generation, dp_degree)
-    ):
-        if time.monotonic() > deadline:
-            raise TimeoutError(
-                f"timed out waiting for all DP profile shards for generation {generation}"
-            )
-        time.sleep(0.05)
-
-    shards = ray.get(store.get_profile_shards.remote(generation))
-    all_results = [
-        result
-        for shard_rank in sorted(shards)
-        for result in shards[shard_rank]["results"]
-    ]
-
-    # A later profile generation replaces, rather than mixes with, old samples.
+    # A later profiling call replaces, rather than mixes with, old samples.
     for dag in piper_metadata.per_pp_training_dags:
         dag.prologue_profile_times_by_mode.clear()
         for node in dag.nodes.values():
             node.profile_times_by_mode.clear()
     plan = merge_actor_profiles(
         piper_metadata.per_pp_training_dags,
-        all_results,
+        actor_results,
         profile_configs=configs,
         topology=dict(getattr(piper_metadata, "schedule_info", {}) or {}),
     )
-    step_samples_by_mode_by_dp = {
-        mode: {
-            str(shard_rank): list(shards[shard_rank]["step_samples_us"][mode])
-            for shard_rank in sorted(shards)
-        }
+    plan.profile_metadata["instrumented_global_step_samples_us_by_mode"] = {
+        mode: list(step_samples_us_by_mode[mode])
         for mode in requested_modes
     }
-    plan.profile_metadata["instrumented_step_samples_us_by_mode_by_dp"] = (
-        step_samples_by_mode_by_dp
-    )
-    plan.profile_metadata["instrumented_global_step_samples_us_by_mode"] = {
-        mode: [
-            max(float(per_dp[str(dp)][sample_index]) for dp in sorted(shards))
-            for sample_index in range(
-                min(len(per_dp[str(dp)]) for dp in sorted(shards))
-            )
-        ]
-        for mode, per_dp in step_samples_by_mode_by_dp.items()
-    }
     if measure_uninstrumented_modes:
-        uninstrumented_by_mode_by_dp = {
-            mode: {
-                str(shard_rank): list(
-                    shards[shard_rank]["uninstrumented_step_samples_us"][mode]
-                )
-                for shard_rank in sorted(shards)
-            }
-            for mode in requested_modes
-        }
-        plan.profile_metadata[
-            "uninstrumented_step_samples_us_by_mode_by_dp"
-        ] = uninstrumented_by_mode_by_dp
         plan.profile_metadata[
             "uninstrumented_global_step_samples_us_by_mode"
         ] = {
-            mode: [
-                max(
-                    float(per_dp[str(dp)][sample_index])
-                    for dp in sorted(shards)
-                )
-                for sample_index in range(
-                    min(len(per_dp[str(dp)]) for dp in sorted(shards))
-                )
-            ]
-            for mode, per_dp in uninstrumented_by_mode_by_dp.items()
+            mode: list(uninstrumented_step_samples_us_by_mode[mode])
+            for mode in requested_modes
         }
     piper_metadata.profiled_training_plan = plan
-    if output_path is not None and dp_rank == 0:
+    if output_path is not None:
         plan.save_json(output_path)
     return plan
 
@@ -659,10 +1557,9 @@ def piper_measure_profile_modes(
 ) -> dict[str, tuple[float, ...]]:
     """Measure stream policies without per-node CUDA-event instrumentation.
 
-    Every DP worker must call this function with the same modes and iteration
-    counts.  Mode order alternates so temporal/cache drift is balanced.  Each
-    returned sample is local driver wall time in microseconds; callers combine
-    aligned DP samples with a maximum to obtain global step time.
+    Mode order alternates so temporal/cache drift is balanced.  Each returned
+    sample is program-driver wall time in microseconds and therefore covers all
+    actors participating in the step.
     """
 
     if int(warmup_iters) < 0:
