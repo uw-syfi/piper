@@ -41,6 +41,8 @@ class _CompiledDataStore:
         self._training_dag_ready = False
         self._profile_generation = 0
         self._profile_shards = {}
+        self._profile_convergence = {}
+        self._profile_validation_ready = set()
 
     def publish_training_dag_data(self, data: dict):
         self._training_dag_data = data
@@ -69,6 +71,8 @@ class _CompiledDataStore:
         """Start a fresh distributed profile collection and return its id."""
         self._profile_generation += 1
         self._profile_shards = {}
+        self._profile_convergence = {}
+        self._profile_validation_ready = set()
         return self._profile_generation
 
     def current_profile_generation(self) -> int:
@@ -93,6 +97,63 @@ class _CompiledDataStore:
                 f"stale profile generation {generation}; current={self._profile_generation}"
             )
         return dict(self._profile_shards)
+
+    def mark_profile_validation_ready(
+        self, generation: int, dp_rank: int
+    ) -> None:
+        """Publish that a DP driver finished validation artifact handling."""
+
+        if generation != self._profile_generation:
+            raise ValueError(
+                f"stale profile generation {generation}; "
+                f"current={self._profile_generation}"
+            )
+        self._profile_validation_ready.add(int(dp_rank))
+
+    def profile_validation_ready(
+        self, generation: int, dp_degree: int
+    ) -> bool:
+        return (
+            generation == self._profile_generation
+            and len(self._profile_validation_ready) == int(dp_degree)
+        )
+
+    def submit_profile_convergence(
+        self,
+        generation: int,
+        profile_mode: str,
+        sample_count: int,
+        dp_rank: int,
+        converged: bool,
+        dp_degree: int,
+    ) -> bool | None:
+        """Collect one rank's adaptive-profile decision without blocking.
+
+        Profiling executes ZeRO collectives, so all DP ranks must take exactly
+        the same number of recorded iterations.  The last arrival publishes a
+        decision only if *every* rank has met its local CI target.
+        """
+        if generation != self._profile_generation:
+            raise ValueError(
+                f"stale profile generation {generation}; current={self._profile_generation}"
+            )
+        key = (str(profile_mode), int(sample_count))
+        decisions = self._profile_convergence.setdefault(key, {})
+        decisions[int(dp_rank)] = bool(converged)
+        if len(decisions) == int(dp_degree):
+            self._profile_convergence[key] = bool(all(decisions.values()))
+        resolved = self._profile_convergence[key]
+        return resolved if isinstance(resolved, bool) else None
+
+    def get_profile_convergence(
+        self, generation: int, profile_mode: str, sample_count: int
+    ) -> bool | None:
+        if generation != self._profile_generation:
+            raise ValueError(
+                f"stale profile generation {generation}; current={self._profile_generation}"
+            )
+        resolved = self._profile_convergence.get((str(profile_mode), int(sample_count)))
+        return resolved if isinstance(resolved, bool) else None
 
 torch._dynamo.config.capture_scalar_outputs = True
 

@@ -5,7 +5,8 @@ from unittest.mock import Mock, call
 import torch
 
 import src.executors as executors
-from src.executors import ComputeExecutor, DagExecutor
+from src.executors import CommunicationExecutor, ComputeExecutor, DagExecutor
+from src.runtime import BucketState, StageStore
 from src.tasks import TaskType
 
 
@@ -152,6 +153,57 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
     assert grad.dtype == torch.float32
     weight.grad = grad
+
+
+def test_reduce_scatter_temporary_uses_compute_cache_and_records_dp_stream(
+    monkeypatch,
+) -> None:
+    flat_grads = torch.arange(8, dtype=torch.float32)
+    reduced = Mock()
+    bucket = BucketState(
+        flat_grads=flat_grads,
+        reduce_scatter_grads=reduced,
+        param_shard_info=(0, 4, 8),
+        trainable_param_idxs=[0],
+    )
+    stages = StageStore(
+        buckets={"bucket": bucket},
+        grad_sharded_ubids={"bucket"},
+    )
+    dp_group = object()
+    allocation_stream = object()
+    default_stream = Mock(return_value=allocation_stream)
+    executor = CommunicationExecutor(
+        runtime=SimpleNamespace(
+            dp_group=dp_group,
+            default_stream=default_stream,
+        ),
+        stages=stages,
+        logger=Mock(),
+    )
+    dp_stream = object()
+    scratch = Mock()
+    stream_context = Mock(side_effect=lambda _stream: nullcontext())
+
+    monkeypatch.setattr(executors.torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(executors.torch, "empty_like", Mock(return_value=scratch))
+
+    def reduce_scatter_tensor(output, input_tensor, *, group):
+        assert output is scratch
+        assert input_tensor is flat_grads
+        assert group is dp_group
+
+    monkeypatch.setattr(executors.dist, "reduce_scatter_tensor", reduce_scatter_tensor)
+
+    expected_bytes = flat_grads.numel() * flat_grads.element_size()
+    assert executor.reduce_scatter("bucket", dp_stream) == expected_bytes
+    default_stream.assert_called_once_with()
+    assert stream_context.call_args_list == [
+        call(allocation_stream),
+        call(dp_stream),
+    ]
+    scratch.record_stream.assert_called_once_with(dp_stream)
+    reduced.add_.assert_called_once_with(scratch)
 
 
 def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
