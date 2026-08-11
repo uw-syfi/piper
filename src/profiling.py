@@ -25,7 +25,7 @@ PROFILE_PLAN_SCHEMA_VERSION = 4
 INTERFERENCE_FREE_PROFILE_MODE = "interference_free"
 NORMAL_PROFILE_MODE = "normal"
 PROFILE_MODES = frozenset({INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE})
-DEFAULT_ISOLATION_SCOPE = "serialized_non_p2p_with_directional_p2p"
+DEFAULT_ISOLATION_SCOPE = "event_serialized_logical_streams"
 DEFAULT_NORMAL_SCOPE = "logical_streams_with_directional_p2p"
 
 
@@ -272,8 +272,13 @@ def estimate_profile_time(samples_us: Sequence[float], estimator: str = "median"
 @dataclass(frozen=True)
 class ProfileConfig:
     warmup_iters: int = 5
-    # Exact number of measured iterations for this profile mode.
+    # Minimum number of measured iterations for this profile mode.  When no
+    # CI target is requested this remains the exact number of iterations.
     repeat_iters: int = 30
+    # Optionally keep sampling until the bootstrap 95% CI of the chosen step
+    # estimator is this tight (percent), subject to ``max_repeat_iters``.
+    target_ci95_error_pct: float | None = None
+    max_repeat_iters: int | None = None
     estimator: str = "median"
     network_policy: str = "directional_p2p"
     isolation_scope: str = DEFAULT_ISOLATION_SCOPE
@@ -283,6 +288,10 @@ class ProfileConfig:
             raise ValueError("warmup_iters must be non-negative")
         if int(self.repeat_iters) <= 0:
             raise ValueError("repeat_iters must be positive")
+        if self.target_ci95_error_pct is not None and float(self.target_ci95_error_pct) <= 0.0:
+            raise ValueError("target_ci95_error_pct must be positive when set")
+        if self.max_repeat_iters is not None and int(self.max_repeat_iters) < int(self.repeat_iters):
+            raise ValueError("max_repeat_iters must be at least repeat_iters")
         # Validate the name without requiring measurements yet.
         estimate_profile_time((0.0,), self.estimator)
 
@@ -291,6 +300,16 @@ class ProfileConfig:
         return cls(
             warmup_iters=int(value.get("warmup_iters", 5)),
             repeat_iters=int(value.get("repeat_iters", 30)),
+            target_ci95_error_pct=(
+                None
+                if value.get("target_ci95_error_pct") is None
+                else float(value["target_ci95_error_pct"])
+            ),
+            max_repeat_iters=(
+                None
+                if value.get("max_repeat_iters") is None
+                else int(value["max_repeat_iters"])
+            ),
             estimator=str(value.get("estimator", "median")),
             network_policy=str(value.get("network_policy", "directional_p2p")),
             isolation_scope=str(value.get("isolation_scope", DEFAULT_ISOLATION_SCOPE)),
