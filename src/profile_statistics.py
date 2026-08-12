@@ -128,6 +128,75 @@ def summarize_timing_samples(
     )
 
 
+def summarize_paired_reductions(
+    baseline_samples: Iterable[float],
+    candidate_samples: Iterable[float],
+    *,
+    bootstrap_repetitions: int = 1_000,
+    seed: int = 0,
+) -> tuple[tuple[float, ...], TimingStatistics]:
+    """Summarize aligned per-pair percentage reductions with a median CI.
+
+    The percentage reduction is computed for every aligned
+    ``(baseline, candidate)`` pair *before* bootstrap resampling.  The returned
+    point estimate is the median of those paired reductions, and the 95%
+    interval is the percentile interval obtained by resampling that one list
+    with replacement.  Pairing is therefore never broken by the bootstrap.
+    """
+
+    baseline = _validated_samples(baseline_samples)
+    candidate = _validated_samples(candidate_samples)
+    if len(baseline) != len(candidate):
+        raise ValueError(
+            "baseline and candidate samples must form aligned pairs: "
+            f"baseline={len(baseline)}, candidate={len(candidate)}"
+        )
+    reductions = tuple(
+        predicted_reduction(candidate_value, baseline_value)
+        for baseline_value, candidate_value in zip(baseline, candidate)
+    )
+    # Percentage reductions may be negative, so summarize them directly
+    # instead of using the non-negative timing-sample validator.
+    statistic = _estimator("median")
+    estimate = statistic(reductions)
+    mean = float(statistics.fmean(reductions))
+    median = float(statistics.median(reductions))
+    std = float(statistics.stdev(reductions)) if len(reductions) > 1 else 0.0
+    if len(reductions) == 1 or bootstrap_repetitions <= 0:
+        ci_low = ci_high = estimate
+    else:
+        rng = random.Random(int(seed))
+        pair_count = len(reductions)
+        bootstrapped = sorted(
+            statistic(
+                tuple(
+                    reductions[rng.randrange(pair_count)]
+                    for _ in range(pair_count)
+                )
+            )
+            for _ in range(int(bootstrap_repetitions))
+        )
+        ci_low = _percentile(bootstrapped, 0.025)
+        ci_high = _percentile(bootstrapped, 0.975)
+    half_width = max(0.0, ci_high - ci_low) / 2.0
+    error_pct = (
+        (0.0 if half_width == 0.0 else math.inf)
+        if estimate == 0.0
+        else half_width / abs(estimate) * 100.0
+    )
+    return reductions, TimingStatistics(
+        samples=len(reductions),
+        estimator="paired_median",
+        estimate=estimate,
+        mean=mean,
+        median=median,
+        std=std,
+        ci95_low=ci_low,
+        ci95_high=ci_high,
+        error_pct=error_pct,
+    )
+
+
 def prediction_error(predicted: float, actual: float) -> PredictionError:
     """Return percentage error of ``predicted`` relative to ``actual``."""
 
@@ -158,5 +227,6 @@ __all__ = [
     "TimingStatistics",
     "predicted_reduction",
     "prediction_error",
+    "summarize_paired_reductions",
     "summarize_timing_samples",
 ]

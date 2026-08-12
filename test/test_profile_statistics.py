@@ -5,6 +5,7 @@ import pytest
 from src.profile_statistics import (
     predicted_reduction,
     prediction_error,
+    summarize_paired_reductions,
     summarize_timing_samples,
 )
 
@@ -30,3 +31,24 @@ def test_prediction_and_reduction_percentages_have_explicit_semantics() -> None:
     assert error.signed_pct == pytest.approx(-10.0)
     assert error.absolute_pct == pytest.approx(10.0)
     assert predicted_reduction(75.0, 100.0) == pytest.approx(25.0)
+
+
+def test_paired_reduction_bootstraps_after_computing_each_pair() -> None:
+    reductions, summary = summarize_paired_reductions(
+        (10.0, 100.0, 1000.0),
+        (9.0, 50.0, 990.0),
+        bootstrap_repetitions=2_000,
+        seed=7,
+    )
+
+    # Per-pair savings are 10%, 50%, and 1%, whose median is 10%.  Computing
+    # the reduction from the two separate medians would incorrectly give 50%.
+    assert reductions == pytest.approx((10.0, 50.0, 1.0))
+    assert summary.estimator == "paired_median"
+    assert summary.estimate == pytest.approx(10.0)
+    assert summary.ci95_low <= summary.estimate <= summary.ci95_high
+
+
+def test_paired_reduction_requires_aligned_sample_counts() -> None:
+    with pytest.raises(ValueError, match="aligned pairs"):
+        summarize_paired_reductions((10.0, 20.0), (9.0,))
