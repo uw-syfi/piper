@@ -36,8 +36,16 @@ import tempfile
 import time
 from typing import Any, Callable
 
-import benchmark_grouped_gemm_allreduce_sm_partition as common
-import analyze_trace_compute_comm_overlaps as trace_analysis
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.interference_benchmarks.launch_order import (
+    analyze_trace_compute_comm_overlaps as trace_analysis,
+)
+from scripts.interference_benchmarks.launch_order import (
+    benchmark_grouped_gemm_allreduce_sm_partition as common,
+)
 
 
 COMPUTE_CLASSES = (

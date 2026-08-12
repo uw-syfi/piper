@@ -28,7 +28,7 @@ counts returned by the driver are used for the restricted measurements.
 
 The public invocation is self-orchestrating:
 
-    python scripts/benchmark_grouped_gemm_allreduce_sm_partition.py \
+    python scripts/interference_benchmarks/launch_order/benchmark_grouped_gemm_allreduce_sm_partition.py \
         --output out/sm_partition/results.json
 
 The output JSON and adjacent Markdown report contain the raw samples, derived

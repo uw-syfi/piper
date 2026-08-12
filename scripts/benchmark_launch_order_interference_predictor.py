@@ -22,7 +22,13 @@ import sys
 import tempfile
 from typing import Any
 
-import benchmark_grouped_gemm_allreduce_sm_partition as bench
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.interference_benchmarks.launch_order import (
+    benchmark_grouped_gemm_allreduce_sm_partition as bench,
+)
 
 
 OPERATIONS = ("compute", "comm")

@@ -2,7 +2,7 @@ import csv
 
 import pytest
 
-from scripts.export_node_profile_ratios import (
+from scripts.profile_and_replay.export_node_profile_ratios import (
     build_node_profile_ratios,
     export_node_profile_ratio_csvs,
     summarize_node_types,
