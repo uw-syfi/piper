@@ -158,6 +158,51 @@ def test_profile_mode_comparison_reports_uncertainty_and_prediction_error() -> N
     assert comparison.normal_statistics.samples == 3
 
 
+def test_profile_mode_comparison_uses_paired_median_if_savings() -> None:
+    node = _node("a", {0: 1.0})
+    node.profile_times_by_mode = {
+        "interference_free": {
+            0: NodeProfile.from_samples((9.0, 50.0, 990.0))
+        },
+        "normal": {0: NodeProfile.from_samples((10.0, 100.0, 1000.0))},
+    }
+
+    comparison = simulate_profile_modes([_dag(node)])
+
+    assert comparison.normal_statistics.estimate == pytest.approx(100.0)
+    assert comparison.interference_free_statistics.estimate == pytest.approx(50.0)
+    assert comparison.dependency_replay_interference_reduction_samples_pct == (
+        pytest.approx((10.0, 50.0, 1.0))
+    )
+    assert (
+        comparison.dependency_replay_interference_reduction_pct
+        == pytest.approx(10.0)
+    )
+    assert (
+        comparison.dependency_replay_interference_reduction_statistics.estimator
+        == "paired_median"
+    )
+
+
+def test_profile_mode_comparison_rejects_unaligned_iteration_ids() -> None:
+    node = _node("a", {0: 1.0})
+    node.profile_times_by_mode = {
+        "interference_free": {
+            0: NodeProfile.from_samples(
+                (9.0, 19.0), sample_iteration_ids=(0, 1)
+            )
+        },
+        "normal": {
+            0: NodeProfile.from_samples(
+                (10.0, 20.0), sample_iteration_ids=(1, 2)
+            )
+        },
+    }
+
+    with pytest.raises(SimulationValidationError, match="must align"):
+        simulate_profile_modes([_dag(node)])
+
+
 def test_profile_mode_comparison_reports_direct_uninstrumented_mode_speedup() -> None:
     node = _node("a", {0: 1.0})
     node.profile_times_by_mode = {

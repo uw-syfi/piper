@@ -131,6 +131,15 @@ def main() -> None:
             "predicted_interference_reduction_pct": (
                 comparison.predicted_interference_reduction_pct
             ),
+            "dependency_replay_interference_reduction_pct": (
+                comparison.dependency_replay_interference_reduction_pct
+            ),
+            "dependency_replay_interference_reduction_samples_pct": list(
+                comparison.dependency_replay_interference_reduction_samples_pct
+            ),
+            "dependency_replay_interference_reduction_statistics": (
+                comparison.dependency_replay_interference_reduction_statistics.to_dict()
+            ),
             "profile_event_overhead_pct": comparison.profile_event_overhead_pct,
         }
     else:
