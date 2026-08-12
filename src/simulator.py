@@ -50,6 +50,7 @@ from .profile_statistics import (
     TimingStatistics,
     predicted_reduction,
     prediction_error,
+    summarize_paired_reductions,
     summarize_timing_samples,
 )
 
@@ -158,6 +159,8 @@ class SimulationComparisonResult:
     observed_normal_envelope_samples_us: tuple[float, ...]
     interference_free_statistics: TimingStatistics
     normal_statistics: TimingStatistics
+    dependency_replay_interference_reduction_samples_pct: tuple[float, ...]
+    dependency_replay_interference_reduction_statistics: TimingStatistics
     observed_normal_envelope_statistics: TimingStatistics | None = None
     actual_statistics: TimingStatistics | None = None
     instrumented_normal_statistics: TimingStatistics | None = None
@@ -1508,6 +1511,19 @@ def simulate_profile_modes(
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
+    interference_free_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=INTERFERENCE_FREE_PROFILE_MODE
+    )
+    normal_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=NORMAL_PROFILE_MODE
+    )
+    if interference_free_iteration_ids != normal_iteration_ids:
+        raise SimulationValidationError(
+            "normal and interference-free profile iterations must align for "
+            "paired IF-savings estimation: "
+            f"normal={normal_iteration_ids!r}, "
+            f"interference_free={interference_free_iteration_ids!r}"
+        )
     interference_free_samples = simulate_training_step_samples(
         plan_or_dags,
         profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
@@ -1526,6 +1542,10 @@ def simulate_profile_modes(
         normal_samples,
         estimator="median",
     )
+    (
+        dependency_replay_reduction_samples_pct,
+        dependency_replay_reduction_statistics,
+    ) = summarize_paired_reductions(normal_samples, interference_free_samples)
     observed_normal_envelope_samples: tuple[float, ...] = ()
     observed_normal_envelope_statistics = None
     try:
@@ -1554,9 +1574,8 @@ def simulate_profile_modes(
     instrumented_normal_replay_error = None
     instrumented_interference_free_replay_error = None
     observed_reduction_pct = None
-    dependency_replay_reduction_pct = predicted_reduction(
-        interference_free_statistics.estimate,
-        normal_statistics.estimate,
+    dependency_replay_reduction_pct = (
+        dependency_replay_reduction_statistics.estimate
     )
     instrumented_policy_reduction_pct = None
     envelope_modeled_reduction_pct = None
@@ -1670,6 +1689,12 @@ def simulate_profile_modes(
         ),
         interference_free_statistics=interference_free_statistics,
         normal_statistics=normal_statistics,
+        dependency_replay_interference_reduction_samples_pct=(
+            dependency_replay_reduction_samples_pct
+        ),
+        dependency_replay_interference_reduction_statistics=(
+            dependency_replay_reduction_statistics
+        ),
         observed_normal_envelope_statistics=(
             observed_normal_envelope_statistics
         ),
