@@ -73,7 +73,7 @@ print(comparison.normal_prediction_error)
 A saved artifact can be simulated without GPUs or Ray:
 
 ```bash
-python scripts/simulate_step_times.py \
+python scripts/profile_and_replay/simulate_step_times.py \
   out/step_time_profiles.json \
   --mode both \
   --actual-step-time-s 0.0645 \
@@ -83,7 +83,7 @@ python scripts/simulate_step_times.py \
 To rank profiled nodes by their normal-to-interference-free median duration:
 
 ```bash
-python scripts/export_node_profile_ratios.py \
+python scripts/profile_and_replay/export_node_profile_ratios.py \
   out/step_time_profiles.json \
   --output out/node_profile_time_ratios.csv
 ```

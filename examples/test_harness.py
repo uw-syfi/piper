@@ -31,7 +31,9 @@ sys.path.insert(0, _REPO_ROOT)
 import ray
 from ray.util.placement_group import placement_group_table
 
-from scripts.export_node_profile_ratios import export_node_profile_ratio_csvs
+from scripts.profile_and_replay.export_node_profile_ratios import (
+    export_node_profile_ratio_csvs,
+)
 from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
 from src.profile_statistics import summarize_timing_samples
 from src.schedule import load_schedule_directives

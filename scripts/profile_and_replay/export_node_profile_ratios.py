@@ -12,7 +12,7 @@ from pathlib import Path
 import statistics
 import sys
 
-_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
