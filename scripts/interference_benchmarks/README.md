@@ -8,6 +8,3 @@ partial-overlap suite in `scripts/partial_overlap_interference_benchmarks/`.
 - `collectives/` contains the distributed all-reduce microbenchmark and its
   isolated-trace analyzer.
 - `probes/` contains the CUDA SM-ID probes used by the launch-order studies.
-
-Scripts classified as superseded or one-off are intentionally not moved here;
-see `scripts/ONE_OFF_ANALYSIS_CANDIDATES.md`.

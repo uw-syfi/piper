@@ -1,4 +1,4 @@
-from scripts.visualize_simulation_savings import (
+from scripts.profile_and_replay.visualize_simulation_savings import (
     build_attributed_simulation_trace,
 )
 

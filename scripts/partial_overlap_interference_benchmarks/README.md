@@ -20,6 +20,7 @@ Inspect the benchmark and authoritative suite interfaces with:
 ```bash
 python scripts/partial_overlap_interference_benchmarks/benchmark_pairwise_overlap_cases.py --help
 python scripts/partial_overlap_interference_benchmarks/run_pairwise_authoritative_12k_coretrend_fixed20.py --help
+python scripts/partial_overlap_interference_benchmarks/benchmark_pairwise_physical_resources.py --help
 ```
 
 The historical suite manifest in the artifact bundle retains the runner path

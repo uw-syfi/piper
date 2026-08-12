@@ -24,7 +24,7 @@ import sys
 import time
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 csv.field_size_limit(sys.maxsize)
 

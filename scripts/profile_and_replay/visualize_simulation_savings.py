@@ -8,7 +8,7 @@ and timestamps that the counterfactual replays used.
 
 ``NORMAL_INPUT`` may be either a ``ProfiledTrainingPlan`` JSON artifact (the
 normal replay is generated automatically) or JSON emitted by
-``scripts/simulate_step_times.py``.  The latter may contain a top-level
+``scripts/profile_and_replay/simulate_step_times.py``.  The latter may contain a top-level
 ``timeline`` or a ``normal.timeline`` comparison result.
 """
 
@@ -23,7 +23,7 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
-_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
