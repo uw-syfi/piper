@@ -267,7 +267,7 @@ def build_and_validate_attributed_trace(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the attributed trace and prove it preserves every input event."""
 
-    from scripts.visualize_simulation_savings import (
+    from scripts.profile_and_replay.visualize_simulation_savings import (
         build_attributed_simulation_trace,
     )
 
