@@ -10,6 +10,24 @@ from src.executors import CommunicationExecutor, ComputeExecutor, DagExecutor
 from src.tasks import TaskType
 
 
+def _route_meta(shard_devices, num_global_routes):
+    width = num_global_routes // len(shard_devices)
+    return {
+        "num_global_routes": num_global_routes,
+        "shard_degree": len(shard_devices),
+        "num_local_routes": width,
+        "shard_devices": list(shard_devices),
+        "route_partitions": [
+            {
+                "device": device,
+                "start": index * width,
+                "stop": (index + 1) * width,
+            }
+            for index, device in enumerate(shard_devices)
+        ],
+    }
+
+
 def test_backward_input_events_waits_for_recv_all_gather_and_a2a() -> None:
     stream = Mock()
     recv_evt = object()
@@ -251,22 +269,6 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
 
 def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
-    def fake_permute(tensor, counts, ep_degree, num_local_experts):
-        assert ep_degree == 1
-        assert num_local_experts == counts.numel()
-        return (
-            tensor.shape,
-            tensor + 1,
-            torch.arange(tensor.shape[0]),
-            counts + 2,
-        )
-
-    monkeypatch.setattr(executors, "_permute", fake_permute)
-    monkeypatch.setattr(
-        executors,
-        "_unpermute",
-        lambda tensor, _shape, _indices: tensor + 3,
-    )
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     executor = DagExecutor(
@@ -286,6 +288,7 @@ def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
             "direction": "incoming",
             "expert_fwd_uid": "expert",
             "participants": [3],
+            **_route_meta([3], 4),
         },
     )
     outgoing = SimpleNamespace(
@@ -298,7 +301,7 @@ def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
         },
     )
     tensor = torch.ones(4, 2)
-    counts = torch.tensor([1, 1, 1, 1])
+    counts = torch.tensor([[1, 1, 1, 1]])
 
     dispatched, local_counts = executor._all_to_all_ep_boundary(
         incoming,
@@ -312,42 +315,83 @@ def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:
         stream=object(),
     )
 
-    assert torch.equal(dispatched, tensor + 1)
-    assert torch.equal(local_counts, counts + 2)
-    assert torch.equal(combined, tensor + 4)
+    assert dispatched is tensor
+    assert torch.equal(local_counts, counts)
+    assert combined is dispatched
     state = executor.expert_a2a_states["expert"]
-    assert (state.ep_rank, state.ep_degree) == (0, 1)
+    assert state.participants == (3,)
+    assert state.shard_devices == (3,)
 
 
-def test_a2a_dispatch_aggregates_source_counts_for_local_experts(
+def test_a2a_boundary_rejects_noncanonical_serialized_shard_order(
     monkeypatch,
 ) -> None:
-    state = executors._ExpertA2AState(ep_rank=1, ep_degree=2)
-    counts = torch.tensor([1, 2, 3, 4])
-    routed = torch.randn(10, 3)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    executor = DagExecutor(
+        runtime=SimpleNamespace(actor_group_routed_group="ep", global_rank=0),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=Mock(),
+        compute=None,
+        logger=None,
+    )
+    incoming = SimpleNamespace(
+        uid="incoming",
+        task_type=TaskType.FWD_A2A,
+        node_meta={
+            "direction": "incoming",
+            "expert_fwd_uid": "expert",
+            "participants": [0, 1],
+            **_route_meta([1, 0], 4),
+        },
+    )
 
-    monkeypatch.setattr(executors, "all_to_all_single", lambda *_args, **_kwargs: counts)
+    with pytest.raises(ValueError, match="ascending global actor-rank order"):
+        executor._all_to_all_ep_boundary(
+            incoming,
+            torch.ones(4, 2),
+            stream=object(),
+            routing_counts=torch.ones((1, 4), dtype=torch.int64),
+        )
+
+
+def test_a2a_dispatch_preserves_source_major_counts_and_opaque_rank_blocks(
+    monkeypatch,
+) -> None:
+    state = executors._ExpertA2AState(
+        participants=(0, 1),
+        shard_devices=(0, 1),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
+    )
+    counts = torch.tensor([[1, 2, 3, 4]])
+    routed = torch.randn(10, 3)
+    received = torch.cat((torch.zeros(11, 3), torch.ones(15, 3)))
+    count_collective_inputs = []
+    payload_collective_inputs = []
+
+    def fake_count_a2a(tensor, *_args, **_kwargs):
+        count_collective_inputs.append(tensor.clone())
+        return torch.tensor([5, 6, 7, 8])
+
+    monkeypatch.setattr(executors, "all_to_all_single", fake_count_a2a)
+
+    def fake_payload_a2a(tensor, *_args, **_kwargs):
+        payload_collective_inputs.append(tensor.clone())
+        return received
+
     monkeypatch.setattr(
         executors,
         "all_to_all_single_autograd",
-        lambda tensor, *_args, **_kwargs: tensor,
+        fake_payload_a2a,
     )
     monkeypatch.setattr(
         executors.torch.ops._c10d_functional,
         "wait_tensor",
         lambda tensor: tensor,
     )
-    monkeypatch.setattr(
-        executors,
-        "_permute",
-        lambda tensor, grouped_counts, degree, local_experts: (
-            tensor.shape,
-            tensor,
-            torch.arange(tensor.shape[0]),
-            torch.tensor([4, 6]),
-        ),
-    )
-
     executor = DagExecutor(
         runtime=SimpleNamespace(actor_group_routed_group="ep"),
         stages=None,
@@ -363,8 +407,139 @@ def test_a2a_dispatch_aggregates_source_counts_for_local_experts(
         state, routed, counts
     )
 
-    assert dispatched is routed
-    assert torch.equal(local_counts, torch.tensor([0, 0, 4, 6]))
+    assert torch.equal(count_collective_inputs[0], counts.flatten())
+    assert torch.equal(payload_collective_inputs[0], routed)
+    assert dispatched is received
+    assert torch.equal(local_counts, torch.tensor([[5, 6], [7, 8]]))
+    assert state.input_splits == [3, 7]
+    assert state.output_splits == [11, 15]
+
+
+def test_a2a_combine_and_backward_use_canonical_rank_block_order(
+    monkeypatch,
+) -> None:
+    state = executors._ExpertA2AState(
+        participants=(0, 1),
+        shard_devices=(0, 1),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
+        input_splits=[3, 7],
+        output_splits=[11, 15],
+    )
+    executor = DagExecutor(
+        runtime=SimpleNamespace(actor_group_routed_group="ep"),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+    )
+    calls = []
+
+    def fake_a2a(tensor, output_splits, input_splits, _group):
+        calls.append((tensor.clone(), output_splits, input_splits))
+        if output_splits == [3, 7]:
+            return torch.cat((torch.zeros(3, 2), torch.ones(7, 2)))
+        return torch.cat((torch.zeros(11, 2), torch.ones(15, 2)))
+
+    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    model_source_major = torch.cat(
+        (torch.full((11, 2), 0.0), torch.full((15, 2), 1.0))
+    )
+    combined = executor._combine_expert_a2a(state, model_source_major)
+    assert torch.equal(
+        calls[0][0],
+        model_source_major,
+    )
+    assert torch.equal(combined, torch.cat((torch.zeros(3, 2), torch.ones(7, 2))))
+
+    original_route_major_grad = torch.cat(
+        (torch.full((3, 2), 0.0), torch.full((7, 2), 1.0))
+    )
+    dispatched_grad = executor._dispatch_expert_a2a_gradient(
+        state, original_route_major_grad
+    )
+    assert torch.equal(
+        calls[1][0],
+        original_route_major_grad,
+    )
+    assert torch.equal(
+        dispatched_grad,
+        torch.cat((torch.zeros(11, 2), torch.ones(15, 2))),
+    )
+
+
+def test_a2a_dispatch_accepts_empty_payload_and_zero_route_counts() -> None:
+    state = executors._ExpertA2AState(
+        participants=(0,),
+        shard_devices=(0,),
+        num_global_routes=3,
+        route_partitions=((0, 3),),
+    )
+    payload = torch.empty(0, 5)
+    counts = torch.zeros((1, 3), dtype=torch.int64)
+    executor = DagExecutor(
+        runtime=SimpleNamespace(actor_group_routed_group="ep"),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+    )
+
+    received, received_counts = executor._dispatch_expert_a2a(
+        state, payload, counts
+    )
+
+    assert received.shape == (0, 5)
+    assert torch.equal(received_counts, counts)
+    assert state.input_splits == [0]
+    assert state.output_splits == [0]
+
+
+def test_a2a_dispatch_state_isolated_by_routed_microbatch_uid(monkeypatch) -> None:
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    executor = DagExecutor(
+        runtime=SimpleNamespace(actor_group_routed_group="ep", global_rank=0),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+    )
+
+    for uid, counts in (
+        ("expert-mb0", torch.tensor([[1, 0]])),
+        ("expert-mb1", torch.tensor([[2, 1]])),
+    ):
+        node = SimpleNamespace(
+            uid=f"dispatch-{uid}",
+            task_type=TaskType.FWD_A2A,
+            node_meta={
+                "direction": "incoming",
+                "expert_fwd_uid": uid,
+                "participants": [0],
+                **_route_meta([0], 2),
+            },
+        )
+        executor._all_to_all_ep_boundary(
+            node,
+            torch.zeros(int(counts.sum()), 3),
+            stream=object(),
+            routing_counts=counts,
+        )
+
+    first = executor.expert_a2a_states["expert-mb0"]
+    second = executor.expert_a2a_states["expert-mb1"]
+    assert first is not second
+    assert first.input_splits == [1]
+    assert second.input_splits == [3]
 
 
 @pytest.mark.parametrize(
@@ -372,25 +547,25 @@ def test_a2a_dispatch_aggregates_source_counts_for_local_experts(
     [
         (
             torch.randn(2, 2, 3),
-            torch.tensor([1, 1]),
+            torch.tensor([[1, 1]]),
             ValueError,
             r"shape \[tokens, hidden\]",
         ),
         (
             torch.randn(2, 3),
-            torch.tensor([1.0, 1.0]),
+            torch.tensor([[1.0, 1.0]]),
             TypeError,
             "integer dtype",
         ),
         (
             torch.randn(2, 3),
-            torch.tensor([3, -1]),
+            torch.tensor([[3, -1]]),
             ValueError,
             "negative counts",
         ),
         (
             torch.randn(2, 3),
-            torch.tensor([1, 2]),
+            torch.tensor([[1, 2]]),
             ValueError,
             "counts sum",
         ),
@@ -412,7 +587,12 @@ def test_a2a_dispatch_rejects_invalid_routed_layout(
 
     with pytest.raises(error, match=message):
         executor._dispatch_expert_a2a(
-            executors._ExpertA2AState(ep_rank=0, ep_degree=1),
+            executors._ExpertA2AState(
+                participants=(0,),
+                shard_devices=(0,),
+                num_global_routes=2,
+                route_partitions=((0, 2),),
+            ),
             payload,
             counts,
         )
@@ -422,6 +602,9 @@ def _routed_state(**overrides):
     values = {
         "source_devices": (0, 2),
         "destination_devices": (1,),
+        "shard_devices": (1,),
+        "num_global_routes": 4,
+        "route_partitions": ((0, 4),),
         "participants": (0, 1, 2),
         "layout_group": "layout",
         "m_to_n_group": "m-to-n",
@@ -478,12 +661,83 @@ def test_dense_n_to_m_destination_needs_splits_but_not_expert_permutation(
     assert calls[0][1:] == ([0, 4, 0], [0, 0, 0], "n-to-m")
 
 
+def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None:
+    state = _routed_state(
+        source_devices=(0, 2),
+        destination_devices=(1, 3),
+        shard_devices=(1, 3),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
+        participants=(0, 1, 2, 3),
+        input_splits=[0, 3, 0, 7],
+        output_splits=[5, 0, 6, 0],
+        payload_shape=(11, 2),
+        payload_dtype=torch.float32,
+    )
+    executor = DagExecutor(
+        runtime=SimpleNamespace(device="cpu", global_rank=2),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+        routed_cross_group_states={"expert": state},
+    )
+    node = SimpleNamespace(
+        uid="combine-source",
+        task_type=TaskType.FWD_N_TO_M,
+        node_meta={
+            "direction": "outgoing",
+            "role": "source",
+            "expert_fwd_uid": "expert",
+            "a2a_tensor_idx": 0,
+        },
+    )
+    source_major = torch.cat((torch.zeros(5, 2), torch.full((6, 2), 2.0)))
+    communicator_output = torch.cat((torch.ones(3, 2), torch.full((7, 2), 3.0)))
+    calls = []
+
+    def fake_a2a(tensor, output_splits, input_splits, group):
+        calls.append((tensor.clone(), output_splits, input_splits, group))
+        return communicator_output
+
+    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+
+    result = executor._routed_cross_group_boundary(node, source_major, object())
+
+    assert result is None
+    assert torch.equal(calls[0][0], source_major)
+    assert calls[0][1:] == ([0, 3, 0, 7], [5, 0, 6, 0], "n-to-m")
+
+    destination_node = SimpleNamespace(
+        uid="combine-destination",
+        task_type=TaskType.FWD_N_TO_M,
+        node_meta={
+            "direction": "outgoing",
+            "role": "destination",
+            "expert_fwd_uid": "expert",
+            "a2a_tensor_idx": 0,
+        },
+    )
+    executor.runtime.global_rank = 1
+    result = executor._routed_cross_group_boundary(
+        destination_node, None, object()
+    )
+    assert result is communicator_output
+
+
 def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     monkeypatch,
 ) -> None:
     state = executors._RoutedCrossGroupState(
         source_devices=(0, 2),
         destination_devices=(1, 3),
+        shard_devices=(1, 3),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
         participants=(0, 1, 2, 3),
         layout_group="layout",
         m_to_n_group="m-to-n",
@@ -494,7 +748,7 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
         bucket=lambda _key: SimpleNamespace(
             forward_input_meta=[
                 ((10, 3), torch.float32, True),
-                ((4,), torch.int64, False),
+                ((1, 4), torch.int64, False),
             ]
         )
     )
@@ -528,8 +782,8 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
             [5, 6, 7, 8],
             [0, 0, 0, 0],
         ]
-    ).view(-1)
-    received = torch.randn(14, 3)
+    )
+    received = torch.cat((torch.zeros(3, 3), torch.full((11, 3), 2.0)))
     calls = []
 
     layout_calls = []
@@ -546,16 +800,6 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
         return received
 
     monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
-    monkeypatch.setattr(
-        executors,
-        "_permute",
-        lambda tensor, counts, degree, local_experts: (
-            tensor.shape,
-            tensor,
-            torch.arange(tensor.shape[0]),
-            torch.tensor([16, 16]),
-        ),
-    )
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     routed, local_counts = executor._routed_cross_group_boundary(
@@ -563,7 +807,7 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     )
 
     assert routed is received
-    assert torch.equal(local_counts, torch.tensor([16, 16, 0, 0]))
+    assert torch.equal(local_counts, torch.tensor([[1, 2], [5, 6]]))
     assert state.input_splits == [0, 0, 0, 0]
     assert state.output_splits == [3, 0, 11, 0]
     assert layout_calls == [("layout", True)]
@@ -575,6 +819,9 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
     state = executors._RoutedCrossGroupState(
         source_devices=(0, 2),
         destination_devices=(1, 3),
+        shard_devices=(1, 3),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
         participants=(0, 1, 2, 3),
         layout_group="layout",
         m_to_n_group="m-to-n",
@@ -595,7 +842,7 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
         uid="dispatch-source",
         node_meta={"role": "source", "routing_counts_idx": 1},
     )
-    local_counts = torch.tensor([4, 1, 2, 3])
+    local_counts = torch.tensor([[4, 1, 2, 3]])
     waited = []
     work = SimpleNamespace(wait=lambda: waited.append(True))
 
@@ -621,6 +868,68 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
     assert state.layout_work is work
     assert state.layout_output is not None
     assert waited == []
+
+
+def test_m_to_n_source_uses_canonical_shard_and_collective_order(
+    monkeypatch,
+) -> None:
+    state = executors._RoutedCrossGroupState(
+        source_devices=(0,),
+        destination_devices=(1, 3),
+        shard_devices=(1, 3),
+        num_global_routes=4,
+        route_partitions=((0, 2), (2, 4)),
+        participants=(0, 1, 3),
+        layout_group="layout",
+        m_to_n_group="m-to-n",
+        n_to_m_group="n-to-m",
+    )
+    executor = DagExecutor(
+        runtime=SimpleNamespace(device="cpu", global_rank=0),
+        stages=None,
+        buffers=None,
+        events=None,
+        params=None,
+        communication=None,
+        compute=None,
+        logger=None,
+        routed_cross_group_states={"expert": state},
+    )
+    node = SimpleNamespace(
+        uid="dispatch-source",
+        task_type=TaskType.FWD_M_TO_N,
+        node_meta={
+            "direction": "incoming",
+            "role": "source",
+            "expert_fwd_uid": "expert",
+            "a2a_tensor_idx": 0,
+            "routing_counts_idx": 1,
+        },
+    )
+    counts = torch.tensor([[1, 2, 3, 4]])
+    payload = torch.arange(30, dtype=torch.float32).view(10, 3)
+    calls = []
+
+    def fake_all_gather(output, _counts, *, group, async_op):
+        output.zero_()
+        return SimpleNamespace(wait=lambda: None)
+
+    def fake_a2a(tensor, output_splits, input_splits, group):
+        calls.append((tensor.clone(), output_splits, input_splits, group))
+        return tensor.new_empty((0, tensor.shape[1]))
+
+    monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+
+    result = executor._routed_cross_group_boundary(
+        node, payload, object(), routing_counts=counts
+    )
+
+    assert result is None
+    assert state.input_splits == [0, 3, 7]
+    assert torch.equal(calls[0][0], payload)
+    assert calls[0][1:] == ([0, 0, 0], [0, 3, 7], "m-to-n")
 
 
 def test_cross_group_forward_and_backward_rejoin_dense_passthroughs(

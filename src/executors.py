@@ -13,27 +13,110 @@ from torch.distributed._functional_collectives import (
 from torch.autograd.graph import GradientEdge, Node
 from torch.nn import Parameter
 
-try:
-    from torchtitan.models.moe.utils import _permute, _unpermute
-except ImportError:  # Newer TorchTitan source layout.
-    from torchtitan.models.common.moe.utils import _permute, _unpermute
+
+def _route_partition_metadata(
+    meta: dict[str, Any],
+    destination_devices: tuple[int, ...],
+) -> tuple[int, tuple[int, ...], tuple[tuple[int, int], ...]]:
+    """Validate schedule-owned equal contiguous route partitions."""
+    try:
+        num_global_routes = int(meta["num_global_routes"])
+        shard_degree = int(meta["shard_degree"])
+        num_local_routes = int(meta["num_local_routes"])
+        shard_devices = tuple(int(rank) for rank in meta["shard_devices"])
+        raw_partitions = meta["route_partitions"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "routed communication is missing valid schedule route metadata "
+            "(num_global_routes, shard_degree, num_local_routes, "
+            "shard_devices, route_partitions)"
+        ) from error
+    if num_global_routes < 1:
+        raise ValueError(f"num_global_routes must be positive, got {num_global_routes}")
+    if shard_degree < 1:
+        raise ValueError(f"shard_degree must be positive, got {shard_degree}")
+    if shard_degree != len(shard_devices):
+        raise ValueError(
+            f"shard_degree={shard_degree} does not match "
+            f"shard_devices={shard_devices}"
+        )
+    if len(shard_devices) != len(set(shard_devices)):
+        raise ValueError(f"shard_devices contains duplicates: {shard_devices}")
+    if shard_devices != tuple(sorted(shard_devices)):
+        raise ValueError(
+            "shard_devices must be in ascending global actor-rank order, got "
+            f"{shard_devices}"
+        )
+    if set(shard_devices) != set(destination_devices):
+        raise ValueError(
+            "shard_devices must identify exactly the routed destinations: "
+            f"shard_devices={shard_devices}, destinations={destination_devices}"
+        )
+    if num_global_routes % shard_degree:
+        raise ValueError(
+            f"num_global_routes={num_global_routes} must be divisible by "
+            f"shard_degree={shard_degree}"
+        )
+    if not isinstance(raw_partitions, list) or len(raw_partitions) != shard_degree:
+        raise ValueError(
+            f"route_partitions must contain {shard_degree} entries, got "
+            f"{raw_partitions!r}"
+        )
+    expected_width = num_global_routes // shard_degree
+    if num_local_routes != expected_width:
+        raise ValueError(
+            f"num_local_routes={num_local_routes} does not match the equal "
+            f"contiguous partition width={expected_width}"
+        )
+    partitions: list[tuple[int, int]] = []
+    for index, (device, raw) in enumerate(zip(shard_devices, raw_partitions)):
+        if not isinstance(raw, dict):
+            raise ValueError(f"route partition {index} is not a mapping: {raw!r}")
+        try:
+            partition_device = int(raw["device"])
+            start = int(raw["start"])
+            stop = int(raw["stop"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid route partition {index}: {raw!r}") from error
+        expected_start = index * expected_width
+        expected_stop = expected_start + expected_width
+        if (
+            partition_device != device
+            or start != expected_start
+            or stop != expected_stop
+        ):
+            raise ValueError(
+                "route_partitions must assign equal contiguous ranges in "
+                "shard_devices order; got "
+                f"partition={raw!r}, expected device={device}, "
+                f"start={expected_start}, stop={expected_stop}"
+            )
+        partitions.append((start, stop))
+    return num_global_routes, shard_devices, tuple(partitions)
 
 
-def _local_padded_expert_counts(
-    counts: torch.Tensor,
-    source_degree: int,
-    num_local_experts: int,
-) -> torch.Tensor:
-    """Normalize the padded counts returned by TorchTitan's ``_permute``."""
-    if counts.numel() == num_local_experts:
-        return counts
-    if counts.numel() == source_degree * num_local_experts:
-        return counts.view(source_degree, num_local_experts).sum(dim=0)
-    raise ValueError(
-        "TorchTitan _permute returned an invalid padded-count layout: "
-        f"got {counts.numel()} values for source_degree={source_degree}, "
-        f"num_local_experts={num_local_experts}"
-    )
+def _validate_routed_payload_schema(
+    tensor: torch.Tensor,
+    payload_shape: tuple[int, ...] | None,
+    payload_dtype: torch.dtype | None,
+    *,
+    context: str,
+) -> None:
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"{context} payload must have shape [rows, hidden], got "
+            f"shape={tuple(tensor.shape)}"
+        )
+    if payload_shape is not None and tuple(tensor.shape[1:]) != payload_shape[1:]:
+        raise ValueError(
+            f"{context} payload trailing shape={tuple(tensor.shape[1:])} does "
+            f"not match dispatch trailing shape={payload_shape[1:]}"
+        )
+    if payload_dtype is not None and tensor.dtype != payload_dtype:
+        raise TypeError(
+            f"{context} payload dtype={tensor.dtype} does not match dispatch "
+            f"dtype={payload_dtype}"
+        )
 
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
@@ -89,12 +172,18 @@ class PreparedDagExecution:
 
 @dataclass
 class _ExpertA2AState:
-    ep_rank: int
-    ep_degree: int
+    participants: tuple[int, ...]
+    shard_devices: tuple[int, ...]
+    num_global_routes: int
+    route_partitions: tuple[tuple[int, int], ...]
     input_splits: list[int] | None = None
     output_splits: list[int] | None = None
-    input_shape: torch.Size | None = None
-    permuted_indices: torch.Tensor | None = None
+    payload_shape: tuple[int, ...] | None = None
+    payload_dtype: torch.dtype | None = None
+
+    @property
+    def ep_degree(self) -> int:
+        return len(self.shard_devices)
 
 
 @dataclass
@@ -103,6 +192,9 @@ class _RoutedCrossGroupState:
 
     source_devices: tuple[int, ...]
     destination_devices: tuple[int, ...]
+    shard_devices: tuple[int, ...]
+    num_global_routes: int
+    route_partitions: tuple[tuple[int, int], ...]
     participants: tuple[int, ...]
     layout_group: Any
     m_to_n_group: Any
@@ -111,8 +203,6 @@ class _RoutedCrossGroupState:
     layout_output: torch.Tensor | None = None
     input_splits: list[int] | None = None
     output_splits: list[int] | None = None
-    input_shape: torch.Size | None = None
-    permuted_indices: torch.Tensor | None = None
     payload_shape: tuple[int, ...] | None = None
     payload_dtype: torch.dtype | None = None
     retained_forward_buffer: dict[str, Any] | None = None
@@ -818,17 +908,24 @@ class DagExecutor:
                         f"A2A node {node.uid} has invalid participants="
                         f"{participants!r}"
                     )
-                ep_degree = len(participants)
+                participant_order = tuple(sorted(int(rank) for rank in participants))
                 try:
-                    ep_rank = participants.index(self.runtime.global_rank)
+                    participant_order.index(self.runtime.global_rank)
                 except ValueError as error:
                     raise ValueError(
                         f"Actor rank {self.runtime.global_rank} is not in A2A "
                         f"participants={participants}"
                     ) from error
+                (
+                    num_global_routes,
+                    shard_devices,
+                    route_partitions,
+                ) = _route_partition_metadata(node_meta, participant_order)
                 state = _ExpertA2AState(
-                    ep_rank=ep_rank,
-                    ep_degree=ep_degree,
+                    participants=participant_order,
+                    shard_devices=shard_devices,
+                    num_global_routes=num_global_routes,
+                    route_partitions=route_partitions,
                 )
                 self.expert_a2a_states[expert_fwd_uid] = state
 
@@ -838,7 +935,7 @@ class DagExecutor:
                     if routing_counts is None:
                         raise ValueError(
                             f"Forward dispatch node {node.uid} is missing "
-                            "num_tokens_per_expert"
+                            "route_counts"
                         )
                     return self._dispatch_expert_a2a(
                         state,
@@ -862,12 +959,7 @@ class DagExecutor:
 
     @staticmethod
     def _require_expert_a2a_state(state: _ExpertA2AState) -> None:
-        if (
-            state.input_splits is None
-            or state.output_splits is None
-            or state.input_shape is None
-            or state.permuted_indices is None
-        ):
+        if state.input_splits is None or state.output_splits is None:
             raise RuntimeError(
                 "A2A combine/gradient dispatch ran before forward dispatch"
             )
@@ -876,48 +968,50 @@ class DagExecutor:
         self,
         state: _ExpertA2AState,
         routed_input: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
+        route_counts: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if routed_input.ndim != 2:
             raise ValueError(
                 "routed expert payload must have shape [tokens, hidden], got "
                 f"shape={tuple(routed_input.shape)}"
             )
-        if num_tokens_per_expert.ndim != 1:
+        if route_counts.ndim != 2 or int(route_counts.shape[0]) != 1:
             raise ValueError(
-                "num_tokens_per_expert must be one-dimensional, got "
-                f"shape={tuple(num_tokens_per_expert.shape)}"
+                "route_counts must have shape [1, num_global_routes] before "
+                f"dispatch, got shape={tuple(route_counts.shape)}"
             )
-        if torch.is_floating_point(num_tokens_per_expert) or torch.is_complex(
-            num_tokens_per_expert
-        ):
+        if torch.is_floating_point(route_counts) or torch.is_complex(route_counts):
             raise TypeError(
-                "num_tokens_per_expert must use an integer dtype, got "
-                f"{num_tokens_per_expert.dtype}"
+                "route_counts must use an integer dtype, got "
+                f"{route_counts.dtype}"
             )
-        if bool(torch.any(num_tokens_per_expert < 0).item()):
-            raise ValueError("num_tokens_per_expert cannot contain negative counts")
-        routed_tokens = int(num_tokens_per_expert.sum().item())
+        if bool(torch.any(route_counts < 0).item()):
+            raise ValueError("route_counts cannot contain negative counts")
+        if int(route_counts.shape[1]) != state.num_global_routes:
+            raise ValueError(
+                f"route_counts has {route_counts.shape[1]} routes, expected "
+                f"num_global_routes={state.num_global_routes}"
+            )
+        flat_counts = route_counts.reshape(-1)
+        routed_tokens = int(flat_counts.sum().item())
         if int(routed_input.shape[0]) != routed_tokens:
             raise ValueError(
                 f"routed expert payload has {routed_input.shape[0]} rows, but "
-                f"routing counts sum to {routed_tokens}"
+                f"route_counts sum to {routed_tokens}"
             )
-        if num_tokens_per_expert.shape[0] % state.ep_degree:
-            raise ValueError(
-                f"num_experts={num_tokens_per_expert.shape[0]} must be divisible "
-                f"by ep_degree={state.ep_degree}"
-            )
-
-        num_local_experts = (
-            num_tokens_per_expert.shape[0] // state.ep_degree
-        )
+        num_local_routes = state.num_global_routes // state.ep_degree
+        # Schedule validation makes ownership order identical to process-group
+        # rank order, so model route-major blocks are already collective-ready.
+        counts_for_collective = flat_counts
+        collective_input = routed_input.contiguous()
+        state.payload_shape = tuple(routed_input.shape)
+        state.payload_dtype = routed_input.dtype
         if state.ep_degree > 1:
             with torch.no_grad():
                 # Fixed-size metadata exchange. The result is source-major:
                 # [source rank][local expert].
                 grouped_counts = all_to_all_single(
-                    num_tokens_per_expert,
+                    counts_for_collective,
                     None,
                     None,
                     group=self.runtime.actor_group_routed_group,
@@ -926,7 +1020,7 @@ class DagExecutor:
                     grouped_counts
                 )
                 input_splits = (
-                    num_tokens_per_expert.view(state.ep_degree, -1)
+                    counts_for_collective.view(state.ep_degree, -1)
                     .sum(dim=1)
                     .to(torch.device("cpu"), non_blocking=True)
                 )
@@ -938,42 +1032,23 @@ class DagExecutor:
                 state.input_splits = input_splits.tolist()
                 state.output_splits = output_splits.tolist()
 
-            routed_input = all_to_all_single_autograd(
-                routed_input,
+            collective_output = all_to_all_single_autograd(
+                collective_input,
                 state.output_splits,
                 state.input_splits,
                 self.runtime.actor_group_routed_group,
             )
         else:
-            grouped_counts = num_tokens_per_expert
-            state.input_splits = []
-            state.output_splits = []
+            grouped_counts = counts_for_collective
+            collective_output = collective_input
+            state.input_splits = [routed_tokens]
+            state.output_splits = [routed_tokens]
 
-        (
-            state.input_shape,
-            routed_input,
-            state.permuted_indices,
-            local_counts,
-        ) = _permute(
-            routed_input,
-            grouped_counts,
-            state.ep_degree,
-            num_local_experts,
+        source_major_payload = collective_output
+        source_major_counts = grouped_counts.view(
+            state.ep_degree, num_local_routes
         )
-
-        # Piper's expert weights retain their global first dimension. Zero
-        # counts select only the local rank's contiguous expert range.
-        global_counts = torch.zeros_like(num_tokens_per_expert)
-        local_start = state.ep_rank * num_local_experts
-        local_counts = _local_padded_expert_counts(
-            local_counts,
-            state.ep_degree,
-            num_local_experts,
-        )
-        global_counts[local_start : local_start + num_local_experts] = (
-            local_counts
-        )
-        return routed_input, global_counts
+        return source_major_payload, source_major_counts
 
     def _dispatch_expert_a2a_gradient(
         self,
@@ -981,18 +1056,21 @@ class DagExecutor:
         tensor: torch.Tensor,
     ) -> torch.Tensor:
         self._require_expert_a2a_state(state)
+        _validate_routed_payload_schema(
+            tensor,
+            state.payload_shape,
+            state.payload_dtype,
+            context="A2A backward dispatch",
+        )
         if state.ep_degree > 1:
             tensor = all_to_all_single_autograd(
-                tensor,
+                tensor.contiguous(),
                 state.output_splits,
                 state.input_splits,
                 self.runtime.actor_group_routed_group,
             )
 
-        # Reapply the forward source-major -> expert-major permutation. The
-        # sentinel row supplies every padding index generated by TorchTitan.
-        tensor = torch.vstack((tensor, tensor.new_zeros((tensor.shape[-1],))))
-        return tensor[state.permuted_indices, :]
+        return tensor
 
     def _combine_expert_a2a(
         self,
@@ -1000,19 +1078,20 @@ class DagExecutor:
         tensor: torch.Tensor,
     ) -> torch.Tensor:
         self._require_expert_a2a_state(state)
-        tensor = _unpermute(
+        _validate_routed_payload_schema(
             tensor,
-            state.input_shape,
-            state.permuted_indices,
+            state.payload_shape,
+            state.payload_dtype,
+            context="A2A combine",
         )
-        if state.ep_degree == 1:
-            return tensor
-        return all_to_all_single_autograd(
-            tensor,
-            state.input_splits,
-            state.output_splits,
-            self.runtime.actor_group_routed_group,
-        )
+        if state.ep_degree > 1:
+            tensor = all_to_all_single_autograd(
+                tensor.contiguous(),
+                state.input_splits,
+                state.output_splits,
+                self.runtime.actor_group_routed_group,
+            )
+        return tensor
 
     def _routed_cross_group_state(
         self,
@@ -1039,10 +1118,8 @@ class DagExecutor:
                 f"forward M-to-N dispatch for expert {expert_fwd_uid}"
             )
 
-        source_devices = tuple(sorted(int(d) for d in meta["source_devices"]))
-        destination_devices = tuple(
-            sorted(int(d) for d in meta["destination_devices"])
-        )
+        source_devices = tuple(int(d) for d in meta["source_devices"])
+        destination_devices = tuple(int(d) for d in meta["destination_devices"])
         if not source_devices or not destination_devices:
             raise ValueError(
                 f"Routed node {node.uid} requires non-empty source and "
@@ -1053,10 +1130,28 @@ class DagExecutor:
                 f"Routed node {node.uid} requires disjoint groups, got "
                 f"source={source_devices}, destination={destination_devices}"
             )
+        if source_devices != tuple(sorted(source_devices)):
+            raise ValueError(
+                "source_devices must be in ascending global actor-rank order, "
+                f"got {source_devices}"
+            )
+        if destination_devices != tuple(sorted(destination_devices)):
+            raise ValueError(
+                "destination_devices must be in ascending global actor-rank "
+                f"order, got {destination_devices}"
+            )
         participants = tuple(sorted((*source_devices, *destination_devices)))
+        (
+            num_global_routes,
+            shard_devices,
+            route_partitions,
+        ) = _route_partition_metadata(meta, destination_devices)
         state = _RoutedCrossGroupState(
             source_devices=source_devices,
             destination_devices=destination_devices,
+            shard_devices=shard_devices,
+            num_global_routes=num_global_routes,
+            route_partitions=route_partitions,
             participants=participants,
             layout_group=self.runtime.process_group_for_participants(
                 participants, channel="routed_layout"
@@ -1118,8 +1213,6 @@ class DagExecutor:
     @staticmethod
     def _require_routed_cross_group_layout(
         state: _RoutedCrossGroupState,
-        *,
-        require_permutation: bool,
     ) -> None:
         if (
             state.input_splits is None
@@ -1129,14 +1222,6 @@ class DagExecutor:
                 "M-to-N/N-to-M communication ran before forward dispatch "
                 "established its split layout"
             )
-        if require_permutation and (
-            state.input_shape is None or state.permuted_indices is None
-        ):
-            raise RuntimeError(
-                "Expert-side M-to-N/N-to-M communication ran before forward "
-                "dispatch established its permutation layout"
-            )
-
     def _initialize_routed_cross_group_layout(
         self,
         node: Any,
@@ -1161,26 +1246,24 @@ class DagExecutor:
                 f"Routed node {node.uid} has invalid role={role!r}"
             )
 
-        if local_counts.ndim != 1:
+        if local_counts.ndim != 2 or int(local_counts.shape[0]) != 1:
             raise ValueError(
-                "num_tokens_per_expert must be one-dimensional, got "
-                f"shape={tuple(local_counts.shape)}"
+                "route_counts must have shape [1, num_global_routes] before "
+                f"dispatch, got shape={tuple(local_counts.shape)}"
             )
         if torch.is_floating_point(local_counts) or torch.is_complex(local_counts):
             raise TypeError(
-                "num_tokens_per_expert must use an integer dtype, got "
+                "route_counts must use an integer dtype, got "
                 f"{local_counts.dtype}"
             )
         if bool(torch.any(local_counts < 0).item()):
-            raise ValueError("num_tokens_per_expert cannot contain negative counts")
-        num_experts = int(local_counts.shape[0])
-        destination_degree = len(state.destination_devices)
-        if num_experts % destination_degree:
+            raise ValueError("route_counts cannot contain negative counts")
+        if int(local_counts.shape[1]) != state.num_global_routes:
             raise ValueError(
-                f"num_experts={num_experts} must be divisible by routed "
-                f"destination degree={destination_degree}"
+                f"route_counts has {local_counts.shape[1]} routes, expected "
+                f"num_global_routes={state.num_global_routes}"
             )
-        num_local_experts = num_experts // destination_degree
+        flat_counts = local_counts.reshape(-1)
 
         with torch.no_grad():
             participant_index = {
@@ -1194,11 +1277,11 @@ class DagExecutor:
                 # collective.  In particular, the scalar reads below must not
                 # accidentally synchronize behind that collective on a backend
                 # that launches NCCL work on the current stream.
-                for destination_index, rank in enumerate(state.destination_devices):
-                    start = destination_index * num_local_experts
-                    stop = start + num_local_experts
+                for rank, (start, stop) in zip(
+                    state.shard_devices, state.route_partitions
+                ):
                     input_splits[participant_index[rank]] = int(
-                        local_counts[start:stop].sum().item()
+                        flat_counts[start:stop].sum().item()
                     )
             elif global_rank not in state.destination_devices:
                 raise ValueError(
@@ -1207,7 +1290,7 @@ class DagExecutor:
                 )
 
             gathered_counts = torch.empty(
-                len(state.participants) * num_experts,
+                (len(state.participants), state.num_global_routes),
                 dtype=local_counts.dtype,
                 device=local_counts.device,
             )
@@ -1226,21 +1309,17 @@ class DagExecutor:
                 state.layout_output = gathered_counts
             else:
                 # Destinations need every source row before they can derive
-                # receive splits and the source-major expert permutation.
+                # receive splits and compact source-major local-route counts.
                 layout_work.wait()
-                gathered_counts = gathered_counts.view(
-                    len(state.participants), num_experts
-                )
                 source_counts = torch.stack(
                     [
                         gathered_counts[participant_index[rank]]
                         for rank in state.source_devices
                     ]
                 )
-                destination_index = state.destination_devices.index(global_rank)
-                start = destination_index * num_local_experts
-                stop = start + num_local_experts
-                grouped_counts = source_counts[:, start:stop].contiguous().view(-1)
+                destination_index = state.shard_devices.index(global_rank)
+                start, stop = state.route_partitions[destination_index]
+                grouped_counts = source_counts[:, start:stop].contiguous()
                 for source_index, rank in enumerate(state.source_devices):
                     output_splits[participant_index[rank]] = int(
                         source_counts[source_index, start:stop].sum().item()
@@ -1288,25 +1367,20 @@ class DagExecutor:
                     )
                 )
             else:
-                self._require_routed_cross_group_layout(
-                    state,
-                    require_permutation=(
-                        (direction == "incoming" and role == "destination")
-                        or (direction == "outgoing" and role == "source")
-                    ),
-                )
+                self._require_routed_cross_group_layout(state)
                 grouped_counts = None
 
             if direction == "incoming":
                 if role == "source":
                     if tensor is None:
                         raise ValueError(f"Routed source node {node.uid} has no tensor")
-                    if tensor.ndim != 2:
-                        raise ValueError(
-                            f"Routed source node {node.uid} payload must have "
-                            f"shape [tokens, hidden], got {tuple(tensor.shape)}"
-                        )
                     if task_type == TaskType.FWD_M_TO_N:
+                        _validate_routed_payload_schema(
+                            tensor,
+                            None,
+                            None,
+                            context=f"Forward M-to-N source {node.uid}",
+                        )
                         routed_tokens = int(local_counts.sum().item())
                         if tensor.ndim < 1 or int(tensor.shape[0]) != routed_tokens:
                             raise ValueError(
@@ -1316,6 +1390,13 @@ class DagExecutor:
                             )
                         state.payload_shape = tuple(tensor.shape)
                         state.payload_dtype = tensor.dtype
+                    else:
+                        _validate_routed_payload_schema(
+                            tensor,
+                            state.payload_shape,
+                            state.payload_dtype,
+                            context=f"Routed source {node.uid}",
+                        )
                     collective_input = tensor.contiguous()
                 else:
                     collective_input = self._empty_routed_payload(
@@ -1331,62 +1412,24 @@ class DagExecutor:
                     return None
                 if task_type == TaskType.FWD_M_TO_N:
                     assert grouped_counts is not None
-                    num_local_experts = int(grouped_counts.numel()) // len(
-                        state.source_devices
-                    )
-                    (
-                        state.input_shape,
-                        collective_output,
-                        state.permuted_indices,
-                        source_major_padded_counts,
-                    ) = _permute(
-                        collective_output,
-                        grouped_counts,
-                        len(state.source_devices),
-                        num_local_experts,
-                    )
-                    # GroupedExperts consumes the aligned layout emitted by
-                    # _permute, so pass its padded counts rather than the raw
-                    # routing counts used to size the network transfer.
-                    local_counts = _local_padded_expert_counts(
-                        source_major_padded_counts,
-                        len(state.source_devices),
-                        num_local_experts,
-                    )
-                    global_counts = self._empty_routed_input(
-                        node, int(meta["routing_counts_idx"])
-                    )
-                    global_counts.zero_()
-                    destination_index = state.destination_devices.index(
-                        self.runtime.global_rank
-                    )
-                    start = destination_index * num_local_experts
-                    global_counts[start : start + num_local_experts] = local_counts
-                    return collective_output, global_counts
+                    state.payload_shape = tuple(collective_output.shape)
+                    state.payload_dtype = collective_output.dtype
+                    return collective_output, grouped_counts
 
                 # Backward M-to-N carries the gradient of the forward combine.
-                collective_output = torch.vstack(
-                    (
-                        collective_output,
-                        collective_output.new_zeros((collective_output.shape[-1],)),
-                    )
-                )
-                return collective_output[state.permuted_indices, :]
+                return collective_output
 
             # N-to-M is exactly the reverse of the saved dispatch layout.
             if role == "source":
                 if tensor is None:
                     raise ValueError(f"Routed source node {node.uid} has no tensor")
-                if tensor.ndim != 2:
-                    raise ValueError(
-                        f"Routed source node {node.uid} payload must have "
-                        f"shape [tokens, hidden], got {tuple(tensor.shape)}"
-                    )
-                collective_input = _unpermute(
+                _validate_routed_payload_schema(
                     tensor,
-                    state.input_shape,
-                    state.permuted_indices,
-                ).contiguous()
+                    state.payload_shape,
+                    state.payload_dtype,
+                    context=f"Routed source {node.uid}",
+                )
+                collective_input = tensor.contiguous()
             else:
                 collective_input = self._empty_routed_payload(
                     node, state, tensor_idx
@@ -1397,7 +1440,9 @@ class DagExecutor:
                 state.output_splits,
                 state.n_to_m_group,
             )
-            return collective_output if role == "destination" else None
+            if role != "destination":
+                return None
+            return collective_output
 
     def _run_forward_routed_cross_group(
         self,

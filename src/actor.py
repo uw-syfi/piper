@@ -17,11 +17,13 @@ from .state import (
     LOG_LEVEL,
 )
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
+from .dag import restore_triton_side_table
 from .model_state import (
     DEFAULT_MODEL_SEED,
     dynamo_buffer_name_to_state_dict_key,
     dynamo_parameter_name_to_state_dict_key,
     initialize_parameter_,
+    initialize_route_parameter_,
 )
 from .executors import (
     CommunicationExecutor,
@@ -466,6 +468,81 @@ class PiperActor:
             self.stages.buckets.items(), key=lambda item: str(item[0])
         ):
             name_by_arg_idx = dict(zip(bucket.param_idxs, bucket.param_names))
+            route_specs = bucket.route_sharded_param_specs
+            if route_specs:
+                if ubid in self.stages.param_sharded_ubids:
+                    raise RuntimeError(
+                        f"route-owned bucket {ubid} cannot also use ZeRO "
+                        "parameter sharding across distinct route owners"
+                    )
+                group_size = self.runtime.actor_group_size
+                sync_group = self.runtime.actor_group_sync_group
+                if group_size > 1 and sync_group is None:
+                    raise RuntimeError(
+                        f"cannot export route-owned parameters for bucket "
+                        f"{ubid}: ActorGroup communicator is missing"
+                    )
+                canonical_devices = tuple(
+                    sorted(int(rank) for rank in self.runtime.actor_group_devices)
+                )
+                for arg_idx in sorted(route_specs):
+                    value = bucket.forward_args[arg_idx]
+                    if value is None:
+                        raise RuntimeError(
+                            f"route-owned parameter index {arg_idx} in bucket "
+                            f"{ubid} has no storage"
+                        )
+                    spec = route_specs[arg_idx]
+                    if group_size == 1:
+                        gathered = value.detach()
+                    else:
+                        gathered = torch.empty(
+                            (value.shape[0] * group_size, *value.shape[1:]),
+                            dtype=value.dtype,
+                            device=value.device,
+                        )
+                        with torch.cuda.stream(stream):
+                            dist.all_gather_into_tensor(
+                                gathered, value.detach(), group=sync_group
+                            )
+                        stream.synchronize()
+                    if representative:
+                        shard_devices = tuple(
+                            int(device) for device in spec["shard_devices"]
+                        )
+                        if shard_devices != canonical_devices:
+                            raise RuntimeError(
+                                f"route-owned export for bucket {ubid} requires "
+                                "canonical ascending shard_devices; got "
+                                f"{shard_devices}, expected {canonical_devices}"
+                            )
+                        global_value = gathered
+                        expected_shape = tuple(spec["global_shape"])
+                        if tuple(global_value.shape) != expected_shape:
+                            raise RuntimeError(
+                                f"route-owned export for bucket {ubid} "
+                                f"produced shape={tuple(global_value.shape)}, "
+                                f"expected={expected_shape}"
+                            )
+                        self._add_exported_parameter(
+                            state,
+                            name_by_arg_idx.get(arg_idx),
+                            global_value,
+                        )
+                if representative:
+                    for arg_idx in bucket.trainable_param_idxs:
+                        if arg_idx in route_specs:
+                            continue
+                        value = bucket.forward_args[arg_idx]
+                        if value is None:
+                            raise RuntimeError(
+                                f"cannot export parameter index {arg_idx} in "
+                                f"bucket {ubid}: parameter storage is missing"
+                            )
+                        self._add_exported_parameter(
+                            state, name_by_arg_idx.get(arg_idx), value
+                        )
+                continue
             if ubid in self.stages.param_sharded_ubids:
                 group_size = self.runtime.actor_group_size
                 sync_group = self.runtime.actor_group_sync_group
@@ -713,6 +790,11 @@ class PiperActor:
             ac_num_subgraphs = int(bd.get("ac_num_subgraphs", 1))
             ac_requested_subgraphs = int(bd.get("ac_requested_subgraphs", ac_num_subgraphs))
             gms = [_deserialize_graphmodule(gm_data) for gm_data in bd["gm_data_list"]] if "gm_data_list" in bd else [_deserialize_graphmodule(bd["gm_data"])]
+            restore_triton_side_table(
+                gms,
+                kernels=dict(bd.get("triton_kernels", {})),
+                constant_args=dict(bd.get("triton_constant_args", {})),
+            )
             for gm in gms:
                 self._relocate_meta_devices(gm)
             if self.use_inductor:
@@ -742,6 +824,59 @@ class PiperActor:
             b_input_idxs = list(bd["input_idxs"])
             b_param_idxs = list(bd["param_idxs"])
             apply_zero = bool(bd.get("apply_zero", True))
+            raw_route_specs = list(bd.get("route_sharded_param_specs", ()))
+            route_spec_by_arg_idx: dict[int, dict[str, Any]] = {}
+            if raw_route_specs:
+                shard_devices = tuple(int(rank) for rank in bd["shard_devices"])
+                if shard_devices != tuple(sorted(shard_devices)):
+                    raise RuntimeError(
+                        f"route-owned bucket {ubid} requires canonical ascending "
+                        f"shard_devices, got {shard_devices}"
+                    )
+                if set(shard_devices) != set(self.runtime.actor_group_devices):
+                    raise RuntimeError(
+                        f"route-owned bucket {ubid} shard_devices={shard_devices} "
+                        "do not match its ActorGroup "
+                        f"{self.runtime.actor_group_devices}"
+                    )
+                try:
+                    ownership_index = shard_devices.index(self.runtime.global_rank)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"actor rank {self.runtime.global_rank} has no route "
+                        f"partition in shard_devices={shard_devices}"
+                    ) from exc
+                partitions = list(bd["route_partitions"])
+                partition = partitions[ownership_index]
+                if int(partition["device"]) != self.runtime.global_rank:
+                    raise RuntimeError(
+                        f"route partition {partition} does not describe actor "
+                        f"rank {self.runtime.global_rank}"
+                    )
+                route_start = int(partition["start"])
+                route_stop = int(partition["stop"])
+                for raw_spec in raw_route_specs:
+                    spec = dict(raw_spec)
+                    arg_idx = int(spec["arg_idx"])
+                    if arg_idx in route_spec_by_arg_idx:
+                        raise RuntimeError(
+                            f"duplicate route-owned parameter index {arg_idx} "
+                            f"in bucket {ubid}"
+                        )
+                    if int(spec.get("route_axis", -1)) != 0:
+                        raise RuntimeError(
+                            "only leading-axis route-owned parameters are "
+                            f"supported, got {spec}"
+                        )
+                    local_shape = tuple(int(dim) for dim in spec["local_shape"])
+                    if not local_shape or local_shape[0] != route_stop - route_start:
+                        raise RuntimeError(
+                            f"route-owned parameter {spec} disagrees with "
+                            f"partition {partition}"
+                        )
+                    spec["global_route_start"] = route_start
+                    spec["shard_devices"] = shard_devices
+                    route_spec_by_arg_idx[arg_idx] = spec
             shared_placeholder_names = list(
                 bd.get("shared_placeholder_names", bd.get("placeholder_names", []))
             )
@@ -782,11 +917,20 @@ class PiperActor:
                             "cannot deterministically initialize trainable "
                             f"placeholder {ph_name!r}: unsupported Dynamo name"
                         )
-                    initialize_parameter_(
-                        t,
-                        state_key,
-                        self.model_seed,
-                    )
+                    route_spec = route_spec_by_arg_idx.get(i)
+                    if route_spec is None:
+                        initialize_parameter_(
+                            t,
+                            state_key,
+                            self.model_seed,
+                        )
+                    else:
+                        initialize_route_parameter_(
+                            t,
+                            state_key,
+                            global_route_start=route_spec["global_route_start"],
+                            model_seed=self.model_seed,
+                        )
                     t.requires_grad_(True)
                 else:
                     # Non-trainable slot: fill lifted model buffers (freqs_cis,
@@ -875,6 +1019,7 @@ class PiperActor:
             bucket.forward_fn = _bucket_forward_runner
             bucket.forward_args = realized
             bucket.param_idxs = b_param_idxs
+            bucket.route_sharded_param_specs = route_spec_by_arg_idx
             bucket.activation_checkpoint_subgraph_count = ac_num_subgraphs
             trainable_idxs = [
                 i for i in b_param_idxs
@@ -1063,7 +1208,13 @@ class PiperActor:
                 "is_expert": getattr(node, "uid", None)
                 in routed_expert_fwd_uids,
                 "training_dag_uid": getattr(node, "uid", None),
+                "triton_kernels": dict(meta.get("triton_kernels", {})),
                 "triton_constant_args": dict(meta.get("triton_constant_args", {})),
+                "route_sharded_param_specs": list(
+                    meta.get("route_sharded_param_specs", ())
+                ),
+                "shard_devices": list(meta.get("shard_devices", ())),
+                "route_partitions": list(meta.get("route_partitions", ())),
             }
             stage_to_modules[int(stage_id)].append(module_data)
 

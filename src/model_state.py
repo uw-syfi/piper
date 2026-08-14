@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 
 import torch
 
@@ -89,11 +90,63 @@ def initialize_parameter_(
     )
 
 
+def initialize_route_parameter_(
+    parameter: torch.Tensor,
+    parameter_name: str,
+    *,
+    global_route_start: int = 0,
+    model_seed: int = DEFAULT_MODEL_SEED,
+) -> torch.Tensor:
+    """Initialize complete route slices independently and reproducibly.
+
+    Independent per-route seeds let a rank initialize only its contiguous
+    local experts while producing exactly the corresponding slice of an eager
+    global parameter, without transiently materializing that global tensor.
+    """
+    if parameter.ndim < 1 or parameter.shape[0] <= 0:
+        raise ValueError(
+            "route-owned parameters require a nonempty leading route axis, "
+            f"got shape={tuple(parameter.shape)}"
+        )
+    for local_route in range(int(parameter.shape[0])):
+        global_route = int(global_route_start) + local_route
+        initialize_parameter_(
+            parameter[local_route],
+            f"{parameter_name}[route={global_route}]",
+            model_seed,
+        )
+    return parameter
+
+
 def initialize_model_parameters_(
     model: torch.nn.Module,
     model_seed: int = DEFAULT_MODEL_SEED,
+    *,
+    route_parameter_axes: Mapping[str, int] | None = None,
 ) -> None:
     """Initialize an eager model exactly like Piper actors initialize tensors."""
+    route_parameter_axes = dict(route_parameter_axes or {})
+    named_parameters = dict(model.named_parameters())
+    unknown = sorted(set(route_parameter_axes) - set(named_parameters))
+    if unknown:
+        raise ValueError(
+            f"route_parameter_axes names are not model parameters: {unknown}"
+        )
+    unsupported = {
+        name: axis for name, axis in route_parameter_axes.items() if axis != 0
+    }
+    if unsupported:
+        raise ValueError(
+            "only leading route-axis initialization is currently supported, "
+            f"got {unsupported}"
+        )
     with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            initialize_parameter_(parameter, name, model_seed)
+        for name, parameter in named_parameters.items():
+            if name in route_parameter_axes:
+                initialize_route_parameter_(
+                    parameter,
+                    name,
+                    model_seed=model_seed,
+                )
+            else:
+                initialize_parameter_(parameter, name, model_seed)

@@ -69,6 +69,7 @@ class BucketState:
     input_idxs: list[int] = field(default_factory=list)
     param_idxs: list[int] = field(default_factory=list)
     param_names: list[str] = field(default_factory=list)
+    route_sharded_param_specs: dict[int, dict[str, Any]] = field(default_factory=dict)
     optimizer: Any = None
     trainable_param_idxs: list[int] = field(default_factory=list)
     activation_checkpoint_subgraph_count: int = 1

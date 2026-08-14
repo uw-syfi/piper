@@ -32,8 +32,8 @@ def test_actor_group_metrics_count_per_rank_work_and_keep_rank_peak_labels() -> 
     assert row["program_rank"] == 0
     assert row["actor_group_count"] == 2
     assert row["input_actor_group_size"] == 4
-    assert row["global_tokens_per_step"] == 128
-    assert row["throughput_tokens_per_s"] == 64.0
+    assert row["global_tokens_per_step"] == 32
+    assert row["throughput_tokens_per_s"] == 16.0
     assert row["peak_memory_rank0_gb"] == 1.0
     assert row["peak_memory_rank3_gb"] == 2.0
     assert not any(key.startswith("peak_memory_pp") for key in row)

@@ -46,7 +46,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 0
+      "PP": 0,
+      "EP": "-"
     },
     "devices": [
       0,
@@ -57,7 +58,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 1
+      "PP": 1,
+      "EP": "-"
     },
     "devices": [
       1,
@@ -68,7 +70,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 2
+      "PP": 2,
+      "EP": "-"
     },
     "devices": [
       0,
@@ -79,7 +82,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 3
+      "PP": 3,
+      "EP": "-"
     },
     "devices": [
       1,

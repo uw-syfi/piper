@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from ray import cloudpickle
 import torch
 import torch.nn as nn
 
@@ -10,6 +11,7 @@ from examples.build_schedule import (
 )
 from examples.models.qwen3 import AFDQwen3Model, create_qwen3_config
 from src.dag import TrainingDAG, build_training_dag
+from src.compile import _prepare_training_dags_for_rpc
 from src.directives import _validate_schedule_tags_exist, apply_schedule_directives
 from src.fx import split_gm_by_annotations
 from src.ordering import resolve_total_order_per_stream
@@ -38,7 +40,7 @@ class _ToyExperts(nn.Module):
         return routed_input * scale
 
 
-def _trace_afd_segments(num_stages: int):
+def _trace_afd_segments(num_stages: int, expert_shard_degree: int):
     captured = {}
 
     def backend(gm, example_inputs):
@@ -50,7 +52,11 @@ def _trace_afd_segments(num_stages: int):
     _reset_annotation_state()
     with torch.device("meta"):
         config = create_qwen3_config("9M")
-        model = AFDQwen3Model(config, num_stages=num_stages).to(torch.bfloat16)
+        model = AFDQwen3Model(
+            config,
+            num_stages=num_stages,
+            expert_shard_degree=expert_shard_degree,
+        ).to(torch.bfloat16)
         for layer in model.layers.values():
             layer.moe.experts = _ToyExperts()
         tokens = torch.zeros((1, 8), dtype=torch.int64, device="meta")
@@ -83,7 +89,16 @@ def _full_afd_schedule(base_name: str, *, actor_groups: int) -> list[dict]:
 
 def _lower_afd_schedule(base_name: str, *, actor_groups: int) -> tuple[TrainingDAG, list[TrainingDAG]]:
     directives = _full_afd_schedule(base_name, actor_groups=actor_groups)
-    segments = _trace_afd_segments(num_stages=actor_groups)
+    shard_degrees = {
+        len(directive["devices"])
+        for directive in directives
+        if directive.get("op") == "shard"
+    }
+    assert len(shard_degrees) == 1
+    segments = _trace_afd_segments(
+        num_stages=actor_groups,
+        expert_shard_degree=next(iter(shard_degrees)),
+    )
     global_dag = build_training_dag(segments)
     _validate_schedule_tags_exist(global_dag, directives)
     apply_schedule_directives(global_dag, directives)
@@ -182,6 +197,20 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
     for dag in local_dags:
         _assert_connected(dag)
 
+    rpc_dags = _prepare_training_dags_for_rpc(local_dags)
+    cloudpickle.dumps(rpc_dags)
+    assert all(
+        all(
+            isinstance(dim, int)
+            for arg in node.node_meta.get("graphargs", ())
+            if isinstance(arg, torch.Tensor)
+            for dim in arg.shape
+        )
+        for dag in rpc_dags
+        for node in dag.nodes.values()
+        if node.node_kind == "COMPUTE" and node.compute_subkind == "FWD"
+    )
+
     routed = [
         node for node in global_dag.nodes.values() if node.node_kind in _ROUTED_KINDS
     ]
@@ -191,7 +220,18 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
     assert sum(node.node_kind == "M_TO_N_COMM" for node in routed) == 32
     assert sum(node.node_kind == "N_TO_M_COMM" for node in routed) == 32
     assert not any(
-        node.node_kind == "A2A_COMM" for node in global_dag.nodes.values()
+        node.node_kind in {"A2A_COMM", "SCALE_GRADS"}
+        for node in global_dag.nodes.values()
+    )
+    dense_reductions = [
+        node
+        for node in global_dag.nodes.values()
+        if node.node_kind == "REDUCE_COMM"
+    ]
+    assert dense_reductions
+    assert all(len(node.device or ()) == dense_degree for node in dense_reductions)
+    assert not any(
+        len(node.device or ()) == routed_degree for node in dense_reductions
     )
     p2p_nodes = [
         node

@@ -709,7 +709,6 @@ def _metrics_rows(program_metrics: list[dict]) -> list[dict]:
             (m.get("batch_size") or 0)
             * (m.get("num_microbatches") or 1)
             * (m.get("seq_len") or 0)
-            * input_group_size
         )
         throughput = tokens / mean_iter if iter_times and mean_iter else float("nan")
 

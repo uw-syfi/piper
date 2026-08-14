@@ -9,7 +9,7 @@ from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
     TrainingDAGNode,
-    _collect_triton_constant_args,
+    _collect_triton_side_table,
     _has_path,
     _iter_data_edges,
     _node_io_names,
@@ -21,6 +21,7 @@ from .dag import (
     _with_pass_tag,
 )
 from .state import LOG_LEVEL, create_logger
+from .schedule import validate_shard_device_order
 
 logger = create_logger("directives", LOG_LEVEL)
 _ANY_TAG_INDEX = "__ANY_TAG_INDEX__"
@@ -91,6 +92,60 @@ def _matching_uids(
             )
         )
     return sorted(matched, key=dag._node_order.__getitem__)
+
+
+def _matched_compute_regions(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+) -> set[str]:
+    """Return logical model regions selected by a communication directive."""
+    regions: set[str] = set()
+    for uid in _matching_uids(dag, filters):
+        node = dag.nodes[uid]
+        if node.node_kind != "COMPUTE":
+            continue
+        if _is_backward_compute_subkind(node.compute_subkind):
+            fwd_uid = node.node_meta.get("fwd_uid")
+            if isinstance(fwd_uid, str) and fwd_uid in dag.nodes:
+                regions.add(fwd_uid)
+                continue
+        regions.add(uid)
+    return regions
+
+
+def _validate_replicate_shard_disjoint(
+    dag: TrainingDAG,
+    directives: list[Any],
+) -> None:
+    """Reject logical model regions selected by both replicate and shard."""
+    selections: dict[str, list[tuple[int, dict[str, Any], set[str]]]] = {
+        "replicate": [],
+        "shard": [],
+    }
+    for directive_idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") not in selections:
+            continue
+        op, filters, *_rest = _normalize_filter_devices_directive(raw)
+        selections[op].append(
+            (
+                directive_idx,
+                filters[0],
+                _matched_compute_regions(dag, filters),
+            )
+        )
+
+    for replicate_idx, replicate_filter, replicate_regions in selections[
+        "replicate"
+    ]:
+        for shard_idx, shard_filter, shard_regions in selections["shard"]:
+            overlap = sorted(replicate_regions & shard_regions)
+            if overlap:
+                raise ValueError(
+                    "replicate and shard directives must select disjoint model "
+                    f"regions: replicate directive[{replicate_idx}] filter="
+                    f"{replicate_filter} and shard directive[{shard_idx}] "
+                    f"filter={shard_filter} both match regions={overlap}"
+                )
 
 
 def _apply_split_backward_stencil(
@@ -779,6 +834,7 @@ def _bucket_matched_fwd_nodes(
         fwd_bucket_uids: list[str] = []
         bwd_bucket_uids: list[str] = []
         for bi, (bgm, b_in, b_param, b_args) in enumerate(buckets):
+            triton_side_table = _collect_triton_side_table(bgm)
             (
                 bucket_input_names,
                 bucket_output_names,
@@ -812,9 +868,10 @@ def _bucket_matched_fwd_nodes(
                             bucket_differentiable_output_indices
                         ),
                         "a2a_boundary_after": None,
-                        "triton_constant_args": _collect_triton_constant_args(
-                            bgm
-                        ),
+                        "triton_kernels": triton_side_table["kernels"],
+                        "triton_constant_args": triton_side_table[
+                            "constant_args"
+                        ],
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
                         "bucket_key": bucket_key,
@@ -1238,6 +1295,31 @@ def _routed_expert_fwd_uid(compute_node: TrainingDAGNode) -> str:
     return fwd_uid
 
 
+_ROUTE_OWNERSHIP_META_KEYS = (
+    "num_global_routes",
+    "shard_degree",
+    "shard_devices",
+    "num_local_routes",
+    "route_partitions",
+)
+
+
+def _route_ownership_meta(node: TrainingDAGNode) -> dict[str, Any]:
+    """Copy schedule-derived ownership metadata without inferring model semantics."""
+    present = {
+        key: node.node_meta[key]
+        for key in _ROUTE_OWNERSHIP_META_KEYS
+        if key in node.node_meta
+    }
+    if present and len(present) != len(_ROUTE_OWNERSHIP_META_KEYS):
+        missing = sorted(set(_ROUTE_OWNERSHIP_META_KEYS) - set(present))
+        raise ValueError(
+            f"routed region {node.uid} has incomplete route ownership metadata; "
+            f"missing={missing}"
+        )
+    return present
+
+
 def _require_routed_slot(
     value: Any,
     *,
@@ -1292,8 +1374,8 @@ def _validate_routed_marker_slots(
     dispatch_owner: TrainingDAGNode,
     routed_node: TrainingDAGNode,
     *,
-    routed_degree: int,
-) -> tuple[int, int, int]:
+    shard_devices: tuple[int, ...],
+) -> tuple[int, int, int, dict[str, Any]]:
     """Validate routed tensor slots shared by A2A and M/N lowering."""
     dispatch_boundary = dispatch_owner.node_meta.get("a2a_boundary_after")
     combine_boundary = routed_node.node_meta.get("a2a_boundary_after")
@@ -1395,20 +1477,142 @@ def _validate_routed_marker_slots(
         )
 
     counts_schema = dispatch_boundary.get("routing_counts_schema")
-    if isinstance(counts_schema, dict):
-        counts_shape = counts_schema.get("shape")
-        if (
-            isinstance(counts_shape, (list, tuple))
-            and len(counts_shape) == 1
-            and isinstance(counts_shape[0], int)
-            and counts_shape[0] % routed_degree
-        ):
+    counts_shape = (
+        counts_schema.get("shape") if isinstance(counts_schema, dict) else None
+    )
+    if not (
+        isinstance(counts_shape, (list, tuple))
+        and len(counts_shape) == 2
+        and all(
+            not isinstance(dim, bool) and isinstance(dim, int) and dim >= 0
+            for dim in counts_shape
+        )
+    ):
+        raise ValueError(
+            f"routed region {routed_node.uid} requires statically known rank-2 "
+            "dispatch counts shaped [source_blocks, global_routes] before "
+            f"schedule lowering; got routing_counts_shape={counts_shape!r}"
+        )
+    if counts_shape[0] != 1:
+        raise ValueError(
+            f"routed region {routed_node.uid} source-side dispatch counts must "
+            "contain exactly one source block before communication; got "
+            f"routing_counts_shape={tuple(counts_shape)}"
+        )
+
+    shard_degree = len(shard_devices)
+    if shard_degree <= 0:
+        raise ValueError(
+            f"routed region {routed_node.uid} requires a nonempty ordered "
+            "shard device list"
+        )
+    if len(set(shard_devices)) != shard_degree:
+        raise ValueError(
+            f"routed region {routed_node.uid} shard devices must be unique; "
+            f"got devices={list(shard_devices)}"
+        )
+    num_global_routes = counts_shape[1]
+    if num_global_routes <= 0:
+        raise ValueError(
+            f"routed region {routed_node.uid} requires at least one global "
+            f"route; got num_global_routes={num_global_routes}"
+        )
+    if num_global_routes % shard_degree:
+        raise ValueError(
+            f"routed region {routed_node.uid} has "
+            f"num_global_routes={num_global_routes}, which is not divisible by "
+            f"shard_degree={shard_degree} for ordered shard devices "
+            f"{list(shard_devices)}"
+        )
+
+    num_local_routes = num_global_routes // shard_degree
+    route_partitions = [
+        {
+            "device": device,
+            "start": shard_index * num_local_routes,
+            "stop": (shard_index + 1) * num_local_routes,
+        }
+        for shard_index, device in enumerate(shard_devices)
+    ]
+    route_ownership = {
+        "num_global_routes": num_global_routes,
+        "shard_degree": shard_degree,
+        "shard_devices": list(shard_devices),
+        "num_local_routes": num_local_routes,
+        "route_partitions": route_partitions,
+    }
+    return payload_idx, counts_idx, combine_idx, route_ownership
+
+
+def _validate_route_owned_parameters(
+    routed_node: TrainingDAGNode,
+    route_ownership: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate the initial complete-route parameter layout contract.
+
+    A ``shard``-owned routed region materializes every trainable lifted
+    parameter locally.  Route cardinality comes only from the marked counts and
+    schedule; parameter shapes are checked against that result rather than used
+    to infer it.  The initially supported parameter route axis is axis zero.
+    """
+    graphargs = routed_node.node_meta.get("graphargs")
+    param_idxs = routed_node.node_meta.get("param_idxs")
+    input_names = routed_node.node_meta.get("input_names")
+    if graphargs is None or param_idxs is None:
+        # Synthetic DAG fixtures may intentionally omit executable model data.
+        return []
+    if not isinstance(graphargs, list) or not isinstance(param_idxs, list):
+        raise ValueError(
+            f"routed region {routed_node.uid} has invalid graphargs/param_idxs "
+            "metadata for route-owned parameter validation"
+        )
+    names = input_names if isinstance(input_names, (list, tuple)) else ()
+    num_local_routes = int(route_ownership["num_local_routes"])
+    num_global_routes = int(route_ownership["num_global_routes"])
+    specs: list[dict[str, Any]] = []
+    for raw_idx in param_idxs:
+        if isinstance(raw_idx, bool) or not isinstance(raw_idx, int):
             raise ValueError(
-                f"routed region {routed_node.uid} has "
-                f"num_routes={counts_shape[0]}, which is not divisible by "
-                f"its sharded ActorGroup width={routed_degree}"
+                f"routed region {routed_node.uid} has invalid parameter index "
+                f"{raw_idx!r}"
             )
-    return payload_idx, counts_idx, combine_idx
+        if raw_idx < 0 or raw_idx >= len(graphargs):
+            raise ValueError(
+                f"routed region {routed_node.uid} parameter index {raw_idx} "
+                f"is outside graphargs length {len(graphargs)}"
+            )
+        value = graphargs[raw_idx]
+        if value is None or not bool(getattr(value, "requires_grad", False)):
+            continue
+        shape = tuple(getattr(value, "shape", ()))
+        if not shape or type(shape[0]) is not int:
+            raise ValueError(
+                f"routed region {routed_node.uid} trainable parameter "
+                f"index {raw_idx} must have a statically known leading route "
+                f"axis, got shape={shape}"
+            )
+        if int(shape[0]) != num_local_routes:
+            name = names[raw_idx] if raw_idx < len(names) else f"arg[{raw_idx}]"
+            raise ValueError(
+                f"routed region {routed_node.uid} parameter {name!r} must "
+                "materialize one complete slice per local route on leading "
+                f"axis 0; got shape={shape}, num_local_routes={num_local_routes}"
+            )
+        global_shape = (num_global_routes, *tuple(int(dim) for dim in shape[1:]))
+        specs.append(
+            {
+                "arg_idx": raw_idx,
+                "placeholder_name": (
+                    str(names[raw_idx])
+                    if raw_idx < len(names)
+                    else f"arg[{raw_idx}]"
+                ),
+                "route_axis": 0,
+                "local_shape": tuple(int(dim) for dim in shape),
+                "global_shape": global_shape,
+            }
+        )
+    return specs
 
 
 def _validate_cross_group_routed_interface(
@@ -1568,8 +1772,15 @@ def _validate_placed_routed_regions(
     cross out of the sharded ActorGroup.  A cross-group combine may target a
     later dense ActorGroup, but the original dense state owner and that target
     must have equal widths so the retained buffer can be relayed lane-wise.
+
+    ActorGroup identity is compared as an unordered device set. Route
+    ownership maps equal contiguous ranges of the global route axis to the
+    shard directive's devices in canonical ascending global-rank order. The
+    schedule validator rejects noncanonical shard lists before this pass.
     """
-    shard_specs: list[tuple[int, list[dict[str, Any]], tuple[int, ...]]] = []
+    shard_specs: list[
+        tuple[int, list[dict[str, Any]], tuple[int, ...], tuple[int, ...]]
+    ] = []
     replicate_specs: list[tuple[list[dict[str, Any]], tuple[int, ...]]] = []
     for directive_idx, raw in enumerate(directives):
         if not isinstance(raw, dict) or raw.get("op") not in {"replicate", "shard"}:
@@ -1585,9 +1796,12 @@ def _validate_placed_routed_regions(
             _shard_grads,
             _bucket_size,
         ) = _normalize_filter_devices_directive(raw)
-        device_key = tuple(sorted(int(device) for device in devices))
+        ordered_devices = tuple(int(device) for device in devices)
+        device_key = tuple(sorted(ordered_devices))
         if op == "shard":
-            shard_specs.append((directive_idx, filters, device_key))
+            shard_specs.append(
+                (directive_idx, filters, ordered_devices, device_key)
+            )
         else:
             replicate_specs.append((filters, device_key))
 
@@ -1602,7 +1816,12 @@ def _validate_placed_routed_regions(
 
     shard_policy_by_fwd_uid: dict[str, tuple[int, tuple[int, ...]]] = {}
     shard_matched_uids_by_directive: dict[int, set[str]] = {}
-    for directive_idx, filters, expected_devices in shard_specs:
+    for (
+        directive_idx,
+        filters,
+        ordered_shard_devices,
+        expected_device_set,
+    ) in shard_specs:
         matched_uids = {
             uid
             for uid in _matching_uids(dag, filters)
@@ -1626,15 +1845,15 @@ def _validate_placed_routed_regions(
                 if node.device is None
                 else tuple(sorted(int(device) for device in node.device))
             )
-            if actual_devices != expected_devices:
+            if actual_devices != expected_device_set:
                 raise ValueError(
                     f"shard directive[{directive_idx}] requires matched node "
-                    f"{uid} to be placed on devices={list(expected_devices)}, "
+                    f"{uid} to be placed on devices={list(ordered_shard_devices)}, "
                     f"got node_devices={node.device}"
                 )
         for fwd_uid in matched_fwd_uids:
             previous = shard_policy_by_fwd_uid.get(fwd_uid)
-            policy = (directive_idx, expected_devices)
+            policy = (directive_idx, ordered_shard_devices)
             if previous is not None:
                 raise ValueError(
                     f"routed region {fwd_uid} matches multiple shard "
@@ -1798,14 +2017,23 @@ def _validate_placed_routed_regions(
                 "boundary on the routed region output"
             )
 
-        _validate_routed_marker_slots(
-            dispatch_owner,
-            fwd_node,
-            routed_degree=len(routed_devices),
+        _payload_idx, _counts_idx, _combine_idx, route_ownership = (
+            _validate_routed_marker_slots(
+                dispatch_owner,
+                fwd_node,
+                shard_devices=routed_devices,
+            )
         )
+        fwd_node.node_meta.update(route_ownership)
+        route_param_specs = _validate_route_owned_parameters(
+            fwd_node, route_ownership
+        )
+        if route_param_specs:
+            fwd_node.node_meta["route_sharded_param_specs"] = route_param_specs
 
         owner_devices = _device_key(dispatch_owner)
         consumer_devices = _device_key(combine_consumer)
+        routed_device_set = tuple(sorted(routed_devices))
         _require_replicated_dense(dispatch_owner, routed_uid=fwd_uid)
         _require_replicated_dense(combine_consumer, routed_uid=fwd_uid)
 
@@ -1813,16 +2041,16 @@ def _validate_placed_routed_regions(
             ("dispatch", owner_devices),
             ("combine", consumer_devices),
         ):
-            overlap = set(dense_devices) & set(routed_devices)
-            if dense_devices != routed_devices and overlap:
+            overlap = set(dense_devices) & set(routed_device_set)
+            if dense_devices != routed_device_set and overlap:
                 raise ValueError(
                     f"routed region {fwd_uid} has a partially overlapping "
                     f"{role} ActorGroup: routed_devices={list(routed_devices)}, "
                     f"dense_devices={list(dense_devices)}"
                 )
 
-        dispatch_crosses_group = owner_devices != routed_devices
-        combine_crosses_group = consumer_devices != routed_devices
+        dispatch_crosses_group = owner_devices != routed_device_set
+        combine_crosses_group = consumer_devices != routed_device_set
         if dispatch_crosses_group != combine_crosses_group:
             raise ValueError(
                 f"routed region {fwd_uid} mixes within-group and cross-group "
@@ -1885,11 +2113,12 @@ def _validate_placed_routed_regions(
                 f"{bwd_node.uid}; a routed lifecycle must be lowered by one "
                 "shard policy"
             )
-        if _device_key(bwd_node) != routed_devices:
+        if _device_key(bwd_node) != routed_device_set:
             raise ValueError(
                 f"routed forward/backward placement mismatch for {fwd_uid}: "
                 f"forward={list(routed_devices)}, backward={bwd_node.device}"
             )
+        bwd_node.node_meta.update(route_ownership)
 
         bwd_incoming = _activation_compute_edges(bwd_node.uid, incoming=True)
         bwd_outgoing = _activation_compute_edges(bwd_node.uid, incoming=False)
@@ -2337,6 +2566,7 @@ def _insert_cross_group_routed_comm_nodes(
                 "comm_id": comm_id,
                 "comm_group_kind": "routed_cross_group",
             }
+            common_meta.update(_route_ownership_meta(expert_fwd_node))
             if direction == "incoming" and expert_node.compute_subkind == "FWD":
                 routing_counts_idx = boundary_info.get("routing_counts_idx")
                 if routing_counts_idx is None:
@@ -2683,6 +2913,7 @@ def _insert_shard_a2a_comm_nodes(
                 "comm_group_kind": "ep",
                 "participants": sorted(int(rank) for rank in node.device),
             }
+            comm_meta.update(_route_ownership_meta(dag.nodes[expert_fwd_uid]))
             if node.compute_subkind == "FWD":
                 comm_meta["routing_counts_idx"] = routing_counts_by_fwd_uid[
                     expert_fwd_uid
@@ -2726,6 +2957,7 @@ def _insert_shard_a2a_comm_nodes(
                     "comm_id": f"a2a:{uid}->{e.dst_uid}:{a2a_tensor_idx}",
                     "comm_group_kind": "ep",
                     "participants": sorted(int(rank) for rank in node.device),
+                    **_route_ownership_meta(dag.nodes[expert_fwd_uid]),
                 },
             )
             dag.add_node(comm_node)
@@ -3300,6 +3532,9 @@ def apply_communication_directives_to_rank_dags(
 ) -> None:
     """Lower ActorGroup-local communication after physical DAG splitting."""
 
+    validate_shard_device_order(directives)
+    for rank_dag in rank_dags:
+        _validate_replicate_shard_disjoint(rank_dag, directives)
     shared_comm_indices: dict[str, int] = {}
     for rank_dag in rank_dags:
         rank_dag._next_comm_index_by_kind = shared_comm_indices
@@ -3332,6 +3567,8 @@ def apply_schedule_directives(
 ) -> None:
     if not directives:
         return
+    validate_shard_device_order(directives)
+    _validate_replicate_shard_disjoint(training_dag, directives)
     split_backward_keys = _validate_split_backward_order_stencil(directives)
 
     # Buckets partition the base FX graph and are shared by every microbatch.
@@ -3371,6 +3608,9 @@ def apply_schedule_directives(
         _apply_split_directive(training_dag, flt, dim_name, num_microbatches)
 
     _apply_split_backward_stencil(training_dag, split_backward_keys)
+    # Recheck filters that become concrete only after MB expansion or
+    # backward splitting.
+    _validate_replicate_shard_disjoint(training_dag, directives)
     place_streams: set[str] = set()
     placed_devices_by_compute_uid: dict[str, tuple[int, ...]] = {}
     for i, raw in enumerate(directives):

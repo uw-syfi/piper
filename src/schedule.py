@@ -18,8 +18,76 @@ def load_schedule_directives(path: str) -> list[dict]:
                 "split.num_microbatches must be encoded in the schedule JSON; "
                 "'__MBS__' is no longer supported"
             )
+    _validate_replicate_shard_filter_nesting(directives)
     _validate_device_set_consistency(directives)
     return directives
+
+
+def validate_shard_device_order(directives: list[Any]) -> None:
+    """Require route ownership to follow canonical global-rank order."""
+    for idx, directive in enumerate(directives):
+        if not isinstance(directive, dict) or directive.get("op") != "shard":
+            continue
+        devices = directive.get("devices", directive.get("device"))
+        if not isinstance(devices, list) or any(
+            isinstance(device, bool) or not isinstance(device, int)
+            for device in devices
+        ):
+            # The ordinary directive-shape validation reports malformed lists.
+            continue
+        canonical = sorted(devices)
+        if devices != canonical:
+            raise ValueError(
+                f"shard directive[{idx}] devices must be in ascending global "
+                f"actor-rank order; got {devices}, expected {canonical}"
+            )
+
+
+def _filter_subsumes(
+    broader: dict[str, Any],
+    narrower: dict[str, Any],
+) -> bool:
+    """Whether every tag matched by ``narrower`` also matches ``broader``."""
+    for key, broader_value in broader.items():
+        if key not in narrower:
+            return False
+        narrower_value = narrower[key]
+        if broader_value == "-":
+            if narrower_value != "-":
+                return False
+        elif broader_value == "*":
+            if narrower_value in ("-", None):
+                return False
+        elif narrower_value != broader_value:
+            return False
+    return True
+
+
+def _validate_replicate_shard_filter_nesting(
+    directives: list[dict[str, Any]],
+) -> None:
+    """Reject filter pairs whose overlap is provable without a model DAG."""
+    replicate = [
+        (idx, directive["filter"])
+        for idx, directive in enumerate(directives)
+        if directive.get("op") == "replicate"
+    ]
+    shard = [
+        (idx, directive["filter"])
+        for idx, directive in enumerate(directives)
+        if directive.get("op") == "shard"
+    ]
+    for replicate_idx, replicate_filter in replicate:
+        for shard_idx, shard_filter in shard:
+            if _filter_subsumes(
+                replicate_filter, shard_filter
+            ) or _filter_subsumes(shard_filter, replicate_filter):
+                raise ValueError(
+                    "replicate and shard directives must select disjoint model "
+                    f"regions: replicate directive[{replicate_idx}] filter="
+                    f"{replicate_filter} overlaps shard directive[{shard_idx}] "
+                    f"filter={shard_filter}"
+                )
 
 
 def load_schedule_info(path: str) -> dict[str, Any]:
@@ -148,6 +216,7 @@ def _validate_device_set_consistency(directives: list[dict]) -> None:
     two distinct sets may not overlap. This prevents a schedule from treating
     a subset (or any other partial overlap) as a different SPMD group.
     """
+    validate_shard_device_order(directives)
     device_sets: list[tuple[int, str, frozenset[int]]] = []
     place_sets: set[frozenset[int]] = set()
     communication_sets: list[tuple[int, str, frozenset[int]]] = []

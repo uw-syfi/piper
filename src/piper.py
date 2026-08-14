@@ -122,24 +122,68 @@ def annotate(name: str, *, index: int | None = None) -> Iterator[dict[str, int]]
 def _mark_ep_boundary(tensor: torch.Tensor, role: str) -> torch.Tensor:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(
-            f"Piper EP boundary markers require a torch.Tensor, got {type(tensor)!r}"
+            "Piper routed boundary markers require a torch.Tensor, "
+            f"got {type(tensor)!r}"
         )
     with fx.traceback.annotate({PIPER_EP_BOUNDARY_META_KEY: role}):
         return torch.ops.aten.alias.default(tensor)
 
 
 def mark_dispatch_payload(tensor: torch.Tensor) -> torch.Tensor:
-    """Mark the routed activation entering a Piper EP region."""
+    """Mark the sole dynamic payload entering a routed model region.
+
+    ``tensor`` must be a rank-2 ``[rows, hidden]`` tensor whose rows are
+    packed as consecutive route blocks in the order documented by the
+    accompanying :func:`mark_dispatch_counts` tensor. Its row count must equal
+    the sum of those counts. Piper transports these rows opaquely; model code
+    inside the routed region owns any expert-local regrouping or
+    kernel-specific padding.
+
+    The Piper user is responsible for packing each row into the semantically
+    correct route block. Piper can validate the payload shape and total row
+    count, but cannot infer a row's intended route from its tensor values.
+    """
     return _mark_ep_boundary(tensor, EP_DISPATCH_PAYLOAD)
 
 
 def mark_dispatch_counts(tensor: torch.Tensor) -> torch.Tensor:
-    """Mark the per-expert token counts entering a Piper EP region."""
+    """Mark the sole routing descriptor entering a routed model region.
+
+    ``tensor`` must be a nonnegative, non-differentiable integer tensor shaped
+    ``[source_blocks, local_routes]``. Entry ``[source, route]`` gives the
+    number of consecutive dispatch-payload rows for that source block and
+    route. The route-axis order is the model's logical route order; after
+    sharding, Piper assigns equal contiguous route ranges to shard devices in
+    ascending global actor-rank order. Unsorted ``shard.devices`` lists are
+    rejected rather than silently changing ownership.
+
+    Piper uses these counts only to derive and validate transport metadata. It
+    does not interpret routes as experts, regroup rows into expert-local order,
+    or apply expert-kernel alignment. Both this descriptor and the marked
+    dispatch payload must contribute to the marked combine payload. The Piper
+    user is responsible for ensuring that every count describes the actual
+    consecutive row block packed into the dispatch payload; Piper cannot prove
+    that semantic correspondence from tensor values.
+    """
     return _mark_ep_boundary(tensor, EP_DISPATCH_COUNTS)
 
 
 def mark_combine_payload(tensor: torch.Tensor) -> torch.Tensor:
-    """Mark the expert activation leaving a Piper EP region."""
+    """Mark the sole dynamic payload leaving a routed model region.
+
+    ``tensor`` must contain exactly one result row for every dispatch row and
+    must restore the source-major, local-route row order received by the
+    routed region. Its dtype and trailing shape must match the dispatch
+    payload. Piper reverses the transport from saved split metadata and cannot
+    recover an ordering changed by model-side expert computation. This is the
+    only dynamic activation allowed to leave the routed region.
+
+    The Piper user is responsible for restoring the semantic identity of every
+    row to the exact source-major, local-route order received by the region.
+    Piper can validate shapes, dtypes, dependencies, and row totals, but cannot
+    prove semantic row identity from tensor values. Models should test this
+    contract with identifiable rows.
+    """
     return _mark_ep_boundary(tensor, EP_COMBINE_PAYLOAD)
 
 
@@ -1280,23 +1324,42 @@ def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
 
     schedule_info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
     actor_ranks = list(actors)
-    representative_ranks = {
-        int(group["devices"][0])
+    result_by_rank = {
+        int(actor_rank): result
+        for actor_rank, result in zip(actor_ranks, results)
+    }
+    actor_groups = {
+        int(group["id"]): group
         for group in schedule_info.get("actor_groups", [])
     }
-    if not representative_ranks:
-        raise RuntimeError("schedule metadata contains no ActorGroups")
+    loss_group_ids = schedule_info.get("loss_actor_group_ids")
+    if not actor_groups or not isinstance(loss_group_ids, list) or not loss_group_ids:
+        raise RuntimeError(
+            "schedule metadata must identify ActorGroups that compute loss"
+        )
+
     losses = []
-    for actor_rank, result in zip(actor_ranks, results):
-        # Every rank in a schedule ActorGroup executes the same DAG, including
-        # replicated loss computation. Report one loss sample per group rather
-        # than multiplying it by the group's SPMD width.
-        if int(actor_rank) not in representative_ranks:
-            continue
-        if isinstance(result, dict):
-            losses.extend(result.get("losses", []))
-        elif result:
-            losses.extend(result)
+    for group_id in loss_group_ids:
+        group = actor_groups.get(int(group_id))
+        if group is None:
+            raise RuntimeError(
+                f"loss ActorGroup id {group_id} is missing from schedule metadata"
+            )
+        losses_by_rank = []
+        for actor_rank in group["devices"]:
+            result = result_by_rank[int(actor_rank)]
+            rank_losses = result.get("losses", []) if isinstance(result, dict) else result
+            losses_by_rank.append(list(rank_losses or []))
+        sample_counts = {len(rank_losses) for rank_losses in losses_by_rank}
+        if len(sample_counts) != 1:
+            raise RuntimeError(
+                f"loss ActorGroup {group_id} ranks returned inconsistent loss "
+                f"sample counts: {sorted(sample_counts)}"
+            )
+        # Each rank computes the mean loss for its equally sized, distinct
+        # microbatch shard. Their arithmetic mean is the global-microbatch loss.
+        for samples in zip(*losses_by_rank):
+            losses.append(sum(float(sample) for sample in samples) / len(samples))
     return losses
 
 

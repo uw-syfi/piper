@@ -22,6 +22,7 @@ from models.qwen3 import (
     PiperQwen3Model,
     QWEN_MODEL_NAMES,
     create_qwen3_config,
+    qwen_expert_shard_degree,
 )
 from torchtitan.models.qwen3.model.model import precompute_rope_cache
 
@@ -78,10 +79,13 @@ def main(args, pg):
         config.rope_theta,
     )
     model_cls = _model_class_for_schedule(args.schedule_directives_file)
+    shard_degree = qwen_expert_shard_degree(
+        load_schedule_directives(args.schedule_directives_file)
+    )
     logger.info("Using Qwen wrapper %s", model_cls.__name__)
     piper_setup(
         model_cls,
-        model_args=(config, num_stages),
+        model_args=(config, num_stages, shard_degree),
         optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
@@ -95,6 +99,7 @@ def main(args, pg):
         use_inductor=args.use_inductor,
         pp_outer=args.pp_outer,
         schedule_directives_file=args.schedule_directives_file,
+        dynamic_input_dims={0: (1,)},
     )
 
     del x, y

@@ -17,7 +17,7 @@ shapes, or depend on a particular sequence of expert operations.
 | Responsibility | Owner |
 |---|---|
 | Ordered source and destination ranks | Piper schedule |
-| Whole-expert ownership | `shard` directive and its ordered device list |
+| Whole-expert ownership | `shard` directive in ascending global-rank order |
 | Packed dispatch payload | Model code |
 | Counts for the ordered global routes | Model code |
 | Split calculation and dynamic metadata exchange | Piper backend |
@@ -39,17 +39,26 @@ the shard degree is `N` and every rank owns `L` local experts, the model has
 Piper does not shard the matrices within an individual expert; that would be
 tensor parallelism within an expert, not traditional EP.
 
+For the initial implementation, every trainable lifted parameter consumed by a
+routed region is route-owned and must be captured with leading dimension
+`num_local_experts`. Piper derives that local cardinality from the marked global
+route width and scheduled shard degree, validates the parameter shape, and
+never infers ownership from parameter names or expert operators. A future
+explicit parameter marker is required before a routed region can mix
+route-owned and replicated trainable parameters.
+
 The initially supported ownership rule is **equal contiguous route-axis
 sharding**. For `shard(N)`, Piper divides the ordered global route/expert axis
 into `N` equal contiguous ranges. Piper must:
 
 - validate that the global route count is divisible by the shard degree; and
-- document and enforce that device-list order determines ownership.
+- require shard device lists in ascending global actor-rank order and assign
+  ownership in that canonical order.
 
 For example, with eight experts and devices `[1, 3]`, device 1 owns experts
-0--3 and device 3 owns experts 4--7. Uneven or noncontiguous ownership requires
-a future explicit route-to-device mapping and must not be inferred
-heuristically.
+0--3 and device 3 owns experts 4--7. `[3, 1]` is rejected rather than silently
+changing that ownership. Uneven or noncontiguous ownership requires a future
+explicit route-to-device mapping and must not be inferred heuristically.
 
 The model-side code that converts received source-major rows into expert-local
 order needs counts logically shaped:
@@ -186,8 +195,8 @@ After placement is available, Piper should reject a schedule unless:
   region;
 - the global route count is known;
 - `num_global_routes % shard_degree == 0`;
-- the ordered shard device list unambiguously defines equal contiguous route
-  ranges;
+- the shard device list is in ascending global actor-rank order and therefore
+  unambiguously defines equal contiguous route ranges in communicator order;
 - dispatch and combine refer to the same routed-region identity;
 - a within-group route has the same ordered participant set on both sides;
 - a cross-group route has disjoint ordered source and destination sets;
@@ -254,7 +263,7 @@ _validate_combine_payload(...)
 
 These helpers should:
 
-- derive equal contiguous route partitions from the ordered shard devices;
+- derive equal contiguous route partitions from canonical shard devices;
 - derive local send splits from model-provided global route counts;
 - exchange compact routing metadata;
 - expose destination-local source-major counts;
@@ -322,7 +331,7 @@ an untouched expert implementation can carry its own padding wrapper through DAG
 serialization and actor loading. This support must be operator-generic and must
 not recognize grouped-MM graph structure.
 
-## 5. Validation across expert implementations
+## 5. Validation coverage across expert implementations
 
 Do not add a new example MoE model as part of this work. Validate the boundary
 using:
@@ -360,14 +369,16 @@ using:
 - Compare forward outputs, input gradients, parameter gradients, and optimizer
   updates against an unsharded eager reference.
 
-### GPU end-to-end tests
+### End-to-end parameter parity
 
-- Run Qwen grouped-MM and loop experts against the single-GPU eager reference
-  under AFD PP2 and PP4 schedules.
-- Run two optimizer steps so gradient scaling and ordering errors affect final
-  parameters.
-- Then run the existing Qwen e2e correctness suite for the default expert
-  implementation.
+- Select the existing Qwen parameter-parity cases for AFD PP2, AFD PP4, and
+  DualPipeV. Do not add or parameterize new e2e tests for this focused gate.
+- These existing cases run two SGD optimizer steps, comparing the initialized
+  and final distributed parameter states with the single-GPU eager reference so
+  gradient synchronization, route ordering, and reverse-communication errors are
+  observable.
+- After the focused unit and e2e gates pass, run the entire existing Qwen e2e
+  correctness suite.
 
 ### Static regressions
 
@@ -378,6 +389,197 @@ Add assertions that Piper core:
 - does not infer route semantics from expert tag names, operator sequences, or
   weight shapes.
 
+## 6. Staged implementation and verification
+
+The work is divided by resource requirements. Stage 1 must reach a complete,
+logically executable implementation without allocating or dispatching GPU
+compute. Stage 2 begins only after Stage 1 is green and uses GPU resources to
+complete any behavior that cannot be established through capture, logical DAG
+execution, or mocked collectives.
+
+No new e2e cases are introduced by this work. The focused GPU e2e gate selects
+cases from the existing `test_qwen_parameter_parity` parameterization.
+
+### Stage 1: implementation and verification without GPUs
+
+#### Implementation scope
+
+Implement the contract and core behavior described in Sections 1--4 without
+waiting for GPU access:
+
+- add the marker documentation and capture-time exclusive-interface checks;
+- add route-count divisibility and directive device-list ownership checks;
+- add the private route partition, split, count-exchange, and validation
+  helpers;
+- refactor A2A and M-to-N/N-to-M forward and backward paths to preserve opaque
+  source-major row order;
+- reduce saved routed state to topology, split, and payload-schema metadata;
+- move expert-local regrouping and inverse regrouping into the Qwen model-side
+  routed region;
+- capture Qwen expert modules with local complete-expert parameters, preserve a
+  dynamic routed row dimension through FX splitting, initialize each local
+  route slice reproducibly, and reconstruct global parameters in canonical
+  shard ownership for parity export;
+- reject schedules in which `replicate` and `shard` select any of the same
+  logical model regions; dense replication must exclude routed regions
+  explicitly (for example, `{"PP": 0, "EP": "-"}`), while `place` remains
+  compatible with either communication directive;
+- partition each global microbatch equally along dimension zero across the
+  input ActorGroup, using ActorGroup local-rank order as data-lane order; require
+  the global microbatch size to be at least and divisible by the group width;
+- keep replicated dense-gradient reduction/averaging, but insert neither a
+  gradient collective nor local gradient division for route-owned sharded
+  parameters because every dense source rank contributes distinct data;
+- remove TorchTitan `_permute`/`_unpermute`, sentinel padding, and grouped-MM FX
+  recognition from Piper core; and
+- implement generic Triton higher-order-operation serialization and side-table
+  restoration, while deferring actual CUDA kernel execution to Stage 2.
+
+The no-GPU implementation is not a placeholder. Runtime collective calls may be
+exercised with mocks, but split calculation, row ordering, reverse routing,
+state lifetimes, graph serialization, and schedule/DAG construction must all
+have their final intended semantics before Stage 2.
+
+#### Focused generalized-routing unit tests
+
+The following existing test areas directly exercise the generalized interface
+and should be updated where their assertions currently encode TorchTitan
+permutation or grouped-MM behavior:
+
+| Test file | Generalized interface covered |
+|---|---|
+| `test/test_graph_transform.py` | Marker uniqueness and adjacency, payload/count schemas, dispatch-to-combine dependency, tag independence, and routed-region boundaries. Add the exclusive dynamic input/output checks here. |
+| `test/test_executors.py` | Ragged A2A dispatch/combine state, source-major split/count exchange, M-to-N/N-to-M forward and backward paths, empty payload behavior, and per-microbatch state. Replace mocks of TorchTitan `_permute`/`_unpermute` with opaque row-order and exact reverse-transfer assertions. |
+| `test/test_afd_routed_directives.py` | Schedule classification of within-group versus cross-group routing, shard-policy requirements, static route-width validation, participant topology, collective pairing, and transaction/state identity. Add route-count divisibility and device-list ownership-order cases here. |
+| `test/test_afd_full_lowering.py` | End-to-end lowering of annotated Qwen regions into connected AFD actor DAGs for PP2 and PP4, including M-to-N/N-to-M node counts and metadata. |
+| `test/test_order_directive.py` | Generic `shard` lowering from the routed marker contract and rejection of missing route counts, independent of tag spelling or expert operators. |
+| `test/test_qwen_grouped_experts.py` | Preservation of the routed expert graph and availability of route counts. Replace assertions about removed grouped-MM surgery with graph-preservation checks for grouped-MM, loop, and structurally different test-local experts. |
+
+Run:
+
+```bash
+python -m pytest -q \
+  test/test_graph_transform.py \
+  test/test_executors.py \
+  test/test_afd_routed_directives.py \
+  test/test_afd_full_lowering.py \
+  test/test_order_directive.py \
+  test/test_qwen_grouped_experts.py
+```
+
+This gate must establish:
+
+- route-count divisibility by shard degree, rejection of unsorted shard lists,
+  and ownership in ascending global actor-rank order;
+- no Piper-side payload permutation or kernel padding;
+- unchanged row order through dispatch and exact reversal through combine;
+- correct ragged A2A and unequal M-to-N/N-to-M splits in forward and backward;
+- correct empty, zero-count, uneven-load, and multi-microbatch behavior;
+- replicated dense gradients are reduced across their ActorGroup, while
+  route-owned sharded gradients have neither a collective nor local scaling;
+- malformed routed-region interfaces fail at the earliest available layer; and
+- Piper core has no grouped-MM graph recognition or TorchTitan MoE permutation
+  dependency.
+
+#### Model capture, schedule construction, and logical DAG execution
+
+Without running CUDA kernels or distributed GPU collectives:
+
+- capture/compile the Qwen routed graph on fake/meta tensors for both
+  `GroupedExperts(use_grouped_mm=True)` and `use_grouped_mm=False`;
+- verify serialization/deserialization preserves the untouched routed graph and
+  Triton higher-order-operation metadata;
+- build the existing AFD PP2 and PP4 schedules and their actor-local DAGs;
+- build the existing DualPipeV schedule and its actor-local DAGs;
+- validate all routed collective sequences, endpoint metadata, transaction IDs,
+  dependencies, and per-stream total orders; and
+- run the resulting communication DAGs through the simulator to validate A2A
+  and unequal-group M-to-N/N-to-M rendezvous logically.
+
+Run the relevant existing logical-lowering and simulator suites:
+
+```bash
+python -m pytest -q \
+  test/test_afd_schedule_builder.py \
+  test/test_piper_schedule.py \
+  test/test_dag_builder_equivalence.py \
+  test/test_actor_group_topology.py \
+  test/test_simulator.py
+```
+
+#### Complete no-GPU regression gate
+
+After the focused and logical gates pass, run every existing non-GPU test:
+
+```bash
+python -m pytest -q -m 'not gpu'
+```
+
+Stage 1 is complete only when the focused suites, logical AFD/DualPipeV DAG
+construction, simulator execution, and the full non-GPU suite all pass. No
+pre-existing schedule family or unit test may be removed, skipped, or weakened.
+
+### Stage 2: GPU-dependent completion and verification
+
+#### Complete GPU-dependent implementation
+
+Start with small models, sequence lengths, and microbatch counts. Exercise the
+Stage 1 implementation on real actor processes, NCCL groups, dynamic routed
+payload sizes, and CUDA kernels. Complete only issues that require GPU evidence,
+including:
+
+- restoring and executing an untouched TorchTitan Triton padding wrapper after
+  DAG serialization and actor loading;
+- compiling routed regions with dynamic token counts;
+- validating real ragged A2A and unequal M-to-N/N-to-M count and payload
+  transfers in both directions; and
+- validating grouped-MM, loop, and structurally different expert computations
+  against their eager forward and backward results.
+
+Any fixes discovered here must preserve the generic contract. Do not add
+operator recognition, expert-tag heuristics, or implementation-specific layout
+handling back into Piper.
+
+#### Focused existing e2e parameter-parity gate
+
+Run only the already-existing AFD PP2, AFD PP4, and DualPipeV cases from
+`test/test_qwen_e2e_correctness.py`. The selector covers both model sizes already
+present in `_CORRECTNESS_MODELS`; it does not create new e2e variants.
+
+```bash
+python -m pytest -q -m gpu test/test_qwen_e2e_correctness.py \
+  -k 'afd_pp2_single_node or afd_pp4_single_node or dualpipev'
+```
+
+These cases must pass their existing initial-parameter and two-step final-
+parameter comparisons against the single-GPU eager model. AFD PP2 and PP4 cover
+cross-group M-to-N/N-to-M under two placements. DualPipeV covers the generalized
+within-group ragged A2A path under its existing V-shaped pipeline schedule.
+
+#### Final full regression gate
+
+After GPU-driven fixes, rerun the focused unit tests and then the entire existing
+non-GPU suite to ensure the generic invariants still hold:
+
+```bash
+python -m pytest -q -m 'not gpu'
+```
+
+Finally, run every existing GPU e2e parameter-parity case:
+
+```bash
+python -m pytest -q -m gpu test/test_qwen_e2e_correctness.py
+```
+
+This includes DualPipeV, all other schedules in
+`examples.run_qwen_examples.RUNS`, and AFD PP2/PP4 for every model already
+parameterized by the test. Preserve the existing per-workload two-minute
+subprocess timeout and report any numerical tolerance separately rather than
+broadening it silently.
+
+Stage 2 is complete only when the focused AFD/DualPipeV parameter-parity gate,
+the full existing unit suite, and the full existing e2e suite all pass.
+
 ## Expected result
 
 After this work, the schedule and route-count annotations determine only
@@ -385,3 +587,18 @@ transport. Piper derives topology, ownership, splits, and reverse communication,
 while the captured model region defines all expert-local layout and computation.
 Adding a new expert implementation should require no changes to Piper core as
 long as it obeys the documented routed-region tensor contract.
+
+## Completion
+
+- Focused generalized-routing tests: 127 passed.
+- Complete non-GPU suite: 279 passed, 18 GPU tests deselected.
+- Existing Qwen GPU E2E suite: 18 passed before the final test-only tolerance
+  refinement; afterward, five focused cases passed together and the sole
+  remaining 1B DualPipeV case passed its targeted rerun.
+- Static compilation of the touched Python files passed.
+- Remaining limitation: expert implementations with data-dependent Python
+  control flow such as `route_counts.tolist()` are not meta-capturable; routed
+  expert computation must use tensor operations or a fake/meta-compatible
+  custom operator.
+
+Commit message: `Generalize routed transport for AFD and expert parallelism`.

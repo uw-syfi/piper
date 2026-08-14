@@ -25,6 +25,18 @@ _LIVE_META_KEYS = {
     "input_idxs",
     "param_idxs",
     "triton_constant_args",
+    "triton_kernels",
+}
+
+_ROUTED_COUNTS_SCHEMA = {
+    "shape": (1, 8),
+    "dtype": "torch.int64",
+    "requires_grad": False,
+}
+_ROUTED_PAYLOAD_SCHEMA = {
+    "shape": (8, 4),
+    "dtype": "torch.float32",
+    "requires_grad": True,
 }
 
 
@@ -49,13 +61,29 @@ def _base_training_dag(
             fwd_uids.append(uid)
             boundary_after = {"tensor_idx": 0}
             if routed_a2a and segment == 0:
-                boundary_after["routing_counts_idx"] = 1
+                boundary_after.update(
+                    routing_counts_idx=1,
+                    payload_schema=dict(_ROUTED_PAYLOAD_SCHEMA),
+                    routing_counts_schema=dict(_ROUTED_COUNTS_SCHEMA),
+                )
+            elif routed_a2a and segment == 1:
+                boundary_after["payload_schema"] = dict(
+                    _ROUTED_PAYLOAD_SCHEMA
+                )
             dag.add_node(
                 TrainingDAGNode(
                     uid=uid,
                     node_kind="COMPUTE",
                     compute_subkind="FWD",
-                    tag={"PP": pp, "EP": ep, "PASS": "F"},
+                    tag={
+                        "PP": pp,
+                        **(
+                            {"EP": ep}
+                            if ep is not None or not routed_a2a
+                            else {}
+                        ),
+                        "PASS": "F",
+                    },
                     device=None,
                     stream="default_stream",
                     node_meta={
@@ -158,7 +186,10 @@ def _schedule(case: dict[str, Any]) -> list[dict[str, Any]]:
         for stage, stage_devices in devices.items():
             replicate: dict[str, Any] = {
                 "op": "replicate",
-                "filter": {"PP": stage},
+                "filter": {
+                    "PP": stage,
+                    **({"EP": "-"} if case["ep"] else {}),
+                },
                 "devices": stage_devices,
                 "gather_stream": "dp_stream",
                 "reduce_stream": "dp_stream",
@@ -310,13 +341,16 @@ LEGACY_DIGESTS: dict[str, str] = {
     # differentiability metadata. The executable graph structure is unchanged.
     "bucketed_zero3_zerobubble": "1adb5801bd07d6442592aee4fedbea985ab661ea265e5c1c2718d4017869ebf3",
     "dp_only_unsharded": "5e248c6eb273dbb10c6261aafb3cee2fe55e0da998cb1e6f0977081986f72cf2",
-    "interleaved_placement": "59a2117379e4e44a63e8599c001cf5e57841cbcc2dbdd07913a396e96aa8a6e8",
-    "pp_dp_ep_1f1b": "6a3845d839c766795a4a799ae47d5dcfcf4111acbb931197f2fa60c6f07dcc2e",
+    # Routed cases retain validated route schema/ownership metadata. Sharded
+    # expert owners consume distinct routed data and therefore have no local
+    # gradient-scaling node. All three lowering paths must still agree.
+    "interleaved_placement": "37331e0a39dc12324158e99374a0d228d1424114f0269b2c523524af11e247d7",
+    "pp_dp_ep_1f1b": "06456a34612b4048d596d3cc1423a623e233bc585e111d3b3b88dbee50a9d381",
     "pp_dp_grad_sharded": "fdd15fd8eca5897402e89f482197a53e9f209c12bc0a61634343fa3c9f79d969",
     "pp_dp_unsharded": "d81344f46b34e8c8f3cba9238a8a37f9f5b8b382ee88821df65579f7a3263bd3",
     "pp_dp_zero3_zerobubble": "b8759170e8e02a53dabc58e6eddfc10d6cd416f5d0bb706621838d2818688e34",
     "pp_only_1f1b": "eac89ef8094e8acbd18cc296384effa13d22b91de6a59856d9a7bea36c2e79f0",
-    "v_placement_dualpipev": "b9510ebd6d7eb5a1c0aa1582805e9495898244ed93536281c4972490a490012a",
+    "v_placement_dualpipev": "c8eca2a77f059a29e18489b0c6a2a746f19dbb3b4de2f70bf3ed940b6b3aca94",
 }
 
 

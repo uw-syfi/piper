@@ -1,6 +1,11 @@
 import pytest
+import torch
 
-from src.compile import _actor_group_dags_by_id, _input_actor_group_id
+from src.compile import (
+    _actor_group_dags_by_id,
+    _input_actor_group_id,
+    _partition_actor_group_batch,
+)
 from src.dag import TrainingDAG, TrainingDAGNode
 from src.runtime import RuntimeState
 from src.simulator import _build_rank_layout
@@ -35,6 +40,7 @@ def _schedule_info() -> dict:
             {"id": 0, "devices": [0, 2, 4, 5], "size": 4},
             {"id": 1, "devices": [1, 3], "size": 2},
         ],
+        "loss_actor_group_ids": [0],
     }
 
 
@@ -224,12 +230,46 @@ class _LoadActor:
         self.load_training_dag = _RecordingRemoteMethod()
 
 
-def test_piper_exec_reports_one_replicated_loss_per_actor_group(monkeypatch) -> None:
+def test_actor_group_batch_partition_gives_each_attn_rank_distinct_tokens() -> None:
+    tokens = torch.arange(8 * 3).view(8, 3)
+
+    shards = _partition_actor_group_batch(
+        [tokens],
+        [0, 2, 4, 5],
+        value_name="input",
+    )
+
+    assert [shard[0].tolist() for shard in shards] == [
+        tokens[0:2].tolist(),
+        tokens[2:4].tolist(),
+        tokens[4:6].tolist(),
+        tokens[6:8].tolist(),
+    ]
+    assert torch.equal(torch.cat([shard[0] for shard in shards]), tokens)
+
+
+@pytest.mark.parametrize("batch_size", [3, 6])
+def test_actor_group_batch_partition_rejects_too_small_or_uneven_microbatch(
+    batch_size: int,
+) -> None:
+    with pytest.raises(ValueError, match="at least and divisible"):
+        _partition_actor_group_batch(
+            [torch.arange(batch_size)],
+            [0, 2, 4, 5],
+            value_name="input",
+        )
+
+
+def test_piper_exec_averages_distinct_loss_shards_within_actor_group(monkeypatch) -> None:
     import src.piper as piper_module
 
     actors = {
-        rank: _FakeActor({"losses": [f"loss-{rank}"]})
-        for rank in (0, 2, 4, 5, 1, 3)
+        0: _FakeActor({"losses": [1.0, 5.0]}),
+        2: _FakeActor({"losses": [2.0, 6.0]}),
+        4: _FakeActor({"losses": [3.0, 7.0]}),
+        5: _FakeActor({"losses": [4.0, 8.0]}),
+        1: _FakeActor({"losses": []}),
+        3: _FakeActor({"losses": []}),
     }
     monkeypatch.setattr(piper_metadata, "actors", actors)
     monkeypatch.setattr(
@@ -241,15 +281,17 @@ def test_piper_exec_reports_one_replicated_loss_per_actor_group(monkeypatch) -> 
 
     losses = piper_module.piper_exec_dag(loss_fn=None)
 
-    assert losses == ["loss-0", "loss-1"]
+    assert losses == [2.5, 6.5]
 
 
-def test_piper_exec_uses_representatives_for_equal_width_actor_groups(monkeypatch) -> None:
+def test_piper_exec_uses_only_declared_loss_actor_group(monkeypatch) -> None:
     import src.piper as piper_module
 
     actors = {
-        rank: _FakeActor({"losses": [f"loss-{rank}"]})
-        for rank in (0, 1)
+        0: _FakeActor({"losses": []}),
+        2: _FakeActor({"losses": []}),
+        1: _FakeActor({"losses": [3.0]}),
+        3: _FakeActor({"losses": [5.0]}),
     }
     monkeypatch.setattr(piper_metadata, "actors", actors)
     monkeypatch.setattr(
@@ -259,12 +301,13 @@ def test_piper_exec_uses_representatives_for_equal_width_actor_groups(monkeypatc
             "actor_groups": [
                 {"id": 0, "devices": [0, 2]},
                 {"id": 1, "devices": [1, 3]},
-            ]
+            ],
+            "loss_actor_group_ids": [1],
         },
     )
     monkeypatch.setattr(piper_module.ray, "get", lambda refs: refs)
 
-    assert piper_module.piper_exec_dag(loss_fn=None) == ["loss-0", "loss-1"]
+    assert piper_module.piper_exec_dag(loss_fn=None) == [4.0]
 
 
 def test_compile_loads_identical_dag_on_every_actor_group_member(monkeypatch) -> None:

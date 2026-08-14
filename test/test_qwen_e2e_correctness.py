@@ -13,7 +13,13 @@ from examples.run_qwen_examples import RUNS
 pytestmark = pytest.mark.gpu
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CORRECTNESS_MODELS = ("9M", "1B")
-_AFD_EXPERT_ATOL = 2e-4
+# Expert parameters (names containing ``.moe.experts.``) use the 2e-4 absolute
+# tolerance because sharded grouped-expert execution changes kernel padding,
+# layout, and BF16 accumulation order. Everything else uses zero relative
+# tolerance and the larger of 1e-7 absolute error or two BF16 spacings measured
+# at the initial/eager-final value; initialization itself remains bitwise exact.
+_ROUTED_DENSE_ATOL = 1e-7
+_ROUTED_EXPERT_ATOL = 2e-4
 _AFD_RUNS = (
     (
         "afd_pp2_single_node",
@@ -68,13 +74,13 @@ def test_qwen_parameter_parity(
         "--mbs",
         str(microbatches),
         "--batch-size",
-        "2",
+        "4" if schedule == "afd" else "2",
         "--seq-len",
         "16",
         "--steps",
         "2",
-        # SGD makes gradient-scale errors directly observable. Adam largely
-        # cancels a uniform scale factor and its fused update can also differ
+        # SGD makes gradient-synchronization errors directly observable. Adam
+        # largely cancels a uniform scale factor and its fused update can differ
         # by a BF16 ULP when Piper groups parameters into stage optimizers.
         "--optimizer",
         "sgd",
@@ -84,19 +90,23 @@ def test_qwen_parameter_parity(
         "--ray-namespace",
         f"qwen-e2e-{os.getpid()}-{model.lower()}-{name}",
     ]
-    if schedule == "afd":
-        # Disaggregation changes the grouped-GEMM padding/layout and therefore
-        # BF16 accumulation order.  Keep initialization bitwise-exact (checked
-        # by the test program) while allowing the observed one-ULP training
-        # difference in expert parameters.
-        command.extend(
-            [
-                "--rtol",
-                "0",
-                "--expert-atol",
-                str(_AFD_EXPERT_ATOL),
-            ]
-        )
+    # Routed regrouping changes grouped-kernel padding/accumulation order. In
+    # addition, each replica accumulates its distinct BF16 gradient before the
+    # per-microbatch collective, whereas the eager reference visits shards in
+    # sequence. Keep initialization bitwise-exact (checked by the test program)
+    # while allowing tightly bounded routed-training differences.
+    command.extend(
+        [
+            "--rtol",
+            "0",
+            "--atol",
+            str(_ROUTED_DENSE_ATOL),
+            "--dense-max-ulps",
+            "2",
+            "--expert-atol",
+            str(_ROUTED_EXPERT_ATOL),
+        ]
+    )
     ray_address = os.environ.get("PIPER_E2E_RAY_ADDRESS")
     if ray_address:
         host, separator, port = ray_address.rpartition(":")

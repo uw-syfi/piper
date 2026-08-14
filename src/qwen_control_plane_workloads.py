@@ -297,7 +297,10 @@ def build_qwen_dualpipe_schedule(
         for stage, devices in stage_devices.items():
             replicate: dict[str, Any] = {
                 "op": "replicate",
-                "filter": {"PP": stage},
+                "filter": {
+                    "PP": stage,
+                    **({"EP": "-"} if spec.ep_degree > 1 else {}),
+                },
                 "devices": devices,
                 "gather_stream": dp_stream,
                 "reduce_stream": dp_stream,
@@ -406,8 +409,8 @@ class QwenTrainingDAGFactory:
         self.model_name = model_name
         self.batch_size = batch_size
         self.sequence_length = sequence_length
-        self._base_dags: dict[int, TrainingDAG] = {}
-        self._trace_times_s: dict[int, float] = {}
+        self._base_dags: dict[tuple[int, int], TrainingDAG] = {}
+        self._trace_times_s: dict[tuple[int, int], float] = {}
         self._lowered_templates: dict[tuple[Any, ...], QwenControlPlaneWorkload] = {}
 
     @staticmethod
@@ -473,8 +476,13 @@ class QwenTrainingDAGFactory:
         metadata["dag_build_time_s"] = time.perf_counter() - build_start
         return workload
 
-    def _trace_base_dag(self, virtual_stage_count: int) -> TrainingDAG:
-        cached = self._base_dags.get(virtual_stage_count)
+    def _trace_base_dag(
+        self,
+        virtual_stage_count: int,
+        expert_shard_degree: int,
+    ) -> TrainingDAG:
+        trace_key = (virtual_stage_count, expert_shard_degree)
+        cached = self._base_dags.get(trace_key)
         if cached is not None:
             return cached
 
@@ -499,49 +507,39 @@ class QwenTrainingDAGFactory:
         start = time.perf_counter()
         torch._dynamo.reset()
         with torch.device("meta"):
-            model = PiperQwen3Model(config, virtual_stage_count).to(torch.bfloat16)
+            model = PiperQwen3Model(
+                config,
+                virtual_stage_count,
+                expert_shard_degree,
+            ).to(torch.bfloat16)
             tokens = torch.empty(
                 (self.batch_size, self.sequence_length),
                 dtype=torch.int64,
                 device="meta",
             )
-        # This is a meta-device graph capture with a custom backend, so Triton
-        # capability detection is both unnecessary and actively harmful on
-        # CPU-only hosts whose container exposes CUDA libraries but no GPU.
-        # Clear the cached probe on both sides so this local setting cannot
-        # affect a later real compilation in the same process.
-        from torch._inductor import config as inductor_config
+            torch._dynamo.mark_dynamic(tokens, 1)
+        # This is a meta-device graph capture with a custom backend. Dynamo
+        # still must recognize Triton JITFunctions so it records wrapper HOPs,
+        # but no driver or kernel execution is needed. A CPU PyTorch wheel
+        # reports ``has_triton() == False`` because no capable device is
+        # active, which makes Dynamo fall through into an attempted Triton
+        # driver call. Enable only the capture-time classification here.
         from torch.utils import _triton
 
-        previous_detection_setting = (
-            inductor_config.triton_disable_device_detection
-        )
-        previous_cuda_is_available = torch.cuda.is_available
-        inductor_config.triton_disable_device_detection = True
-        torch.cuda.is_available = lambda: False
-        _triton.has_triton.cache_clear()
-        _triton._device_supports_tma.cache_clear()
-        _triton.has_triton_experimental_host_tma.cache_clear()
-        _triton.has_triton_tensor_descriptor_host_tma.cache_clear()
+        previous_has_triton = _triton.has_triton
+        _triton.has_triton = lambda: True
         try:
             compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
             _reset_annotation_state()
             compiled(tokens)
         finally:
-            torch.cuda.is_available = previous_cuda_is_available
-            inductor_config.triton_disable_device_detection = (
-                previous_detection_setting
-            )
-            _triton.has_triton.cache_clear()
-            _triton._device_supports_tma.cache_clear()
-            _triton.has_triton_experimental_host_tma.cache_clear()
-            _triton.has_triton_tensor_descriptor_host_tma.cache_clear()
+            _triton.has_triton = previous_has_triton
         try:
             base_dag = captured["dag"]
         except KeyError as exc:
             raise RuntimeError("torch.compile did not invoke the capture backend") from exc
-        self._trace_times_s[virtual_stage_count] = time.perf_counter() - start
-        self._base_dags[virtual_stage_count] = base_dag
+        self._trace_times_s[trace_key] = time.perf_counter() - start
+        self._base_dags[trace_key] = base_dag
         return base_dag
 
     def build(self, spec: QwenDualPipeWorkloadSpec) -> QwenControlPlaneWorkload:
@@ -560,8 +558,12 @@ class QwenTrainingDAGFactory:
                 spec,
                 build_start=build_start,
             )
-        trace_cache_hit = spec.virtual_stage_count in self._base_dags
-        base_dag = self._trace_base_dag(spec.virtual_stage_count)
+        trace_key = (spec.virtual_stage_count, spec.ep_degree)
+        trace_cache_hit = trace_key in self._base_dags
+        base_dag = self._trace_base_dag(
+            spec.virtual_stage_count,
+            spec.ep_degree,
+        )
         directives = build_qwen_dualpipe_schedule(spec)
 
         lower_start = time.perf_counter()
@@ -620,7 +622,7 @@ class QwenTrainingDAGFactory:
             "generated_physical_pp_ranks": [0],
             "virtual_stage_count": spec.virtual_stage_count,
             "microbatch_count": spec.resolved_microbatch_count,
-            "trace_time_s": self._trace_times_s[spec.virtual_stage_count],
+            "trace_time_s": self._trace_times_s[trace_key],
             "trace_cache_hit": trace_cache_hit,
             "structural_template_cache_hit": False,
             "lowering_time_s": lowering_time_s,

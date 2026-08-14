@@ -13,6 +13,7 @@ from src.model_state import (
     dynamo_parameter_name_to_state_dict_key,
     initialize_model_parameters_,
     initialize_parameter_,
+    initialize_route_parameter_,
 )
 from src.runtime import BucketState, ParamStorage, RuntimeState, StageStore
 
@@ -105,6 +106,41 @@ def test_named_initialization_changes_with_model_seed() -> None:
     initialize_parameter_(first, "layer.weight", model_seed=1)
     initialize_parameter_(second, "layer.weight", model_seed=2)
     assert not torch.equal(first, second)
+
+
+def test_route_initialization_matches_contiguous_global_slices() -> None:
+    global_parameter = torch.empty(8, 3, 2)
+    initialize_route_parameter_(
+        global_parameter,
+        "layers.0.moe.experts.w1",
+        model_seed=123,
+    )
+
+    first = torch.empty(4, 3, 2)
+    second = torch.empty(4, 3, 2)
+    initialize_route_parameter_(
+        first,
+        "layers.0.moe.experts.w1",
+        global_route_start=0,
+        model_seed=123,
+    )
+    initialize_route_parameter_(
+        second,
+        "layers.0.moe.experts.w1",
+        global_route_start=4,
+        model_seed=123,
+    )
+
+    assert torch.equal(torch.cat((first, second), dim=0), global_parameter)
+
+
+def test_model_route_initialization_requires_explicit_parameter_names() -> None:
+    model = torch.nn.Linear(2, 2, bias=False)
+    with pytest.raises(ValueError, match="not model parameters"):
+        initialize_model_parameters_(
+            model,
+            route_parameter_axes={"missing.weight": 0},
+        )
 
 
 def test_zero2_rebuilds_full_parameters_after_shard_update(monkeypatch) -> None:
@@ -261,4 +297,61 @@ def test_nonrepresentative_participates_in_sharded_parameter_export(
 
     assert actor.export_model_parameter_state() == {}
     assert collective_calls == [(shard_param, "sync")]
+    stream.synchronize.assert_called_once_with()
+
+
+def test_route_owned_export_uses_canonical_collective_order(monkeypatch) -> None:
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    local_parameter = torch.nn.Parameter(
+        torch.tensor([[10.0], [20.0]])
+    )
+    bucket = BucketState(
+        forward_args=[local_parameter],
+        trainable_param_idxs=[0],
+        param_idxs=[0],
+        param_names=["l_self_parameters_experts_"],
+        route_sharded_param_specs={
+            0: {
+                "arg_idx": 0,
+                "route_axis": 0,
+                "local_shape": (2, 1),
+                "global_shape": (4, 1),
+                "global_route_start": 0,
+                "shard_devices": (0, 1),
+            }
+        },
+    )
+    actor.stages = StageStore(buckets={"bucket": bucket})
+    stream = Mock()
+    actor.runtime = SimpleNamespace(
+        actor_group_size=2,
+        actor_group_sync_group="sync",
+        actor_group_devices=(0, 1),
+        is_actor_group_representative=True,
+        default_stream=lambda: stream,
+    )
+    actor.params = SimpleNamespace(drain_pending_frees=Mock())
+
+    monkeypatch.setattr(actor_module.torch.cuda, "synchronize", Mock())
+    monkeypatch.setattr(
+        actor_module.torch.cuda, "stream", lambda _stream: nullcontext()
+    )
+
+    def fake_all_gather(output, input_tensor, *, group):
+        assert input_tensor is not None
+        assert group == "sync"
+        output.copy_(torch.tensor([[10.0], [20.0], [30.0], [40.0]]))
+
+    monkeypatch.setattr(
+        actor_module.dist,
+        "all_gather_into_tensor",
+        fake_all_gather,
+    )
+
+    exported = actor.export_model_parameter_state()
+    assert torch.equal(
+        exported["experts"],
+        torch.tensor([[10.0], [20.0], [30.0], [40.0]]),
+    )
     stream.synchronize.assert_called_once_with()

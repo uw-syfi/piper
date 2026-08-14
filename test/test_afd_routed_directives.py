@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from examples.build_schedule import build_afpipe_baseline_schedule
 from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
@@ -9,6 +10,7 @@ from src.directives import (
     _apply_split_directive,
     _insert_cross_group_routed_comm_nodes,
     _insert_shard_a2a_comm_nodes,
+    _validate_route_owned_parameters,
     apply_schedule_directives,
 )
 from src.ordering import resolve_total_order_per_stream
@@ -78,6 +80,11 @@ def _cross_group_routed_dag(
     pre.node_meta["a2a_boundary_after"] = {
         "tensor_idx": 0,
         "routing_counts_idx": 1,
+        "routing_counts_schema": {
+            "shape": (1, 8),
+            "dtype": "torch.int64",
+            "requires_grad": False,
+        },
     }
     pre.node_meta["output_names"] = ["dense_output", "routing_counts"]
     pre.node_meta["tensor_output_indices"] = [0, 1]
@@ -225,6 +232,136 @@ def test_cross_group_routed_arity_excludes_lifted_parameter_placeholders() -> No
     ]
     assert routed
     assert {node.node_meta["expert_input_arity"] for node in routed} == {2}
+
+
+def test_route_owned_parameters_use_schedule_derived_local_route_width() -> None:
+    node = _compute(
+        "expert.fwd",
+        region="ROUTED",
+        index=0,
+        compute_subkind="FWD",
+        devices=[3, 1],
+    )
+    node.node_meta.update(
+        graphargs=[
+            torch.empty(3, 4),
+            torch.empty(1, 8, dtype=torch.int64),
+            torch.nn.Parameter(torch.empty(4, 2, 3)),
+        ],
+        input_idxs=[0, 1],
+        param_idxs=[2],
+        input_names=["payload", "counts", "expert_weight"],
+    )
+    ownership = {
+        "num_global_routes": 8,
+        "num_local_routes": 4,
+    }
+
+    assert _validate_route_owned_parameters(node, ownership) == [
+        {
+            "arg_idx": 2,
+            "placeholder_name": "expert_weight",
+            "route_axis": 0,
+            "local_shape": (4, 2, 3),
+            "global_shape": (8, 2, 3),
+        }
+    ]
+
+    node.node_meta["graphargs"][2] = torch.nn.Parameter(torch.empty(8, 2, 3))
+    with pytest.raises(ValueError, match="num_local_routes=4"):
+        _validate_route_owned_parameters(node, ownership)
+
+
+def test_replicate_and_shard_cannot_select_the_same_model_region() -> None:
+    dag = _cross_group_routed_dag([0, 1], [0, 1])
+    dag.add_node(
+        TrainingDAGNode(
+            uid="upd.0",
+            node_kind="UPD",
+            compute_subkind=None,
+            tag={"PASS": None},
+            device=[0, 1],
+            stream="default_stream",
+            node_meta={},
+        )
+    )
+    for uid in ("pre.bwd", "expert.bwd", "post.bwd"):
+        dag.add_edge(TrainingDAGEdge(uid, "upd.0", "temporal"))
+    expert = dag.nodes["expert.fwd"]
+    expert.node_meta.update(
+        graphargs=[
+            torch.empty(3, 4),
+            torch.empty(1, 8, dtype=torch.int64),
+            torch.nn.Parameter(torch.empty(4, 2, 3)),
+        ],
+        input_idxs=[0, 1],
+        param_idxs=[2],
+        input_names=["routed_tokens", "routing_counts", "expert_weight"],
+    )
+    directives = [
+        {"op": "place", "filter": {}, "devices": [0, 1]},
+        {"op": "replicate", "filter": {}, "devices": [0, 1]},
+        {
+            "op": "shard",
+            "filter": {"ROUTED": 0},
+            "devices": [0, 1],
+        },
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="replicate and shard directives must select disjoint model regions",
+    ):
+        apply_schedule_directives(dag, directives)
+
+
+def test_place_can_select_regions_owned_by_replicate_or_shard() -> None:
+    dag = _cross_group_routed_dag([0, 1], [0, 1])
+    dag.add_node(
+        TrainingDAGNode(
+            uid="upd.0",
+            node_kind="UPD",
+            compute_subkind=None,
+            tag={"PASS": None},
+            device=None,
+            stream="default_stream",
+            node_meta={},
+        )
+    )
+    for uid in ("pre.bwd", "expert.bwd", "post.bwd"):
+        dag.add_edge(TrainingDAGEdge(uid, "upd.0", "temporal"))
+    for node in dag.nodes.values():
+        node.device = None
+    expert = dag.nodes["expert.fwd"]
+    expert.node_meta.update(
+        graphargs=[
+            torch.empty(3, 4),
+            torch.empty(1, 8, dtype=torch.int64),
+            torch.nn.Parameter(torch.empty(4, 2, 3)),
+        ],
+        input_idxs=[0, 1],
+        param_idxs=[2],
+        input_names=["routed_tokens", "routing_counts", "expert_weight"],
+    )
+
+    apply_schedule_directives(
+        dag,
+        [
+            {"op": "place", "filter": {}, "devices": [0, 1]},
+            {
+                "op": "replicate",
+                "filter": {"ROUTED": "-"},
+                "devices": [0, 1],
+            },
+            {
+                "op": "shard",
+                "filter": {"ROUTED": 0},
+                "devices": [0, 1],
+            },
+        ],
+    )
+
+    assert expert.node_meta["route_sharded_param_specs"]
 
 
 def test_schedule_classifies_cross_group_routing_before_generic_p2p() -> None:
@@ -579,7 +716,7 @@ def test_schedule_rejects_static_route_count_width_mismatch() -> None:
     dag.nodes["pre.fwd"].node_meta["a2a_boundary_after"][
         "routing_counts_schema"
     ] = {
-        "shape": (8,),
+        "shape": (1, 8),
         "dtype": "torch.int64",
         "requires_grad": False,
     }
@@ -595,6 +732,83 @@ def test_schedule_rejects_static_route_count_width_mismatch() -> None:
                 post_devices=[0, 2],
             ),
         )
+
+
+def test_schedule_rejects_legacy_rank1_route_counts_schema() -> None:
+    dag = _cross_group_routed_dag([0, 2], [1, 3])
+    dag.nodes["pre.fwd"].node_meta["a2a_boundary_after"][
+        "routing_counts_schema"
+    ]["shape"] = (8,)
+    for node in dag.nodes.values():
+        node.device = None
+
+    with pytest.raises(ValueError, match="statically known rank-2"):
+        apply_schedule_directives(
+            dag,
+            _placed_routed_schedule(
+                pre_devices=[0, 2],
+                routed_devices=[1, 3],
+                post_devices=[0, 2],
+            ),
+        )
+
+
+def test_shard_devices_define_contiguous_ownership_in_canonical_rank_order() -> None:
+    dag = _cross_group_routed_dag([0, 2], [1, 3, 5])
+    dag.nodes["pre.fwd"].node_meta["a2a_boundary_after"][
+        "routing_counts_schema"
+    ]["shape"] = (1, 12)
+    for node in dag.nodes.values():
+        node.device = None
+
+    schedule = _placed_routed_schedule(
+        pre_devices=[0, 2],
+        routed_devices=[1, 3, 5],
+        post_devices=[0, 2],
+    )
+    apply_schedule_directives(dag, schedule)
+
+    expected = {
+        "num_global_routes": 12,
+        "shard_degree": 3,
+        "shard_devices": [1, 3, 5],
+        "num_local_routes": 4,
+        "route_partitions": [
+            {"device": 1, "start": 0, "stop": 4},
+            {"device": 3, "start": 4, "stop": 8},
+            {"device": 5, "start": 8, "stop": 12},
+        ],
+    }
+    routed_nodes = [
+        dag.nodes["expert.fwd"],
+        dag.nodes["expert.bwd"],
+        *[
+            node
+            for node in dag.nodes.values()
+            if node.node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}
+        ],
+    ]
+    assert len(routed_nodes) == 10
+    for node in routed_nodes:
+        assert {key: node.node_meta[key] for key in expected} == expected
+
+
+def test_apply_schedule_rejects_unsorted_shard_devices() -> None:
+    dag = _cross_group_routed_dag([0, 4], [0, 4])
+    dag.nodes["pre.fwd"].node_meta["a2a_boundary_after"][
+        "routing_counts_schema"
+    ]["shape"] = (1, 6)
+    for node in dag.nodes.values():
+        node.device = None
+
+    schedule = _placed_routed_schedule(
+        pre_devices=[0, 4],
+        routed_devices=[0, 4],
+        post_devices=[0, 4],
+    )
+    schedule[-1]["devices"] = [4, 0]
+    with pytest.raises(ValueError, match="ascending global actor-rank order"):
+        apply_schedule_directives(dag, schedule)
 
 
 def test_schedule_requires_wide_dense_neighbors_to_be_replicated() -> None:
@@ -874,6 +1088,11 @@ def _synthetic_afd_training_dag(
         dense.node_meta["a2a_boundary_after"] = {
             "tensor_idx": 0,
             "routing_counts_idx": 1,
+            "routing_counts_schema": {
+                "shape": (1, 8),
+                "dtype": "torch.int64",
+                "requires_grad": False,
+            },
         }
         routed = add_fwd(f"routed{layer}", {"PP": pp, "FFN": layer})
         routed.node_meta["output_names"] = ["expert_output"]
@@ -956,7 +1175,7 @@ def test_full_afd_directive_path_builds_connected_sequence_safe_actor_dags() -> 
         if node.device is not None
     } == {(0, 2, 4, 5), (1, 3)}
     assert not any(
-        node.node_kind in {"SEND_COMM", "RECV_COMM", "A2A_COMM"}
+        node.node_kind in {"SEND_COMM", "RECV_COMM", "A2A_COMM", "SCALE_GRADS"}
         for actor_dag in actor_dags
         for node in actor_dag.nodes.values()
     )

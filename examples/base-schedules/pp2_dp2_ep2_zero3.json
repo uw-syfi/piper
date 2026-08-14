@@ -24,7 +24,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 0
+      "PP": 0,
+      "EP": "-"
     },
     "devices": [
       0,
@@ -38,7 +39,8 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 1
+      "PP": 1,
+      "EP": "-"
     },
     "devices": [
       1,

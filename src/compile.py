@@ -56,6 +56,30 @@ def _prepare_training_dags_for_rpc(per_pp_training_dags: list) -> list:
                 )
             meta["gm_data"] = _serialize_graphmodule(gm)
             del meta["gm"]
+            # Dynamo-backed SymInts retain weak references to their ShapeEnv
+            # and are not pickleable by Ray. ``graphargs`` are capture-time
+            # tensor templates used for parameter realization and static P2P
+            # schemas, not the executable shape program (which lives in the
+            # serialized GraphModule). Materialize their current shape hints
+            # in the RPC-only copy. Routed row counts remain runtime-dynamic
+            # and are allocated from exchanged routing metadata.
+            concrete_graphargs = []
+            for arg in meta.get("graphargs", ()):
+                if not isinstance(arg, torch.Tensor):
+                    concrete_graphargs.append(arg)
+                    continue
+                shape = tuple(int(dim) for dim in arg.shape)
+                concrete = torch.empty(shape, dtype=arg.dtype, device="meta")
+                requires_grad = bool(arg.requires_grad)
+                if isinstance(arg, torch.nn.Parameter):
+                    concrete = torch.nn.Parameter(
+                        concrete,
+                        requires_grad=requires_grad,
+                    )
+                else:
+                    concrete.requires_grad_(requires_grad)
+                concrete_graphargs.append(concrete)
+            meta["graphargs"] = concrete_graphargs
     return rpc_dags
 
 
@@ -144,6 +168,66 @@ def _resolve_model_constructor_value(value, schedule_info: dict):
     return value
 
 
+def _partition_actor_group_batch(
+    tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    devices: list[int] | tuple[int, ...],
+    *,
+    value_name: str,
+) -> list[list[torch.Tensor]]:
+    """Split a global microbatch equally across an ActorGroup's local ranks.
+
+    ActorGroup rank order defines data-lane order: local rank ``i`` receives
+    the ``i``th contiguous slice along tensor dimension zero.  Model constants
+    belong in ``const_attrs``; every value passed here is therefore required to
+    carry the same leading global-microbatch dimension.
+    """
+
+    width = len(devices)
+    if width <= 0:
+        raise ValueError(f"{value_name} ActorGroup must not be empty")
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        raise ValueError(f"{value_name} must be a non-empty tensor sequence")
+
+    batch_size: int | None = None
+    for tensor_idx, tensor in enumerate(tensors):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{value_name}[{tensor_idx}] must be a tensor, got "
+                f"{type(tensor).__name__}"
+            )
+        if tensor.ndim == 0:
+            raise ValueError(
+                f"{value_name}[{tensor_idx}] must have a leading global "
+                "microbatch dimension"
+            )
+        tensor_batch = int(tensor.shape[0])
+        if batch_size is None:
+            batch_size = tensor_batch
+        elif tensor_batch != batch_size:
+            raise ValueError(
+                f"all {value_name} tensors must have the same leading "
+                f"dimension; expected {batch_size}, got {tensor_batch} at "
+                f"index {tensor_idx}"
+            )
+
+    assert batch_size is not None
+    if batch_size < width or batch_size % width:
+        raise ValueError(
+            f"global {value_name} microbatch size {batch_size} must be at "
+            f"least and divisible by ActorGroup width {width}; "
+            f"devices={list(devices)}"
+        )
+
+    local_batch_size = batch_size // width
+    return [
+        [
+            tensor.narrow(0, local_rank * local_batch_size, local_batch_size)
+            for tensor in tensors
+        ]
+        for local_rank in range(width)
+    ]
+
+
 def _artifact_dir_for_schedule(schedule_directives_file: str) -> str:
     parent = Path(schedule_directives_file).parent
     return str(parent if str(parent) else Path("out"))
@@ -169,6 +253,7 @@ def piper_setup(
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
     model_seed: int = DEFAULT_MODEL_SEED,
+    dynamic_input_dims: dict[int, tuple[int, ...]] | None = None,
 ):
     """
     Compile a model with the TrainingDAG backend.
@@ -179,8 +264,11 @@ def piper_setup(
     Args:
         model: The model to compile.
         optim_fn: Callable ``(params) -> Optimizer`` used to create optimizers.
-        example_inputs: Example inputs for tracing.
-        example_outputs: Example outputs (labels) for tracing.
+        example_inputs: Example inputs for tracing. Dimension zero is the
+            global microbatch and is split equally across the input
+            ActorGroup in local-rank order.
+        example_outputs: Example outputs (labels). Dimension zero is split
+            equally across every ActorGroup that computes the loss.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
         schedule_directives_file: JSON schedule description consumed by the
@@ -188,6 +276,9 @@ def piper_setup(
             metadata from this file.
         model_seed: Shared seed used to initialize every lifted model parameter
             deterministically by its eager ``state_dict`` name.
+        dynamic_input_dims: Optional input-index to dimension-index mapping.
+            Marked dimensions remain symbolic through annotation splitting so
+            routed subgraphs can receive variable row counts.
     """
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
@@ -293,12 +384,56 @@ def piper_setup(
         model_dtype,
     )
 
-    compiled = torch.compile(model, backend=piper, fullgraph=True)
-    compile_inputs = [x.to(device="meta") for x in example_inputs]
-    _reset_annotation_state()
-    _ = compiled(*compile_inputs)
+    def compile_for_inputs(inputs: list[torch.Tensor]) -> list:
+        torch._dynamo.reset()
+        compile_inputs = [tensor.to(device="meta") for tensor in inputs]
+        for input_idx, dims in (dynamic_input_dims or {}).items():
+            if input_idx < 0 or input_idx >= len(compile_inputs):
+                raise ValueError(
+                    f"dynamic input index {input_idx} is outside "
+                    f"[0, {len(compile_inputs)})"
+                )
+            tensor = compile_inputs[input_idx]
+            for dim in sorted(set(dims)):
+                if dim < 0 or dim >= tensor.ndim:
+                    raise ValueError(
+                        f"dynamic dimension {dim} is outside input[{input_idx}] "
+                        f"rank {tensor.ndim}"
+                    )
+                torch._dynamo.mark_dynamic(tensor, dim)
+        piper_metadata.training_dag = None
+        piper_metadata.per_pp_training_dags = None
+        compiled = torch.compile(model, backend=piper, fullgraph=True)
+        _reset_annotation_state()
+        _ = compiled(*compile_inputs)
+        dags = getattr(piper_metadata, "per_pp_training_dags", None)
+        if not dags:
+            raise RuntimeError(
+                "piper backend did not produce per_pp_training_dags; "
+                "backend transition incomplete"
+            )
+        return dags
 
-    local_training_dags = getattr(piper_metadata, "per_pp_training_dags", None)
+    # Placement is known only after annotations have been traced and schedule
+    # directives have been applied. Use the driver's global example once to
+    # discover the input ActorGroup, then make the authoritative capture with
+    # one representative rank's actual local input shape. This keeps dense P2P
+    # buffer metadata consistent with execution rather than relying on a
+    # symbolic global batch dimension to be rebound after RPC serialization.
+    discovery_dags = compile_for_inputs(list(example_inputs))
+    discovery_by_group = _actor_group_dags_by_id(discovery_dags, schedule_info)
+    input_group_id = _input_actor_group_id(discovery_by_group)
+    input_group = schedule_info["actor_groups"][input_group_id]
+    input_shards = _partition_actor_group_batch(
+        example_inputs,
+        input_group["devices"],
+        value_name="input",
+    )
+    local_training_dags = (
+        discovery_dags
+        if len(input_group["devices"]) == 1
+        else compile_for_inputs(input_shards[0])
+    )
     if not local_training_dags:
         raise RuntimeError(
             "piper backend did not produce per_pp_training_dags; "
@@ -309,6 +444,12 @@ def piper_setup(
             f"Expected {pp_degree} ActorGroup DAGs, got {len(local_training_dags)}"
         )
     dag_by_group = _actor_group_dags_by_id(local_training_dags, schedule_info)
+    final_input_group_id = _input_actor_group_id(dag_by_group)
+    if final_input_group_id != input_group_id:
+        raise RuntimeError(
+            "input ActorGroup changed when tracing the per-rank input shape: "
+            f"discovery={input_group_id}, final={final_input_group_id}"
+        )
     ordered_training_dags = [
         dag_by_group[group_id] for group_id in range(pp_degree)
     ]
@@ -317,15 +458,15 @@ def piper_setup(
     _load_training_dags_on_actors(training_dags_rpc, schedule_info)
 
     dag_by_group = _actor_group_dags_by_id(training_dags_rpc, schedule_info)
-    input_group_id = _input_actor_group_id(dag_by_group)
-    input_group = schedule_info["actor_groups"][input_group_id]
     piper_metadata.schedule_info["input_actor_group_id"] = input_group_id
     piper_metadata.schedule_info["input_actor_group_size"] = len(
         input_group["devices"]
     )
     ray.get([
-        piper_metadata.actors[int(global_rank)].load_input.remote(example_inputs)
-        for global_rank in input_group["devices"]
+        piper_metadata.actors[int(global_rank)].load_input.remote(
+            input_shards[local_rank]
+        )
+        for local_rank, global_rank in enumerate(input_group["devices"])
     ])
     loss_group_ids = {
         group_id
@@ -338,9 +479,21 @@ def piper_setup(
     }
     if not loss_group_ids:
         raise ValueError("ActorGroup DAGs contain no compute_loss node")
-    ray.get([
-        piper_metadata.actors[int(global_rank)].load_labels.remote(example_outputs)
+    piper_metadata.schedule_info["loss_actor_group_ids"] = sorted(loss_group_ids)
+    label_shards_by_group_id = {
+        int(group["id"]): _partition_actor_group_batch(
+            [example_outputs],
+            group["devices"],
+            value_name="label",
+        )
         for group in schedule_info["actor_groups"]
         if int(group["id"]) in loss_group_ids
-        for global_rank in group["devices"]
+    }
+    ray.get([
+        piper_metadata.actors[int(global_rank)].load_labels.remote(
+            label_shards_by_group_id[int(group["id"])][local_rank][0]
+        )
+        for group in schedule_info["actor_groups"]
+        if int(group["id"]) in loss_group_ids
+        for local_rank, global_rank in enumerate(group["devices"])
     ])

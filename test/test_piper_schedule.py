@@ -190,6 +190,44 @@ def test_load_schedule_directives_accepts_consistent_device_sets(tmp_path) -> No
     load_schedule_directives(str(schedule_path))
 
 
+def test_load_schedule_directives_rejects_nested_replicate_and_shard_filters(
+    tmp_path,
+) -> None:
+    schedule_path = tmp_path / "schedule.json"
+    schedule_path.write_text(
+        json.dumps([
+            {"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+            {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1]},
+            {
+                "op": "shard",
+                "filter": {"PP": 0, "EP": "*"},
+                "devices": [0, 1],
+            },
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="replicate and shard directives must select disjoint model regions",
+    ):
+        load_schedule_directives(str(schedule_path))
+
+
+def test_load_schedule_directives_rejects_unsorted_shard_devices(tmp_path) -> None:
+    schedule_path = tmp_path / "schedule.json"
+    schedule_path.write_text(
+        json.dumps([
+            {"op": "place", "filter": {"X": "*"}, "devices": [1, 3]},
+            {"op": "shard", "filter": {"X": "*"}, "devices": [3, 1]},
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ascending global actor-rank order"):
+        load_schedule_directives(str(schedule_path))
+
+
 @pytest.mark.parametrize("conflicting_devices", ([0], [0, 4]))
 def test_load_schedule_directives_rejects_overlapping_device_sets(
     tmp_path,
