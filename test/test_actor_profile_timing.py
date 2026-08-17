@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 import src.actor as actor_module
-from src.actor import PiperActor, _CudaEventTimingRecorder
+from src.actor import (
+    PiperActor,
+    _CudaEventTimingRecorder,
+    _kineto_correlated_activity_envelope_samples_us,
+)
 from src.dag import TrainingDAG, TrainingDAGNode
 
 
@@ -25,6 +29,47 @@ class _FakeEvent:
 
     def synchronize(self) -> None:
         pass
+
+
+def test_kineto_simulator_duration_uses_activity_envelope() -> None:
+    measured = {
+        # This is intentionally much shorter than the complete correlated
+        # activity, reproducing key_averages() on an outer Piper range.
+        "device_time_mean_us": 3.0,
+        "range_count": 2,
+        "unmatched_launch_count": 0,
+        "range_activity_signatures": [
+            {
+                "activity_time_sum_us": 11.0,
+                "activity_envelope_time_us": 17.0,
+            },
+            {
+                "activity_time_sum_us": 13.0,
+                "activity_envelope_time_us": 19.0,
+            },
+        ],
+    }
+
+    assert _kineto_correlated_activity_envelope_samples_us(
+        measured, node_uid="backward"
+    ) == (17.0, 19.0)
+
+
+def test_kineto_simulator_duration_rejects_incomplete_attribution() -> None:
+    with pytest.raises(RuntimeError, match="left 1 CUDA launches unmatched"):
+        _kineto_correlated_activity_envelope_samples_us(
+            {
+                "range_count": 1,
+                "unmatched_launch_count": 1,
+                "range_activity_signatures": [
+                    {
+                        "activity_time_sum_us": 11.0,
+                        "activity_envelope_time_us": 17.0,
+                    }
+                ],
+            },
+            node_uid="all_gather",
+        )
 
 
 def test_cuda_event_recorder_reuses_events_for_cross_stream_start_offsets(
@@ -76,7 +121,8 @@ def test_actor_retains_start_offsets_for_both_profile_modes(monkeypatch) -> None
         "interference_free": object(),
         "normal": object(),
     }
-    actor._execute_dag = lambda **_kwargs: None
+    execution_calls = []
+    actor._execute_dag = lambda **kwargs: execution_calls.append(kwargs)
     monkeypatch.setattr(actor_module, "_CudaEventTimingRecorder", _Recorder)
     monkeypatch.setattr(actor_module.torch.cuda, "synchronize", lambda *_args: None)
 
@@ -93,6 +139,33 @@ def test_actor_retains_start_offsets_for_both_profile_modes(monkeypatch) -> None
     assert actor._profile_node_start_offsets["normal"] == {
         "node": [19.0]
     }
+    assert execution_calls[0]["serialize_nodes"] is True
+    assert execution_calls[1]["serialize_nodes"] is False
+
+
+def test_profile_run_dag_can_defer_profiler_advance(monkeypatch) -> None:
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    steps = []
+    actor.runtime = SimpleNamespace(
+        pytorch_profiler_enabled=True,
+        torch_profiler=SimpleNamespace(step=lambda: steps.append("step")),
+        device="cuda:0",
+    )
+    actor._execute_dag = lambda **_kwargs: None
+    actor.profile_prepared_dag_executions = {"interference_free": None}
+    actor._cupti_allocator_iteration_stats = []
+    monkeypatch.setattr(actor_module.torch.cuda, "synchronize", lambda *_args: None)
+
+    actor.profile_run_dag(
+        record=False,
+        advance_profiler=False,
+        capture_allocator_stats=False,
+    )
+    assert steps == []
+
+    actor.step_pytorch_profiler()
+    assert steps == ["step"]
 
 
 def test_actor_normal_run_uses_execution_prepared_during_setup() -> None:

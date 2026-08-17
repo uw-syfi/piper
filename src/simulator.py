@@ -50,6 +50,7 @@ from .profile_statistics import (
     TimingStatistics,
     predicted_reduction,
     prediction_error,
+    summarize_paired_reductions,
     summarize_timing_samples,
 )
 
@@ -86,7 +87,13 @@ class NodeInstance:
 
 @dataclass(frozen=True)
 class TimelineEvent:
-    """The simulated interval for one rank-local node occurrence."""
+    """The simulated interval for one rank-local node occurrence.
+
+    ``start_us`` is the earliest legal start implied by the DAG and physical
+    stream FIFO constraints.  Observed CUDA start offsets are retained only
+    for validation; they are not replay release constraints in either timing
+    mode, so normal and isolated replays differ solely by service times.
+    """
 
     operation: NodeInstance
     node_kind: str
@@ -96,6 +103,8 @@ class TimelineEvent:
     profile_duration_us: float
     effective_duration_us: float
     profile_start_offset_us: float = 0.0
+    observed_profile_start_offset_us: float = 0.0
+    arrival_start_us: float | None = None
     communication_id: str | None = None
     critical_predecessor: NodeInstance | None = None
 
@@ -150,6 +159,8 @@ class SimulationComparisonResult:
     observed_normal_envelope_samples_us: tuple[float, ...]
     interference_free_statistics: TimingStatistics
     normal_statistics: TimingStatistics
+    dependency_replay_interference_reduction_samples_pct: tuple[float, ...]
+    dependency_replay_interference_reduction_statistics: TimingStatistics
     observed_normal_envelope_statistics: TimingStatistics | None = None
     actual_statistics: TimingStatistics | None = None
     instrumented_normal_statistics: TimingStatistics | None = None
@@ -167,6 +178,66 @@ class SimulationComparisonResult:
     normal_dependency_replay_excess_pct: float | None = None
     profile_event_overhead_pct: float | None = None
     mode_profile_event_overhead_pct: float | None = None
+    kineto_cupti_instrumentation_error: PredictionError | None = None
+
+
+@dataclass(frozen=True)
+class EarliestLegalStartComparison:
+    """Validation of DAG/stream readiness against observed CUDA starts."""
+
+    samples: int
+    mean_signed_error_us: float
+    median_signed_error_us: float
+    median_absolute_error_us: float
+    p95_absolute_error_us: float
+
+
+def compare_earliest_legal_starts(
+    plan_or_dags: Any,
+    *,
+    profile_mode: str = NORMAL_PROFILE_MODE,
+    strict: bool = True,
+) -> EarliestLegalStartComparison:
+    """Compare simulated earliest legal starts with recorded CUDA starts.
+
+    The comparison is per node instance and raw profile iteration.  A positive
+    error means the observed CUDA start was later than its DAG/stream-ready
+    time, i.e. residual launch or resource-queue delay not explained by the
+    modeled ordering constraints.
+    """
+    mode = normalize_profile_mode(profile_mode)
+    errors: list[float] = []
+    for iteration_id in profile_iteration_ids(plan_or_dags, profile_mode=mode):
+        result = simulate_training_step(
+            plan_or_dags,
+            profile_mode=mode,
+            sample_iteration_id=iteration_id,
+            strict=strict,
+        )
+        for event in result.timeline:
+            observed = event.observed_profile_start_offset_us
+            earliest_start = (
+                event.start_us
+                if event.arrival_start_us is None
+                else event.arrival_start_us
+            )
+            errors.append(float(observed) - float(earliest_start))
+    if not errors:
+        raise SimulationValidationError(
+            f"profile mode {mode!r} has no events to compare"
+        )
+    absolute_errors = sorted(abs(error) for error in errors)
+    p95_index = min(
+        len(absolute_errors) - 1,
+        max(0, math.ceil(0.95 * len(absolute_errors)) - 1),
+    )
+    return EarliestLegalStartComparison(
+        samples=len(errors),
+        mean_signed_error_us=statistics.fmean(errors),
+        median_signed_error_us=statistics.median(errors),
+        median_absolute_error_us=statistics.median(absolute_errors),
+        p95_absolute_error_us=absolute_errors[p95_index],
+    )
 
 @dataclass(frozen=True)
 class _RankLayout:
@@ -941,11 +1012,12 @@ def simulate_training_step(
                         context=f"node {uid!r} rank {rank}",
                         sample_iteration_id=sample_iteration_id,
                     )
-                    profile_start_offset = (
-                        observed_profile_start_offset
-                        if profile_mode == NORMAL_PROFILE_MODE
-                        else 0.0
-                    )
+                    # Both modes replay the same dependency and physical
+                    # stream ordering.  Observed starts are diagnostics: they
+                    # may include host latency or resource queueing, which
+                    # must not make normal and isolated counterfactuals use
+                    # different release policies.
+                    profile_start_offset = 0.0
                     if cross_actor_offsets_aligned and not tuple(
                         getattr(profile, "start_offset_samples_us", ())
                     ):
@@ -1238,6 +1310,12 @@ def simulate_training_step(
                 profile_duration_us=member.profile_duration_us,
                 effective_duration_us=vertex.duration_us,
                 profile_start_offset_us=member.profile_start_offset_us,
+                observed_profile_start_offset_us=(
+                    member.observed_profile_start_offset_us
+                ),
+                arrival_start_us=vertices[
+                    instance_start_vertex[member.key]
+                ].start_us,
                 communication_id=vertex.communication_id,
                 critical_predecessor=critical_predecessor,
             )
@@ -1433,6 +1511,19 @@ def simulate_profile_modes(
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
+    interference_free_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=INTERFERENCE_FREE_PROFILE_MODE
+    )
+    normal_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=NORMAL_PROFILE_MODE
+    )
+    if interference_free_iteration_ids != normal_iteration_ids:
+        raise SimulationValidationError(
+            "normal and interference-free profile iterations must align for "
+            "paired IF-savings estimation: "
+            f"normal={normal_iteration_ids!r}, "
+            f"interference_free={interference_free_iteration_ids!r}"
+        )
     interference_free_samples = simulate_training_step_samples(
         plan_or_dags,
         profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
@@ -1451,6 +1542,10 @@ def simulate_profile_modes(
         normal_samples,
         estimator="median",
     )
+    (
+        dependency_replay_reduction_samples_pct,
+        dependency_replay_reduction_statistics,
+    ) = summarize_paired_reductions(normal_samples, interference_free_samples)
     observed_normal_envelope_samples: tuple[float, ...] = ()
     observed_normal_envelope_statistics = None
     try:
@@ -1479,9 +1574,8 @@ def simulate_profile_modes(
     instrumented_normal_replay_error = None
     instrumented_interference_free_replay_error = None
     observed_reduction_pct = None
-    dependency_replay_reduction_pct = predicted_reduction(
-        interference_free_statistics.estimate,
-        normal_statistics.estimate,
+    dependency_replay_reduction_pct = (
+        dependency_replay_reduction_statistics.estimate
     )
     instrumented_policy_reduction_pct = None
     envelope_modeled_reduction_pct = None
@@ -1595,6 +1689,12 @@ def simulate_profile_modes(
         ),
         interference_free_statistics=interference_free_statistics,
         normal_statistics=normal_statistics,
+        dependency_replay_interference_reduction_samples_pct=(
+            dependency_replay_reduction_samples_pct
+        ),
+        dependency_replay_interference_reduction_statistics=(
+            dependency_replay_reduction_statistics
+        ),
         observed_normal_envelope_statistics=(
             observed_normal_envelope_statistics
         ),
@@ -1626,6 +1726,14 @@ def simulate_profile_modes(
         ),
         profile_event_overhead_pct=event_overhead_pct,
         mode_profile_event_overhead_pct=mode_profile_event_overhead_pct,
+        kineto_cupti_instrumentation_error=(
+            None
+            if instrumented_statistics is None or actual_statistics is None
+            else prediction_error(
+                instrumented_statistics.estimate,
+                actual_statistics.estimate,
+            )
+        ),
     )
 
 

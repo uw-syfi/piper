@@ -23,6 +23,11 @@ from src.state import piper_metadata, create_logger, LOG_LEVEL
 from models.qwen3 import PiperQwen3Model, QWEN_MODEL_NAMES, create_qwen3_config
 from torchtitan.models.qwen3.model.model import precompute_rope_cache
 
+try:
+    from .test_harness import _add_profile_comparison_metrics
+except ImportError:
+    from test_harness import _add_profile_comparison_metrics
+
 logger = create_logger("test_qwen", LOG_LEVEL)
 
 
@@ -323,81 +328,3 @@ def parse_args(argv=None):
     parser.add_argument("--profile-mode-block-iters", type=int, default=1)
     parser.add_argument("--step-time-profile-output", default="")
     return parser.parse_args(argv)
-
-
-def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
-    metrics["interference_free_step_time_us"] = (
-        comparison.interference_free_statistics.estimate
-    )
-    metrics["interference_free_step_time_s"] = (
-        comparison.interference_free_statistics.estimate / 1_000_000.0
-    )
-    metrics["simulated_interference_free_step_time_samples_s"] = [
-        sample / 1_000_000.0
-        for sample in comparison.interference_free_samples_us
-    ]
-    metrics["simulated_normal_step_time_us"] = comparison.normal_statistics.estimate
-    metrics["simulated_normal_step_time_s"] = (
-        comparison.normal_statistics.estimate / 1_000_000.0
-    )
-    metrics["simulated_normal_step_time_samples_s"] = [
-        sample / 1_000_000.0 for sample in comparison.normal_samples_us
-    ]
-    if comparison.normal_prediction_error is not None:
-        metrics["simulated_normal_prediction_error_pct"] = (
-            comparison.normal_prediction_error.signed_pct
-        )
-        metrics["simulated_normal_absolute_error_pct"] = (
-            comparison.normal_prediction_error.absolute_pct
-        )
-    metrics["predicted_interference_reduction_pct"] = (
-        comparison.predicted_interference_reduction_pct
-    )
-    metrics["dependency_replay_interference_reduction_pct"] = (
-        comparison.dependency_replay_interference_reduction_pct
-    )
-    metrics["instrumented_policy_reduction_pct"] = (
-        comparison.instrumented_policy_reduction_pct
-    )
-    metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
-    metrics["mode_profile_event_overhead_pct"] = (
-        comparison.mode_profile_event_overhead_pct
-    )
-    metrics["observed_interference_reduction_pct"] = (
-        comparison.observed_interference_reduction_pct
-    )
-    metrics["envelope_modeled_interference_reduction_pct"] = (
-        comparison.envelope_modeled_interference_reduction_pct
-    )
-    metrics["normal_dependency_replay_excess_pct"] = (
-        comparison.normal_dependency_replay_excess_pct
-    )
-    metrics["observed_normal_envelope_step_time_samples_s"] = [
-        sample / 1_000_000.0
-        for sample in comparison.observed_normal_envelope_samples_us
-    ]
-    if comparison.instrumented_normal_replay_error is not None:
-        metrics["instrumented_normal_replay_error_pct"] = (
-            comparison.instrumented_normal_replay_error.signed_pct
-        )
-    if comparison.instrumented_interference_free_replay_error is not None:
-        metrics["instrumented_interference_free_replay_error_pct"] = (
-            comparison.instrumented_interference_free_replay_error.signed_pct
-        )
-    instrumented = plan.profile_metadata.get(
-        "instrumented_global_step_samples_us_by_mode", {}
-    ).get("normal", ())
-    metrics["instrumented_normal_profile_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0 for sample in instrumented
-    ]
-    uninstrumented = plan.profile_metadata.get(
-        "uninstrumented_global_step_samples_us_by_mode", {}
-    )
-    metrics["uninstrumented_normal_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("normal", ())
-    ]
-    metrics["uninstrumented_interference_free_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("interference_free", ())
-    ]

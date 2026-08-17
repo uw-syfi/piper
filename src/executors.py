@@ -172,10 +172,22 @@ class CommunicationExecutor:
         assert rs_out is not None, (
             f"reduce_scatter: missing reduce_scatter_grads buffer for ubid={ubid}"
         )
+        # The native CUDA caching allocator owns free blocks by their creation
+        # stream. Backward's large transient allocations use Piper's logical
+        # default stream, so allocating this shard-sized temporary directly on
+        # the DP stream strands it in a separate cache. Near capacity that made
+        # backward and reduce-scatter flush and rebuild each other's caches on
+        # every iteration. Allocate from the compute cache, then explicitly
+        # record the cross-stream use so it cannot be reused until RS completes.
+        allocation_stream = self.runtime.default_stream()
+        with torch.cuda.stream(allocation_stream):
+            tmp = torch.empty_like(rs_out)
         with torch.cuda.stream(stream):
             total_bytes = flat_grads.numel() * flat_grads.element_size()
-            tmp = torch.empty_like(rs_out)
-            dist.reduce_scatter_tensor(tmp, flat_grads, group=self.runtime.dp_group)
+            tmp.record_stream(stream)
+            dist.reduce_scatter_tensor(
+                tmp, flat_grads, group=self.runtime.dp_group
+            )
             rs_out.add_(tmp)
             return total_bytes
 
@@ -984,8 +996,15 @@ class DagExecutor:
         loss_fn=None,
         *,
         timing_recorder: TimingRecorder | None = None,
+        serialize_nodes: bool = False,
     ) -> None:
-        """Run one iteration using state prepared outside the hot loop."""
+        """Run one iteration using state prepared outside the hot loop.
+
+        When ``serialize_nodes`` is true, each node waits for a CUDA event
+        recorded after the preceding node. The wait and handoff-event record
+        occur outside the node's profiling range, so CUPTI timing contains
+        only the node's own work while retaining its intended logical stream.
+        """
         assert prepared is not None, (
             "load_training_dag() must prepare execution before run_dag()"
         )
@@ -1016,6 +1035,7 @@ class DagExecutor:
             stream.wait_event(zero_evt)
         completion_events: dict[str, torch.cuda.Event] = {}
         completion_streams: dict[str, torch.cuda.Stream] = {}
+        serialization_event: torch.cuda.Event | None = None
         update_result = None
 
         self.buffers.init_refcounts(prepared.buffer_refcount_template)
@@ -1027,6 +1047,12 @@ class DagExecutor:
             ubid = self._node_bucket_key(node)
             node_stream = physical_stream_by_uid[node.uid]
             node_tag = self._node_tag_str(node)
+
+            # Preserve each node's intended physical stream while forcing the
+            # interference-free profiling policy to execute one node at a
+            # time.  This wait is intentionally before the profiling range.
+            if serialize_nodes and serialization_event is not None:
+                node_stream.wait_event(serialization_event)
 
             operation = planned_by_uid[node.uid]
             for predecessor_uid in operation.completion_predecessors:
@@ -1456,6 +1482,12 @@ class DagExecutor:
             completion_streams[node.uid] = node_stream
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
+
+            # Keep this profiling-only handoff outside the node range.  The
+            # following node waits on it before opening its own range.
+            if serialize_nodes:
+                serialization_event = torch.cuda.Event()
+                serialization_event.record(node_stream)
 
         if timing_recorder is not None:
             # CUDA event elapsed times are valid only after their work has

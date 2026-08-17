@@ -28,10 +28,18 @@ if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
 
+# Model example modules import shared harness helpers.  Reuse this module when
+# the harness is launched as a script instead of loading a second copy under
+# the ``test_harness`` name.
+if __name__ == "__main__":
+    sys.modules.setdefault("test_harness", sys.modules[__name__])
+
 import ray
 from ray.util.placement_group import placement_group_table
 
-from scripts.export_node_profile_ratios import export_node_profile_ratio_csvs
+from scripts.profile_and_replay.export_node_profile_ratios import (
+    export_node_profile_ratio_csvs,
+)
 from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
 from src.profile_statistics import summarize_timing_samples
 from src.schedule import load_schedule_directives
@@ -62,6 +70,99 @@ _RAY_FORWARDED_ENV_VARS = (
     "GLOO_SOCKET_IFNAME",
     "PIPER_PROCESS_GROUP_TIMEOUT_MINUTES",
 )
+
+
+def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
+    """Add profile-and-simulate results to a model's raw metrics mapping."""
+
+    metrics["interference_free_step_time_us"] = (
+        comparison.interference_free_statistics.estimate
+    )
+    metrics["interference_free_step_time_s"] = (
+        comparison.interference_free_statistics.estimate / 1_000_000.0
+    )
+    metrics["simulated_interference_free_step_time_samples_s"] = [
+        sample / 1_000_000.0
+        for sample in comparison.interference_free_samples_us
+    ]
+    metrics["simulated_normal_step_time_us"] = comparison.normal_statistics.estimate
+    metrics["simulated_normal_step_time_s"] = (
+        comparison.normal_statistics.estimate / 1_000_000.0
+    )
+    metrics["simulated_normal_step_time_samples_s"] = [
+        sample / 1_000_000.0 for sample in comparison.normal_samples_us
+    ]
+    if comparison.normal_prediction_error is not None:
+        metrics["simulated_normal_prediction_error_pct"] = (
+            comparison.normal_prediction_error.signed_pct
+        )
+        metrics["simulated_normal_absolute_error_pct"] = (
+            comparison.normal_prediction_error.absolute_pct
+        )
+    metrics["predicted_interference_reduction_pct"] = (
+        comparison.predicted_interference_reduction_pct
+    )
+    metrics["dependency_replay_interference_reduction_pct"] = (
+        comparison.dependency_replay_interference_reduction_pct
+    )
+    reduction_stats = comparison.dependency_replay_interference_reduction_statistics
+    metrics["dependency_replay_interference_reduction_samples_pct"] = list(
+        comparison.dependency_replay_interference_reduction_samples_pct
+    )
+    metrics["dependency_replay_interference_reduction_estimator"] = (
+        reduction_stats.estimator
+    )
+    metrics["dependency_replay_interference_reduction_ci95_low_pct"] = (
+        reduction_stats.ci95_low
+    )
+    metrics["dependency_replay_interference_reduction_ci95_high_pct"] = (
+        reduction_stats.ci95_high
+    )
+    metrics["instrumented_policy_reduction_pct"] = (
+        comparison.instrumented_policy_reduction_pct
+    )
+    metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
+    metrics["mode_profile_event_overhead_pct"] = (
+        comparison.mode_profile_event_overhead_pct
+    )
+    metrics["observed_interference_reduction_pct"] = (
+        comparison.observed_interference_reduction_pct
+    )
+    metrics["envelope_modeled_interference_reduction_pct"] = (
+        comparison.envelope_modeled_interference_reduction_pct
+    )
+    metrics["normal_dependency_replay_excess_pct"] = (
+        comparison.normal_dependency_replay_excess_pct
+    )
+    metrics["observed_normal_envelope_step_time_samples_s"] = [
+        sample / 1_000_000.0
+        for sample in comparison.observed_normal_envelope_samples_us
+    ]
+    if comparison.instrumented_normal_replay_error is not None:
+        metrics["instrumented_normal_replay_error_pct"] = (
+            comparison.instrumented_normal_replay_error.signed_pct
+        )
+    if comparison.instrumented_interference_free_replay_error is not None:
+        metrics["instrumented_interference_free_replay_error_pct"] = (
+            comparison.instrumented_interference_free_replay_error.signed_pct
+        )
+    instrumented = plan.profile_metadata.get(
+        "instrumented_global_step_samples_us_by_mode", {}
+    ).get("normal", ())
+    metrics["instrumented_normal_profile_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0 for sample in instrumented
+    ]
+    uninstrumented = plan.profile_metadata.get(
+        "uninstrumented_global_step_samples_us_by_mode", {}
+    )
+    metrics["uninstrumented_normal_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0
+        for sample in uninstrumented.get("normal", ())
+    ]
+    metrics["uninstrumented_interference_free_step_time_samples_s"] = [
+        float(sample) / 1_000_000.0
+        for sample in uninstrumented.get("interference_free", ())
+    ]
 
 
 def main() -> None:
@@ -739,6 +840,8 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
             "simulated_normal_absolute_error_pct",
             "predicted_interference_reduction_pct",
             "dependency_replay_interference_reduction_pct",
+            "dependency_replay_interference_reduction_ci95_low_pct",
+            "dependency_replay_interference_reduction_ci95_high_pct",
             "instrumented_policy_reduction_pct",
             "observed_interference_reduction_pct",
             "envelope_modeled_interference_reduction_pct",
@@ -750,6 +853,17 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
         ):
             if m.get(key) is not None:
                 row[key] = float(m[key])
+        paired_reductions = m.get(
+            "dependency_replay_interference_reduction_samples_pct"
+        ) or []
+        if paired_reductions:
+            row["dependency_replay_interference_reduction_samples"] = len(
+                paired_reductions
+            )
+        if m.get("dependency_replay_interference_reduction_estimator"):
+            row["dependency_replay_interference_reduction_estimator"] = m[
+                "dependency_replay_interference_reduction_estimator"
+            ]
         if m.get("interference_free_step_time_s") is not None:
             row["interference_free_step_time_s"] = m[
                 "interference_free_step_time_s"
