@@ -153,6 +153,7 @@ def test_profile_run_dag_can_defer_profiler_advance(monkeypatch) -> None:
         device="cuda:0",
     )
     actor._execute_dag = lambda **_kwargs: None
+    actor.profile_prepared_dag_executions = {"interference_free": None}
     actor._cupti_allocator_iteration_stats = []
     monkeypatch.setattr(actor_module.torch.cuda, "synchronize", lambda *_args: None)
 
@@ -178,11 +179,54 @@ def test_actor_normal_run_uses_execution_prepared_during_setup() -> None:
         return expected_result
 
     actor._execute_dag = execute_dag
+    actor.runtime = SimpleNamespace(pytorch_profiler_enabled=False)
     loss_fn = object()
 
     assert actor.run_dag(loss_fn=loss_fn) is expected_result
     assert captured["loss_fn"] is loss_fn
     assert "stream_override" not in captured
+
+
+def test_pytorch_profiler_uses_warmup_then_active_and_steps_per_dag(
+    monkeypatch,
+) -> None:
+    actor_class = PiperActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    profiler_steps = []
+    schedule_kwargs = {}
+
+    class _FakeProfiler:
+        def __enter__(self):
+            return self
+
+        def step(self):
+            profiler_steps.append("step")
+
+    def fake_schedule(**kwargs):
+        schedule_kwargs.update(kwargs)
+        return "warmup_then_active"
+
+    def fake_profile(**kwargs):
+        assert kwargs["schedule"] == "warmup_then_active"
+        return _FakeProfiler()
+
+    monkeypatch.setattr(actor_module.torch.profiler, "schedule", fake_schedule)
+    monkeypatch.setattr(actor_module.torch.profiler, "profile", fake_profile)
+    actor.runtime = SimpleNamespace(
+        global_rank=0,
+        pytorch_profiler_enabled=False,
+        torch_profiler=None,
+    )
+    actor.logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+    expected_result = object()
+    actor._execute_dag = lambda **_kwargs: expected_result
+
+    actor.start_pytorch_profiler(warmup_iters=2, active_iters=1)
+    assert schedule_kwargs == {"wait": 0, "warmup": 2, "active": 1, "repeat": 1}
+    assert actor.run_dag() is expected_result
+    assert actor.run_dag() is expected_result
+    assert actor.run_dag() is expected_result
+    assert profiler_steps == ["step", "step", "step"]
 
 
 def test_actor_result_keeps_normal_duration_and_offset_samples_paired(

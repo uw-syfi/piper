@@ -164,9 +164,20 @@ def main(args, pg):
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
             "out", "pytorch_profiles"
         )
-        logger.info(f"Running {args.pytorch_profiler_iters} PyTorch-profiled iterations")
-        ray.get([actor.start_pytorch_profiler.remote() for actor in actors.values()])
-        for _ in range(args.pytorch_profiler_iters):
+        profiler_warmup_iters = 1
+        logger.info(
+            "Running %d PyTorch-profiler warmup iteration and %d active iteration(s)",
+            profiler_warmup_iters,
+            args.pytorch_profiler_iters,
+        )
+        ray.get([
+            actor.start_pytorch_profiler.remote(
+                warmup_iters=profiler_warmup_iters,
+                active_iters=args.pytorch_profiler_iters,
+            )
+            for actor in actors.values()
+        ])
+        for _ in range(profiler_warmup_iters + args.pytorch_profiler_iters):
             piper_exec_dag(loss_fn)
             time.sleep(1)
         ray.get([
@@ -219,7 +230,7 @@ def parse_args(argv=None):
         "--pytorch-profiler-iters",
         type=int,
         default=1,
-        help="Number of iterations to run under the PyTorch profiler.",
+        help="Number of active iterations retained in the PyTorch trace.",
     )
     parser.add_argument(
         "--profile-and-simulate",

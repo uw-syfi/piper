@@ -1,6 +1,6 @@
 import pytest
 
-from src.coordinator import _build_piper_placement_plan
+from src.coordinator import _build_piper_placement_plan, _driver_gpu_fraction
 
 
 def _ray_node(
@@ -130,6 +130,12 @@ def test_non_gb200_cross_node_group_does_not_apply_domain_reasoning():
     ]
     assert [len(bundle.actor_global_ranks) for bundle in plan.bundles] == [4, 2]
     assert all(bundle.nvlink_domain is None for bundle in plan.bundles)
+
+
+def test_pp_outer_no_pipeline_driver_does_not_fragment_actor_gpus():
+    assert _driver_gpu_fraction(pp_outer=True, pp_degree=1) == 0.05
+    assert _driver_gpu_fraction(pp_outer=True, pp_degree=2) == 0.1
+    assert _driver_gpu_fraction(pp_outer=False, pp_degree=1) == 0.1
 
 
 def test_gb200_group_fails_instead_of_crossing_nvlink_domains():

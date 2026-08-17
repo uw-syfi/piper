@@ -10,7 +10,7 @@ from torch.distributed._functional_collectives import (
     all_to_all_single,
     all_to_all_single_autograd,
 )
-from torch.autograd.graph import GradientEdge, Node
+from torch.autograd.graph import GradientEdge, Node, get_gradient_edge
 from torch.nn import Parameter
 
 try:
@@ -357,46 +357,6 @@ class ComputeExecutor:
         out.copy_(grad)
         return out
 
-    def fused_backward(self, stage_outputs_or_loss: list, output_grads: Any, weights: list) -> None:
-        wts = [w for w in weights if w.requires_grad]
-        if not wts:
-            return
-        dweights = torch.autograd.grad(
-            stage_outputs_or_loss,
-            inputs=wts,
-            grad_outputs=output_grads,
-            retain_graph=False,
-            allow_unused=True,
-        )
-        for w, dw in zip(wts, dweights):
-            if dw is None:
-                continue
-            dw = self.grad_with_param_layout(w, dw)
-            if w.grad is None:
-                w.grad = dw
-            else:
-                grad_dtype = (
-                    w.grad_dtype
-                    if getattr(w, "grad_dtype", None) is not None
-                    else w.dtype
-                )
-                if (
-                    w.grad.dtype != grad_dtype
-                    or w.grad.device != w.device
-                    or w.grad.layout != w.layout
-                    or tuple(w.grad.stride()) != tuple(w.stride())
-                ):
-                    w.grad = self.grad_with_param_layout(w, w.grad)
-                w.grad += dw
-
-    def backward_weight_from_outputs(
-        self,
-        stage_outputs_or_loss: list,
-        output_grads: Any,
-        weights: Any,
-    ) -> None:
-        self.fused_backward(stage_outputs_or_loss, output_grads, list(weights))
-
     def bucket_backward_input(
         self,
         stage_outputs_or_loss: list,
@@ -411,18 +371,34 @@ class ComputeExecutor:
 
         input_values = [inp for inp in input_values if inp.requires_grad]
         if not input_values:
-            self.fused_backward(stage_outputs_or_loss, output_grads, weights)
-            for i, t in enumerate(stage_outputs_or_loss):
-                if isinstance(t, torch.Tensor):
-                    stage_outputs_or_loss[i] = t.detach()
-            return (), [], None
+            if any(weight.requires_grad for weight in weights):
+                raise RuntimeError(
+                    "split backward invariant failed: DAG lowering emitted BWD_I/BWD_W "
+                    "for a bucket with trainable weights but no differentiable runtime inputs"
+                )
+            return (), []
 
         stage_output_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, stage_outputs_or_loss)))
         stage_input_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, input_values)))
         weight_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, weights)))
 
+        # Python/new-style autograd nodes (including Inductor's compiled
+        # backward Function) do not themselves keep their C++ graph alive.
+        # get_gradient_edge() creates the ownership token required to reuse
+        # captured interior edges after the stage outputs are detached.
+        ownership_tokens = tuple(
+            edge.ownership_token
+            for output in stage_outputs_or_loss
+            if isinstance(output, torch.Tensor) and output.requires_grad
+            for edge in (get_gradient_edge(output),)
+            if edge.ownership_token is not None
+        )
+
         reverse_edges_dict = construct_reverse_graph(stage_output_grad_fns)
         param_groups = get_param_groups(stage_input_grad_fns, weight_grad_fns, reverse_edges_dict)
+        if ownership_tokens:
+            for param_group in param_groups:
+                param_group["ownership_tokens"] = ownership_tokens
         handles = []
         for param_group in param_groups:
             for i, intermediate in enumerate(param_group["intermediates"]):
@@ -447,15 +423,33 @@ class ComputeExecutor:
             else:
                 inp.grad += dinput
 
-        output_backward_ctx = {
-            "stage_outputs_or_loss": list(stage_outputs_or_loss),
-            "output_grads": output_grads,
-        }
-
         for handle in handles:
             handle.remove()
 
-        return dinputs, param_groups, output_backward_ctx
+        active_grad_fns = set(reverse_edges_dict) | set(stage_output_grad_fns)
+        uncaptured_groups = []
+        for param_group in param_groups:
+            if not any(param in active_grad_fns for param in param_group["params"]):
+                continue
+            captured_grads = param_group.get("grads", [])
+            if not param_group["intermediates"] or not any(
+                grad is not None
+                for grads_tuple in captured_grads
+                if grads_tuple is not None
+                for grad in grads_tuple
+            ):
+                uncaptured_groups.append(param_group)
+        if uncaptured_groups:
+            raise RuntimeError(
+                "split backward invariant failed: one or more trainable parameter "
+                "groups produced no captured boundary gradients"
+            )
+
+        for i, output in enumerate(stage_outputs_or_loss):
+            if isinstance(output, torch.Tensor):
+                stage_outputs_or_loss[i] = output.detach()
+
+        return dinputs, param_groups
 
     def bucket_backward_weight(
         self,
@@ -474,6 +468,9 @@ class ComputeExecutor:
             grad_acc_to_weight[grad_acc] = weight
 
         for param_group in param_groups:
+            # Keep these tokens referenced until the captured-edge backward
+            # below has completed.  Their values are otherwise unused.
+            ownership_tokens = param_group.pop("ownership_tokens", ())
             valid_edges: list[GradientEdge] = []
             valid_grad_outputs: list[torch.Tensor] = []
 
@@ -496,12 +493,18 @@ class ComputeExecutor:
             if not weight_edges:
                 continue
 
-            dweights = torch.autograd.grad(
-                valid_edges,
-                weight_edges,
-                grad_outputs=valid_grad_outputs,
-                retain_graph=False,
-            )
+            try:
+                dweights = torch.autograd.grad(
+                    valid_edges,
+                    weight_edges,
+                    grad_outputs=valid_grad_outputs,
+                    retain_graph=False,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "split backward invariant failed while computing captured "
+                    f"weight gradients for bucket={ubid!r} microbatch={mb_idx!r}"
+                ) from exc
 
             del param_group["grads"]
 
@@ -1414,7 +1417,7 @@ class DagExecutor:
                     weights = self.stages.bucket(ubid).weights()
 
                     with torch.cuda.stream(node_stream):
-                        dinputs, param_groups, output_backward_ctx = self.compute.bucket_backward_input(
+                        dinputs, param_groups = self.compute.bucket_backward_input(
                             stage_outputs_or_loss, output_grads, input_values, iter(weights)
                         )
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
@@ -1429,8 +1432,6 @@ class DagExecutor:
                         "inp_grads": inp_grads_full,
                         "param_groups": param_groups,
                     }
-                    if output_backward_ctx is not None:
-                        self.buffers.task[node.uid]["output_backward_ctx"] = output_backward_ctx
                     if dinputs:
                         self.buffers.task[node.uid]["send_output"] = list(dinputs)
                     fwd_out.clear()
@@ -1450,17 +1451,9 @@ class DagExecutor:
                     param_groups = bwdi_buf["param_groups"]
                     weights = self.stages.bucket(ubid).weights()
                     with torch.cuda.stream(node_stream):
-                        output_backward_ctx = bwdi_buf.get("output_backward_ctx")
-                        if output_backward_ctx is not None:
-                            self.compute.backward_weight_from_outputs(
-                                output_backward_ctx["stage_outputs_or_loss"],
-                                output_backward_ctx["output_grads"],
-                                iter(weights),
-                            )
-                        else:
-                            self.compute.bucket_backward_weight(
-                                iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx
-                            )
+                        self.compute.bucket_backward_weight(
+                            iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx
+                        )
                     self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream)
                     self.buffers.task[node.uid] = {}
                     self.buffers.release(bwdi_node.uid)

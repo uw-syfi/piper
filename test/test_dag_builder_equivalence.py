@@ -220,6 +220,21 @@ CASES: dict[str, dict[str, Any]] = {
 }
 
 
+def test_dualpipev_never_splits_virtual_stage_zero_backward() -> None:
+    for physical_pp in (1, 2, 4):
+        microbatches = 2 * physical_pp
+        directives = build_dualpipev_schedule(physical_pp, microbatches)
+        stage_zero_passes = [
+            tag_filter["PASS"]
+            for directive in directives
+            for slot in directive["filters"]
+            for tag_filter in slot
+            if tag_filter["PP"] == 0 and tag_filter["PASS"] != "F"
+        ]
+
+        assert stage_zero_passes == ["B"] * microbatches
+
+
 def _normalize(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -314,7 +329,7 @@ LEGACY_DIGESTS: dict[str, str] = {
     "pp_dp_unsharded": "d81344f46b34e8c8f3cba9238a8a37f9f5b8b382ee88821df65579f7a3263bd3",
     "pp_dp_zero3_zerobubble": "b8759170e8e02a53dabc58e6eddfc10d6cd416f5d0bb706621838d2818688e34",
     "pp_only_1f1b": "eac89ef8094e8acbd18cc296384effa13d22b91de6a59856d9a7bea36c2e79f0",
-    "v_placement_dualpipev": "b9510ebd6d7eb5a1c0aa1582805e9495898244ed93536281c4972490a490012a",
+    "v_placement_dualpipev": "6723d6564c9e0b7dde5b12af91781bde6a70979dbec7ec5cd691767be86d2410",
 }
 
 
