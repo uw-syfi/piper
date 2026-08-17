@@ -345,13 +345,17 @@ def _run_test_module(
         if forwarded_env
         else {}
     )
-    ray.init(
-        address=f"{args.address}:{args.port}" if args.address else None,
-        namespace=namespace,
-        log_to_driver=True,
-        include_dashboard=False,
-        _temp_dir=args.temp_dir,
+    ray_init_kwargs = {
+        "address": f"{args.address}:{args.port}" if args.address else None,
+        "namespace": namespace,
+        "log_to_driver": True,
+        "include_dashboard": False,
         **runtime_env_kwargs,
+    }
+    if not args.address:
+        ray_init_kwargs["_temp_dir"] = args.temp_dir
+    ray.init(
+        **ray_init_kwargs,
     )
     try:
         pp_outer = getattr(test_ns, "pp_outer", False)
@@ -877,7 +881,10 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
     if args.viz:
         viz_output = run_dir / f"{schedule_stem}.png"
         viz_path = visualize_order_directives(order_directives, viz_output)
-    return run_schedule, viz_path
+    # Ray workers may have a different current working directory from the
+    # driver. The run directory is on shared storage, so forward its absolute
+    # path to make the generated schedule resolvable on every node.
+    return run_schedule.resolve(), viz_path
 
 
 def _schedule_attr_stem(

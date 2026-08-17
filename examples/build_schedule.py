@@ -242,6 +242,14 @@ def build_dualpipev_schedule(n_ranks: int, n_mbs: int) -> list[dict]:
 
         def bwdi(stage: int) -> None:
             mb = count(stage, "i")
+            # Virtual stage 0 consumes model inputs (for example integer token
+            # IDs), not a differentiable activation received from another
+            # stage.  It therefore has no activation-input boundary at which
+            # BI can stop and BW can resume.
+            if stage == 0:
+                append_op(stage, mb, "B")
+                inc_bwd(stage)
+                return
             append_op(stage, mb, "BI")
             weight_queue.append((stage, mb))
             inc(stage, "i")

@@ -264,7 +264,7 @@ QWEN3_CONFIG_SPECS = {
     ),
     "9B": Qwen3ConfigSpec(
         dim=2048,
-        n_layers=4,
+        n_layers=24,
         n_heads=32,
         n_kv_heads=8,
         head_dim=64,
@@ -389,7 +389,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
                 gate_bias=spec.gate_bias,
                 score_before_experts=spec.score_before_experts,
                 load_balance_coeff=spec.load_balance_coeff,
-                _debug_force_load_balance=False,
+                _debug_force_load_balance=True,
             ),
         )
     return Qwen3ModelArgs(**model_kwargs)

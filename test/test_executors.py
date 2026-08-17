@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import Mock, call
 
+import pytest
 import torch
 
 import src.executors as executors
@@ -152,6 +153,94 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
     assert grad.dtype == torch.float32
     weight.grad = grad
+
+
+def test_split_backward_uses_captured_groups_without_output_replay() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(4, 5))
+    output = x @ weight
+    output_grad = torch.randn_like(output)
+    expected_x_grad, expected_weight_grad = torch.autograd.grad(
+        output,
+        (x, weight),
+        output_grad,
+    )
+
+    x = x.detach().requires_grad_(True)
+    weight = torch.nn.Parameter(weight.detach())
+    outputs = [x @ weight]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    _, param_groups = compute.bucket_backward_input(
+        outputs,
+        [output_grad],
+        [x],
+        [weight],
+    )
+
+    assert outputs[0].grad_fn is None
+    assert torch.allclose(x.grad, expected_x_grad)
+    assert weight.grad is None
+
+    compute.bucket_backward_weight([weight], param_groups)
+
+    assert torch.allclose(weight.grad, expected_weight_grad)
+
+
+def test_split_backward_supports_new_style_custom_autograd_boundary() -> None:
+    class Scale(torch.autograd.Function):
+        @staticmethod
+        def forward(x, weight):
+            return x * weight
+
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            del output
+            ctx.save_for_backward(*inputs)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, weight = ctx.saved_tensors
+            return grad_output * weight, grad_output * x
+
+    x = torch.randn(5, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(5))
+    output_grad = torch.randn(5)
+    expected_x_grad = output_grad * weight.detach()
+    expected_weight_grad = output_grad * x.detach()
+    outputs = [Scale.apply(x, weight)]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    _, param_groups = compute.bucket_backward_input(
+        outputs,
+        [output_grad],
+        [x],
+        [weight],
+    )
+    compute.bucket_backward_weight([weight], param_groups)
+
+    assert outputs[0].grad_fn is None
+    assert torch.allclose(x.grad, expected_x_grad)
+    assert torch.allclose(weight.grad, expected_weight_grad)
+
+
+def test_split_backward_rejects_missing_runtime_boundary_gradient() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, requires_grad=True)
+    captured_weight = torch.nn.Parameter(torch.randn(4, 5))
+    fallback_weight = torch.nn.Parameter(torch.randn(5))
+    outputs = [x @ captured_weight, fallback_weight.square()]
+    output_grads = [torch.randn_like(output) for output in outputs]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    with pytest.raises(RuntimeError, match="split backward invariant failed"):
+        compute.bucket_backward_input(
+            outputs,
+            output_grads,
+            [x],
+            [captured_weight, fallback_weight],
+        )
 
 
 def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:

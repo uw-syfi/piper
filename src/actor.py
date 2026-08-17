@@ -348,18 +348,34 @@ class PiperActor:
     def _nvtx_pop(self) -> None:
         self.runtime.nvtx_pop()
 
-    def start_pytorch_profiler(self) -> None:
-        """Begin a torch.profiler session spanning the next run_dag iterations.
+    def start_pytorch_profiler(
+        self,
+        *,
+        warmup_iters: int = 1,
+        active_iters: int = 1,
+    ) -> None:
+        """Begin a scheduled torch.profiler session.
 
         Each node's execution in DagExecutor is wrapped in a record_function
         labelled the same as its NVTX range, so the resulting trace identifies
-        per-node work.
+        per-node work. Warmup iterations exercise profiler instrumentation but
+        are discarded; only active iterations are retained in the trace.
         """
+        if warmup_iters < 1:
+            raise ValueError("PyTorch profiler requires at least one warmup iteration")
+        if active_iters < 1:
+            raise ValueError("PyTorch profiler requires at least one active iteration")
         self.runtime.torch_profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=warmup_iters,
+                active=active_iters,
+                repeat=1,
+            ),
         )
         self.runtime.torch_profiler.__enter__()
         self.runtime.pytorch_profiler_enabled = True
@@ -1090,7 +1106,10 @@ class PiperActor:
             self._nvtx_pop()
 
     def run_dag(self, loss_fn=None):
-        return self._execute_dag(loss_fn=loss_fn)
+        result = self._execute_dag(loss_fn=loss_fn)
+        if self.runtime.pytorch_profiler_enabled:
+            self.runtime.torch_profiler.step()
+        return result
 
     def reset_profile_samples(
         self, *, profile_mode: str = "interference_free"

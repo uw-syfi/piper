@@ -1,4 +1,5 @@
 import pytest
+import torch
 import torch.fx as fx
 
 from src.piper import (
@@ -49,6 +50,37 @@ def _dummy_gm() -> fx.GraphModule:
     graph = fx.Graph()
     x = graph.placeholder("x")
     graph.output(x)
+    return fx.GraphModule({}, graph)
+
+
+def _backward_split_gm(
+    *,
+    parameter_only_output: bool,
+    unknown_tail_after_boundary: bool = False,
+) -> fx.GraphModule:
+    graph = fx.Graph()
+    activation = graph.placeholder("activation")
+    parameter = graph.placeholder("parameter")
+    activation.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    parameter.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    coupled = graph.call_function(torch.mul, (activation, parameter))
+    coupled.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    if unknown_tail_after_boundary:
+        coupled = graph.call_function(torch.sin, (coupled,))
+    if parameter_only_output:
+        independent = graph.call_function(torch.square, (parameter,))
+        independent.meta["example_value"] = torch.empty(
+            2, 2, device="meta", requires_grad=True
+        )
+        graph.output((coupled, independent))
+    else:
+        graph.output(coupled)
     return fx.GraphModule({}, graph)
 
 
@@ -487,7 +519,11 @@ def test_split_backward_stencil_allows_mixed_fused_and_split_microbatches() -> N
         ],
     }
     dag = TrainingDAG()
-    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+    fwd = _compute("fwd", {"PP": 0, "PASS": "F"})
+    fwd.node_meta.update(
+        {"gm": _dummy_gm(), "graphargs": [], "input_idxs": [], "param_idxs": []}
+    )
+    dag.add_node(fwd)
     dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
     dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
 
@@ -555,6 +591,137 @@ def test_bucket_rewrite_resolves_split_microbatch_bwd_by_metadata(monkeypatch) -
     ]
     assert len(reductions) == 2
     assert sorted(len(node.node_meta["bwd_uids"]) for node in reductions) == [2, 2]
+
+
+def test_bucketed_split_backward_weight_phase_stays_bucket_local(monkeypatch) -> None:
+    dag = _single_bucket_training_dag()
+    fwd = dag.nodes["fwd"]
+    fwd.node_meta.update(
+        {
+            "stage_id": 0,
+            "segment_id": 0,
+            "gm": _dummy_gm(),
+            "graphargs": [],
+            "input_idxs": [],
+            "param_idxs": [],
+        }
+    )
+    monkeypatch.setattr(
+        directives,
+        "bucket_stage",
+        lambda *_args, **_kwargs: [
+            (_dummy_gm(), [], [], []),
+            (_dummy_gm(), [], [], []),
+        ],
+    )
+
+    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 1)
+    split_keys = _validate_split_backward_order_stencil(
+        [
+            {
+                "op": "order",
+                "filters": [
+                    [{"PP": 0, "PASS": "BI"}],
+                    [{"PP": 0, "PASS": "BW"}],
+                ],
+            }
+        ]
+    )
+    _apply_split_backward_stencil(dag, split_keys)
+
+    weight_nodes = [
+        node for node in dag.nodes.values()
+        if node.compute_subkind == "BWD_W"
+    ]
+    assert len(weight_nodes) == 2
+    for weight_node in weight_nodes:
+        input_edges = dag.incoming_edges(weight_node.uid, dep_kind="data")
+        assert len(input_edges) == 1
+        input_node = dag.nodes[input_edges[0].src_uid]
+        assert input_node.compute_subkind == "BWD_I"
+        assert input_node.node_meta["bucket_key"] == weight_node.node_meta["bucket_key"]
+        assert input_node.node_meta["fwd_uid"] == weight_node.node_meta["fwd_uid"]
+
+
+@pytest.mark.parametrize(
+    (
+        "parameter_only_output",
+        "differentiable_input",
+        "provable_path",
+        "eligible",
+    ),
+    [
+        (False, True, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+)
+def test_split_backward_requires_capturable_parameter_paths(
+    parameter_only_output: bool,
+    differentiable_input: bool,
+    provable_path: bool,
+    eligible: bool,
+) -> None:
+    dag = _single_bucket_training_dag()
+    gm = _backward_split_gm(
+        parameter_only_output=parameter_only_output
+    )
+    if not provable_path:
+        for node in gm.graph.nodes:
+            if node.op not in ("placeholder", "output"):
+                node.meta.pop("example_value", None)
+    dag.nodes["fwd"].node_meta.update(
+        {
+            "gm": gm,
+            "graphargs": [
+                torch.empty(
+                    2,
+                    2,
+                    device="meta",
+                    requires_grad=differentiable_input,
+                ),
+                torch.empty(2, 2, device="meta", requires_grad=True),
+            ],
+            "input_idxs": [0],
+            "param_idxs": [1],
+        }
+    )
+    split_keys = {(('PP', 0),)}
+
+    if not eligible:
+        with pytest.raises(
+            ValueError,
+            match=r"cannot split backward node 'bwd'.*parameter",
+        ):
+            _apply_split_backward_stencil(dag, split_keys)
+    else:
+        _apply_split_backward_stencil(dag, split_keys)
+        assert dag.nodes["bwd"].compute_subkind == "BWD_I"
+        assert dag.nodes["bwd.bw"].compute_subkind == "BWD_W"
+
+
+def test_split_backward_does_not_require_proof_after_captured_boundary() -> None:
+    dag = _single_bucket_training_dag()
+    dag.nodes["fwd"].node_meta.update(
+        {
+            "gm": _backward_split_gm(
+                parameter_only_output=False,
+                unknown_tail_after_boundary=True,
+            ),
+            "graphargs": [
+                torch.empty(2, 2, device="meta", requires_grad=True),
+                torch.empty(2, 2, device="meta", requires_grad=True),
+            ],
+            "input_idxs": [0],
+            "param_idxs": [1],
+        }
+    )
+
+    _apply_split_backward_stencil(dag, {(('PP', 0),)})
+
+    assert dag.nodes["bwd"].compute_subkind == "BWD_I"
+    assert dag.nodes["bwd.bw"].compute_subkind == "BWD_W"
 
 
 def test_apply_schedule_buckets_base_graph_before_microbatch_split(monkeypatch) -> None:

@@ -401,6 +401,22 @@ def run_dp_rank(
     return training_func(*args, **kwargs)
 
 
+def _driver_gpu_fraction(*, pp_outer: bool, pp_degree: int) -> float:
+    """Avoid fractional-GPU packing deadlock for no-pipeline PP-outer runs.
+
+    A PP=1/DP=16 placement puts eight DP drivers and eight Piper actors in
+    each 8-GPU node bundle.  Ray packs the eight 0.1-GPU drivers onto one
+    physical GPU; because Piper actors each request 0.6 GPU, that leaves room
+    for only seven actors and permanently strands the eighth.  Drivers still
+    need a visible GPU while Dynamo traces Triton-backed MoE kernels, so pack
+    them into 0.4 GPU total and preserve the remaining 0.6 actor slot.
+    """
+
+    if pp_outer and int(pp_degree) == 1:
+        return 0.05
+    return 0.1
+
+
 @ray.remote
 class PiperProgramCoordinator:
     """Central actor that coordinates all DP replicas of one pipeline."""
@@ -444,6 +460,10 @@ class PiperProgramCoordinator:
         return ray.get(
             [
                 run_dp_rank.options(
+                    num_gpus=_driver_gpu_fraction(
+                        pp_outer=self.pp_outer,
+                        pp_degree=self.pp_degree,
+                    ),
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=ray_pg,
                         placement_group_bundle_index=(

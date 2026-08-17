@@ -2,6 +2,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.fx as fx
 
 from .bucket import bucket_stage
@@ -101,10 +102,143 @@ def _apply_split_backward_stencil(
         _split_fused_bwd_node(dag, node.uid)
 
 
+def _split_backward_unsupported_params(fwd_node: TrainingDAGNode) -> list[str]:
+    """Return trainable FX parameters with an uncapturable gradient path."""
+    gm = fwd_node.node_meta.get("gm")
+    graphargs = fwd_node.node_meta.get("graphargs")
+    input_idxs = fwd_node.node_meta.get("input_idxs")
+    param_idxs = fwd_node.node_meta.get("param_idxs")
+    if not isinstance(gm, fx.GraphModule):
+        return ["<missing GraphModule metadata>"]
+    if not isinstance(graphargs, (list, tuple)):
+        return ["<missing graphargs metadata>"]
+    if not isinstance(input_idxs, (list, tuple)) or not isinstance(param_idxs, (list, tuple)):
+        return ["<missing input/parameter index metadata>"]
+
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    output = next((node for node in gm.graph.nodes if node.op == "output"), None)
+    if output is None:
+        return ["<missing FX output>"]
+
+    def _example(node: fx.Node) -> Any:
+        return node.meta.get("example_value", node.meta.get("val"))
+
+    def _arg(index: int) -> Any:
+        return graphargs[index] if 0 <= index < len(graphargs) else None
+
+    def _is_differentiable_value(value: Any) -> bool:
+        return isinstance(value, torch.Tensor) and bool(value.requires_grad)
+
+    def _node_grad_state(node: fx.Node) -> bool | None:
+        example = _example(node)
+        if not isinstance(example, torch.Tensor):
+            return None
+        return bool(example.requires_grad)
+
+    def _has_provable_backward(node: fx.Node) -> bool:
+        if node.op == "call_module":
+            return False
+        target = str(node.target)
+        return "autograd_function_apply" not in target
+
+    output_ancestors: set[fx.Node] = set(output.all_input_nodes)
+    pending = list(output_ancestors)
+    while pending:
+        node = pending.pop()
+        for predecessor in node.all_input_nodes:
+            if predecessor not in output_ancestors:
+                output_ancestors.add(predecessor)
+                pending.append(predecessor)
+
+    differentiable_inputs = {
+        placeholders[index]
+        for index in input_idxs
+        if 0 <= index < len(placeholders)
+        and _is_differentiable_value(
+            _arg(index) if _arg(index) is not None else _example(placeholders[index])
+        )
+    }
+    trainable_params = [
+        placeholders[index]
+        for index in param_idxs
+        if 0 <= index < len(placeholders)
+        and (
+            _arg(index) is None
+            or _is_differentiable_value(_arg(index))
+        )
+    ]
+
+    input_reachable: set[fx.Node] = set()
+    pending = list(differentiable_inputs)
+    while pending:
+        node = pending.pop()
+        for user in node.users:
+            if (
+                user is output
+                or user not in output_ancestors
+                or user in input_reachable
+                or _node_grad_state(user) is not True
+                or not _has_provable_backward(user)
+            ):
+                continue
+            input_reachable.add(user)
+            pending.append(user)
+
+    unsupported: list[str] = []
+    for parameter in trainable_params:
+        if parameter not in output_ancestors:
+            continue
+        # Track whether each parameter-to-output path has crossed a node whose
+        # backward is exercised while differentiating a stage activation input.
+        pending_paths = [(parameter, False)]
+        seen: set[tuple[fx.Node, bool]] = set()
+        has_uncaptured_path = False
+        while pending_paths and not has_uncaptured_path:
+            node, crossed_input_path = pending_paths.pop()
+            state = (node, crossed_input_path)
+            if state in seen:
+                continue
+            seen.add(state)
+            # A hook at the first input-reachable intersection captures the
+            # complete downstream gradient for this parameter-side path.  FX
+            # nodes after that boundary need not expose enough metadata to
+            # prove their own backward implementation.
+            if crossed_input_path:
+                continue
+            for user in node.users:
+                if user is output:
+                    has_uncaptured_path = True
+                    break
+                if user not in output_ancestors or _node_grad_state(user) is False:
+                    continue
+                if _node_grad_state(user) is None or not _has_provable_backward(user):
+                    has_uncaptured_path = True
+                    break
+                pending_paths.append(
+                    (user, crossed_input_path or user in input_reachable)
+                )
+        if has_uncaptured_path:
+            unsupported.append(parameter.name)
+    return sorted(unsupported)
+
+
 def _split_fused_bwd_node(dag: TrainingDAG, bwd_uid: str) -> None:
     bwd_i = dag.nodes[bwd_uid]
     if bwd_i.node_kind != "COMPUTE" or bwd_i.compute_subkind != "BWD":
         raise ValueError(f"expected fused BWD compute node, got {bwd_uid}: {bwd_i}")
+    fwd_uid = bwd_i.node_meta.get("fwd_uid")
+    fwd_node = dag.nodes.get(fwd_uid)
+    unsupported = (
+        [f"<missing forward node {fwd_uid!r}>"]
+        if fwd_node is None
+        else _split_backward_unsupported_params(fwd_node)
+    )
+    if unsupported:
+        raise ValueError(
+            f"cannot split backward node {bwd_uid!r}: trainable parameters have "
+            "no capturable differentiable activation-input boundary on every "
+            f"gradient path: {unsupported}"
+        )
     bwd_w_uid = f"{bwd_uid}.bw"
     if bwd_w_uid in dag.nodes:
         raise ValueError(f"duplicate BWD_W uid while splitting {bwd_uid}: {bwd_w_uid}")
