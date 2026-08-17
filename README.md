@@ -146,6 +146,11 @@ python examples/test_harness.py \
 The base schedule `pp4_dp2_ep2_v_placement.json` describes a PP x DP x EP placement with four annotated pipeline regions mapped onto two physical pipeline ranks in a V layout.
 Regions `PP=0` and `PP=3` run on device group `[0, 2]`, while `PP=1` and `PP=2` run on device group `[1, 3]`.
 Within each device group, Piper replicates non-expert regions for DP and shards expert regions for EP.
+`replicate` and `shard` filters must select disjoint model regions; applying
+both ownership modes to the same region is rejected. A `place` directive may
+select either kind of region. For an EP schedule, use an absence filter such as
+`{"PP": 0, "EP": "-"}` to replicate only the dense portion of a pipeline
+stage and `{"PP": 0, "EP": "*"}` to shard its expert regions.
 This example expects four visible CUDA devices.
 The harness appends DualPipeV `split` and `order` directives for two physical pipeline ranks and four microbatches.
 
@@ -227,6 +232,15 @@ These functions are trace-preserved tensor identities. They let Piper insert
 uneven all-to-all communication without inferring tensor roles from shapes,
 dtypes, or model-specific operator patterns. Each EP region requires exactly
 one marker of each kind.
+
+The model author is responsible for the semantic relationship between these
+markers: dispatch rows must be packed into consecutive blocks described by the
+route counts, and the combine payload must restore every received row to its
+original source-major, local-route position. Piper validates graph
+dependencies, tensor schemas, counts, and row totals, but it cannot determine
+from tensor values whether a row was assigned to the correct route or restored
+to the correct identity. Routed model implementations should therefore include
+correctness tests with identifiable rows.
 
 The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
 For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
