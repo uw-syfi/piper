@@ -71,32 +71,37 @@ def _placeholder_values(gm: fx.GraphModule, example_inputs: list) -> dict[str, o
 
 
 def _run_segments(segments, placeholder_values: dict[str, object]) -> torch.Tensor:
-    prev_output = None
+    runtime_values = dict(placeholder_values)
+    final_output = None
 
     for segment in segments:
         ph_nodes = [node for node in segment.gm.graph.nodes if node.op == "placeholder"]
-        args = []
-        activation_inputs = (
-            ()
-            if prev_output is None
-            else prev_output
-            if isinstance(prev_output, tuple)
-            else (prev_output,)
-        )
-        activation_iter = iter(activation_inputs)
-
-        for node in ph_nodes:
-            if node.name in placeholder_values:
-                args.append(placeholder_values[node.name])
-            else:
-                args.append(next(activation_iter))
+        runtime_by_grapharg = {
+            grapharg_idx: descriptor
+            for grapharg_idx, descriptor in zip(
+                segment.input_idxs, segment.runtime_input_values
+            )
+        }
+        args = [
+            runtime_values[runtime_by_grapharg[index]["value_id"]]
+            if index in runtime_by_grapharg
+            else placeholder_values[node.name]
+            for index, node in enumerate(ph_nodes)
+        ]
 
         with torch.no_grad():
-            prev_output = segment.gm(*args)
+            final_output = segment.gm(*args)
+        outputs = (
+            final_output
+            if isinstance(final_output, tuple)
+            else (final_output,)
+        )
+        for descriptor, value in zip(segment.runtime_output_values, outputs):
+            runtime_values[descriptor["value_id"]] = value
 
-    if isinstance(prev_output, (tuple, list)) and len(prev_output) == 1:
-        prev_output = prev_output[0]
-    return prev_output
+    if isinstance(final_output, (tuple, list)) and len(final_output) == 1:
+        final_output = final_output[0]
+    return final_output
 
 
 def test_split_gm_by_annotations_handles_nested_annotation_segments() -> None:
@@ -306,11 +311,13 @@ def test_split_gm_uses_explicit_ep_tensor_boundaries() -> None:
     assert boundary["routing_counts_idx"] != boundary["tensor_idx"]
     assert boundary["payload_schema"] == {
         "shape": (8, 4),
+        "rank": 2,
         "dtype": "torch.float32",
         "requires_grad": True,
     }
     assert boundary["routing_counts_schema"] == {
         "shape": (1, 4),
+        "rank": 2,
         "dtype": "torch.int64",
         "requires_grad": False,
     }
@@ -639,17 +646,19 @@ class _RoutedRegionWithBypassNet(nn.Module):
         self,
         payload: torch.Tensor,
         bypass: torch.Tensor,
+        bypass_scale: torch.Tensor,
         counts: torch.Tensor,
     ) -> torch.Tensor:
         with annotate("DENSE"):
             payload = mark_dispatch_payload(payload)
             bypass = bypass + 1
+            bypass_scale = bypass_scale + 1
             counts = mark_dispatch_counts(counts)
             with annotate("ROUTED"):
                 scale = counts.sum().to(payload.dtype) * 0 + 1
                 combined = mark_combine_payload(payload * scale)
         with annotate("DENSE"):
-            return combined + bypass
+            return combined + bypass + bypass_scale.to(combined.dtype)
 
 
 def test_split_gm_allows_dynamic_value_to_bypass_routed_region() -> None:
@@ -657,6 +666,7 @@ def test_split_gm_allows_dynamic_value_to_bypass_routed_region() -> None:
         _RoutedRegionWithBypassNet(),
         torch.randn(8, 4),
         torch.randn(8, 4),
+        torch.randn(1, 4, dtype=torch.float64),
         torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
     )
 
@@ -665,6 +675,33 @@ def test_split_gm_allows_dynamic_value_to_bypass_routed_region() -> None:
 
     assert len(segments) == 3
     assert torch.allclose(result, ref, atol=1e-6)
+
+    dense, routed, consumer = segments
+    routed_input_ids = {
+        value["value_id"] for value in routed.runtime_input_values
+    }
+    routed_output_ids = {
+        value["value_id"] for value in routed.runtime_output_values
+    }
+    direct_bypass = [
+        value
+        for value in dense.runtime_output_values
+        if value["value_id"]
+        in {item["value_id"] for item in consumer.runtime_input_values}
+    ]
+    assert len(routed_input_ids) == 2
+    assert len(routed_output_ids) == 1
+    assert len(direct_bypass) == 2
+    assert not ({item["value_id"] for item in direct_bypass} & routed_input_ids)
+    assert not ({item["value_id"] for item in direct_bypass} & routed_output_ids)
+    assert {tuple(item["schema"]["shape"]) for item in direct_bypass} == {
+        (8, 4),
+        (1, 4),
+    }
+    assert {item["schema"]["dtype"] for item in direct_bypass} == {
+        "torch.float32",
+        "torch.float64",
+    }
 
 
 def test_split_gm_rejects_concrete_negative_route_counts_metadata() -> None:

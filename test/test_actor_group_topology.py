@@ -167,6 +167,14 @@ def test_equal_width_actor_groups_define_aligned_direct_p2p_peers() -> None:
         ((8, 9), "pp_hi_lo"),
         ((10, 11), "pp_lo_hi"),
         ((10, 11), "pp_hi_lo"),
+        ((0, 2), "dense_state_lo_hi"),
+        ((0, 2), "dense_state_hi_lo"),
+        ((4, 6), "dense_state_lo_hi"),
+        ((4, 6), "dense_state_hi_lo"),
+        ((8, 9), "dense_state_lo_hi"),
+        ((8, 9), "dense_state_hi_lo"),
+        ((10, 11), "dense_state_lo_hi"),
+        ((10, 11), "dense_state_hi_lo"),
     )
     all_specs = runtime.required_p2p_process_group_specs()
     assert all(spec in all_specs for spec in expected_pair_specs)

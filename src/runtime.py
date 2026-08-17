@@ -248,6 +248,8 @@ class RuntimeState:
             "n_to_m",
             "pp_lo_hi",
             "pp_hi_lo",
+            "dense_state_lo_hi",
+            "dense_state_hi_lo",
         }:
             raise ValueError(
                 "collective channel must be None or a routed/P2P direction, "
@@ -320,7 +322,12 @@ class RuntimeState:
                     continue
                 for left_rank, right_rank in zip(left, right):
                     participants = tuple(sorted((left_rank, right_rank)))
-                    for channel in ("pp_lo_hi", "pp_hi_lo"):
+                    for channel in (
+                        "pp_lo_hi",
+                        "pp_hi_lo",
+                        "dense_state_lo_hi",
+                        "dense_state_hi_lo",
+                    ):
                         specs.append((participants, channel))
         return tuple(specs)
 
@@ -378,7 +385,12 @@ class RuntimeState:
         declared = (getattr(task, "node_meta", {}) or {}).get(
             "comm_group_kind"
         )
-        if declared in {"pp_lo_hi", "pp_hi_lo"}:
+        if declared in {
+            "pp_lo_hi",
+            "pp_hi_lo",
+            "dense_state_lo_hi",
+            "dense_state_hi_lo",
+        }:
             return str(declared)
         if peer_global_rank is None:
             peer_pp_rank = getattr(task, "peer_pp_rank", None)
@@ -450,6 +462,8 @@ class RuntimeState:
         self.directional_p2p_streams = {
             "pp_lo_hi": torch.cuda.Stream(device=self.device),
             "pp_hi_lo": torch.cuda.Stream(device=self.device),
+            "dense_state_lo_hi": torch.cuda.Stream(device=self.device),
+            "dense_state_hi_lo": torch.cuda.Stream(device=self.device),
         }
 
     def directional_p2p_stream_for_task(self, task: Any) -> torch.cuda.Stream:

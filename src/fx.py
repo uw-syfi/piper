@@ -369,6 +369,8 @@ class AnnotationSegment:
     param_idxs: list[int]
     graphargs: list[Any]
     placeholders: list[fx.Node]
+    runtime_input_values: list[dict[str, Any]]
+    runtime_output_values: list[dict[str, Any]]
     a2a_boundary_after: dict[str, Any] | None = None
 
 
@@ -665,9 +667,29 @@ def _concrete_tensor_shape(value: torch.Tensor) -> tuple[int, ...] | None:
 def _routed_tensor_schema(value: torch.Tensor) -> dict[str, Any]:
     return {
         "shape": _concrete_tensor_shape(value),
+        "rank": int(value.ndim),
         "dtype": str(value.dtype),
         "requires_grad": bool(value.requires_grad),
     }
+
+
+def _runtime_value_descriptor(
+    node: fx.Node,
+    *,
+    source_segment_id: int | None,
+) -> dict[str, Any]:
+    """Describe one runtime FX value without relying on generated ABI names."""
+    value = _example_value(node)
+    descriptor: dict[str, Any] = {
+        "value_id": node.name,
+        "source_segment_id": source_segment_id,
+        "is_tensor": isinstance(value, torch.Tensor),
+    }
+    if isinstance(value, torch.Tensor):
+        descriptor["schema"] = _routed_tensor_schema(value)
+    else:
+        descriptor["schema"] = {"python_type": type(value).__name__}
+    return descriptor
 
 
 def _is_fx_ancestor(ancestor: fx.Node, descendant: fx.Node) -> bool:
@@ -954,6 +976,40 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         for target_seg in range(seg + 1, max_seg + 1):
             seg_cross_in[target_seg].append(node)
 
+    # Preserve the real FX producer/consumer relation instead of threading a
+    # live value through every intervening segment ABI.  Values used by the
+    # immediately adjacent segment stay first, which keeps routed marker slots
+    # aligned on both sides of an adjacent boundary; longer bypasses follow in
+    # stable FX order and become explicit non-adjacent DAG dependencies.
+    node_order = {node: index for index, node in enumerate(nodes)}
+    consumer_segs_by_value: dict[fx.Node, set[int]] = defaultdict(set)
+    for node, source_seg in value_seg.items():
+        if _is_symbolic_scalar(_example_value(node)):
+            continue
+        for user in node.users:
+            consumer_seg = _consumer_seg(user)
+            if consumer_seg is not None and consumer_seg > source_seg:
+                consumer_segs_by_value[node].add(consumer_seg)
+
+    seg_direct_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    seg_direct_out: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for node, consumer_segs in consumer_segs_by_value.items():
+        source_seg = value_seg[node]
+        if consumer_segs:
+            seg_direct_out[source_seg].append(node)
+        for consumer_seg in consumer_segs:
+            seg_direct_in[consumer_seg].append(node)
+    for seg in range(n_segs):
+        seg_direct_in[seg].sort(
+            key=lambda node: (-value_seg[node], node_order[node])
+        )
+        seg_direct_out[seg].sort(
+            key=lambda node: (
+                min(consumer_segs_by_value[node]),
+                node_order[node],
+            )
+        )
+
     segments: list[AnnotationSegment] = []
     output_node = next((node for node in nodes if node.op == "output"), None)
 
@@ -986,7 +1042,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 if node in runtime_placeholders:
                     _add_placeholder(node, node.name, is_runtime_input=True)
         else:
-            for node in seg_cross_in[seg]:
+            for node in seg_direct_in[seg]:
                 _add_placeholder(node, f"_xseg_{node.name}", is_runtime_input=True)
 
         seg_compute_nodes = [
@@ -1083,7 +1139,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 sub_g.output(fx.map_arg(output_node.args[0], lambda x: remap[x]))
             boundary_after = None
         else:
-            out_nodes = [remap[node] for node in seg_cross_in[seg + 1]]
+            out_nodes = [remap[node] for node in seg_direct_out[seg]]
             sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
             from_tag = _tag_from_stack(segment_stacks[seg])
             to_tag = _tag_from_stack(segment_stacks[seg + 1])
@@ -1093,7 +1149,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 "from_tag": from_tag,
                 "to_tag": to_tag,
             }
-            crossing_nodes = seg_cross_in[seg + 1]
+            crossing_nodes = seg_direct_out[seg]
             marker_roles = {
                 role
                 for node in crossing_nodes
@@ -1154,6 +1210,27 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 param_idxs=new_param_idxs,
                 graphargs=new_graphargs,
                 placeholders=placeholders,
+                runtime_input_values=[
+                    _runtime_value_descriptor(
+                        node,
+                        source_segment_id=(
+                            None if seg == 0 else value_seg[node]
+                        ),
+                    )
+                    for node in (
+                        [
+                            node
+                            for node in nodes
+                            if node in runtime_placeholders
+                        ]
+                        if seg == 0
+                        else seg_direct_in[seg]
+                    )
+                ],
+                runtime_output_values=[
+                    _runtime_value_descriptor(node, source_segment_id=seg)
+                    for node in seg_direct_out[seg]
+                ],
                 a2a_boundary_after=boundary_after,
             )
         )
@@ -1180,7 +1257,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
 
     _validate_routed_region_interfaces(
         nodes=nodes,
-        seg_cross_in=seg_cross_in,
+        seg_cross_in=seg_direct_in,
         segments=segments,
         routed_segment_ids=dispatch_targets,
         node_seg=node_seg,

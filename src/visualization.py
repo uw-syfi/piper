@@ -74,6 +74,22 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             for key in keys
             if key in node.node_meta
         ]
+        if node.node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}:
+            lines.extend(
+                (
+                    f"routed={node.node_kind.removesuffix('_COMM')}",
+                    f"role={node.node_meta.get('role')}",
+                    f"direction={node.node_meta.get('direction')}",
+                )
+            )
+        elif node.node_meta.get("dense_state_transfer"):
+            lines.extend(
+                (
+                    "dense_state=direct",
+                    f"role={node.node_meta.get('role')}",
+                    f"direction={node.node_meta.get('direction')}",
+                )
+            )
         return "\\n".join(lines)
 
     for uid, node in training_dag.nodes.items():
@@ -87,6 +103,8 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             "ALL_GATHER_COMM",
             "REDUCE_SCATTER_COMM",
             "A2A_COMM",
+            "M_TO_N_COMM",
+            "N_TO_M_COMM",
         ):
             label = (
                 f"{topo_label}\\n{node.node_kind}\\n{_format_tag(node.tag)}\\n"

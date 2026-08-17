@@ -16,7 +16,7 @@ from src.directives import (
 from src.ordering import resolve_total_order_per_stream
 from src.piper import (
     _split_global_training_dag_by_pp_rank,
-    _validate_dense_relay_sequences,
+    _validate_dense_state_sequences,
     _validate_p2p_sequences,
     _validate_routed_collective_sequences,
 )
@@ -90,6 +90,33 @@ def _cross_group_routed_dag(
     pre.node_meta["tensor_output_indices"] = [0, 1]
     pre.node_meta["differentiable_output_indices"] = [0]
     expert.node_meta["a2a_boundary_after"] = {"tensor_idx": 0}
+    post.node_meta["input_names"] = ["expert_output"]
+    pre.node_meta["runtime_outputs_by_destination"] = {
+        "expert.fwd": [
+            {
+                "value_id": "dense_output",
+                "source_output_idx": 0,
+                "destination_input_idx": 0,
+                "is_tensor": True,
+            },
+            {
+                "value_id": "routing_counts",
+                "source_output_idx": 1,
+                "destination_input_idx": 1,
+                "is_tensor": True,
+            },
+        ]
+    }
+    expert.node_meta["runtime_outputs_by_destination"] = {
+        "post.fwd": [
+            {
+                "value_id": "expert_output",
+                "source_output_idx": 0,
+                "destination_input_idx": 0,
+                "is_tensor": True,
+            }
+        ]
+    }
 
     post_bwd = _compute(
         "post.bwd",
@@ -584,6 +611,20 @@ def _use_flexible_same_group_routed_layout(dag: TrainingDAG) -> None:
     routed.node_meta["input_names"] = ["routing_counts", "routed_tokens"]
     routed.node_meta["output_names"] = ["expert_output"]
     routed.node_meta["a2a_boundary_after"]["tensor_idx"] = 0
+    pre.node_meta["runtime_outputs_by_destination"]["expert.fwd"] = [
+        {
+            "value_id": "routing_counts",
+            "source_output_idx": 0,
+            "destination_input_idx": 0,
+            "is_tensor": True,
+        },
+        {
+            "value_id": "routed_tokens",
+            "source_output_idx": 1,
+            "destination_input_idx": 1,
+            "is_tensor": True,
+        },
+    ]
 
 
 def test_same_group_a2a_allows_flexible_routed_buffer_layout() -> None:
@@ -642,21 +683,36 @@ def test_same_group_a2a_requires_differentiable_routed_payloads(
         )
 
 
-def test_cross_group_route_rejects_flexible_same_group_buffer_layout_early() -> None:
+def test_cross_group_route_allows_marker_defined_payload_count_slots() -> None:
     dag = _cross_group_routed_dag([0, 2], [1, 3])
     _use_flexible_same_group_routed_layout(dag)
     for node in dag.nodes.values():
         node.device = None
 
-    with pytest.raises(ValueError, match="dispatch counts in the final"):
-        apply_schedule_directives(
-            dag,
-            _placed_routed_schedule(
-                pre_devices=[0, 2],
-                routed_devices=[1, 3],
-                post_devices=[0, 2],
-            ),
-        )
+    apply_schedule_directives(
+        dag,
+        _placed_routed_schedule(
+            pre_devices=[0, 2],
+            routed_devices=[1, 3],
+            post_devices=[0, 2],
+        ),
+    )
+
+    routed = [
+        node
+        for node in dag.nodes.values()
+        if node.node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}
+    ]
+    assert len(routed) == 8
+    incoming = next(
+        node
+        for node in routed
+        if node.node_kind == "M_TO_N_COMM"
+        and node.tag["PASS"] == "F"
+        and node.node_meta["role"] == "source"
+    )
+    assert incoming.node_meta["a2a_tensor_idx"] == 1
+    assert incoming.node_meta["routing_counts_idx"] == 0
 
 
 def test_cross_group_route_rejects_payload_dtype_change_early() -> None:
@@ -1182,7 +1238,7 @@ def test_full_afd_directive_path_builds_connected_sequence_safe_actor_dags() -> 
     for actor_dag in actor_dags:
         resolve_total_order_per_stream(actor_dag)
     _validate_routed_collective_sequences(actor_dags)
-    _validate_dense_relay_sequences(actor_dags)
+    _validate_dense_state_sequences(actor_dags)
     _validate_p2p_sequences(actor_dags)
 
     routed = [
@@ -1202,7 +1258,7 @@ def test_full_afd_directive_path_builds_connected_sequence_safe_actor_dags() -> 
     )
 
 
-def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> None:
+def test_pp4_routes_combine_and_state_to_the_actual_dense_consumer() -> None:
     placement_path = (
         Path(__file__).parents[1]
         / "examples"
@@ -1229,7 +1285,7 @@ def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> N
     for actor_dag in actor_dags:
         resolve_total_order_per_stream(actor_dag)
     _validate_routed_collective_sequences(actor_dags)
-    _validate_dense_relay_sequences(actor_dags)
+    _validate_dense_state_sequences(actor_dags)
     _validate_p2p_sequences(actor_dags)
 
     routed = [
@@ -1238,24 +1294,41 @@ def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> N
         for node in actor_dag.nodes.values()
         if node.node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}
     ]
-    relays = [
+    state_transfers = [
         node
         for actor_dag in actor_dags
         for node in actor_dag.nodes.values()
         if node.node_kind in {"SEND_COMM", "RECV_COMM"}
-        and node.node_meta.get("dense_relay")
+        and node.node_meta.get("dense_state_transfer")
     ]
     assert len(routed) == 32
-    assert len(relays) == 16
+    assert len(state_transfers) == 16
     assert {
         (node.node_meta["direction"], node.tag["PASS"])
-        for node in relays
+        for node in state_transfers
     } == {("forward", "F"), ("backward", "B")}
-    assert {node.node_kind for node in relays} == {"SEND_COMM", "RECV_COMM"}
-    assert all(node.node_meta["relay_mode"] == "ordinal_one_to_one" for node in relays)
-    assert all(node.node_meta["payload_arity"] == 1 for node in relays)
-    assert all(node.node_meta["forward_tensor_indices"] == [0] for node in relays)
-    assert all(node.node_meta["backward_tensor_indices"] == [0] for node in relays)
+    assert {node.node_kind for node in state_transfers} == {
+        "SEND_COMM",
+        "RECV_COMM",
+    }
+    assert all(node.stream == "dense_state_stream" for node in state_transfers)
+    assert {
+        node.node_meta["comm_group_kind"] for node in state_transfers
+    } == {"dense_state_lo_hi", "dense_state_hi_lo"}
+    assert all(
+        node.node_meta["transfer_mode"] == "ordinal_one_to_one"
+        for node in state_transfers
+    )
+    assert all(node.node_meta["dense_state_arity"] == 0 for node in state_transfers)
+    assert all(node.node_meta["model_tensor_indices"] == [] for node in state_transfers)
+    assert all(
+        node.node_meta["differentiable_model_indices"] == []
+        for node in state_transfers
+    )
+    assert all(
+        node.node_meta["carries_routing_layout"] is True
+        for node in state_transfers
+    )
     assert all(
         node.node_meta["rank_pairs"]
         == [
@@ -1265,7 +1338,7 @@ def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> N
                 node.node_meta["destination_devices"],
             )
         ]
-        for node in relays
+        for node in state_transfers
     )
 
     for layer in range(4):
@@ -1286,16 +1359,24 @@ def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> N
             and node.node_meta["role"] == "destination"
             and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
         )
-        forward_relay_source = next(
+        forward_state_source = next(
             node
-            for node in relays
+            for node in state_transfers
             if node.node_kind == "SEND_COMM"
             and node.tag["PASS"] == "F"
             and node.node_meta["role"] == "source"
             and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
         )
-        assert combine_destination.device == dispatch_source.device
-        assert forward_relay_source.device == dispatch_source.device
+        forward_state_destination = next(
+            node
+            for node in state_transfers
+            if node.node_kind == "RECV_COMM"
+            and node.tag["PASS"] == "F"
+            and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
+        )
+        assert combine_destination.device != dispatch_source.device
+        assert forward_state_source.device == dispatch_source.device
+        assert forward_state_destination.device == combine_destination.device
 
         backward_dispatch_source = next(
             node
@@ -1305,12 +1386,12 @@ def test_pp4_relay_returns_combine_to_state_owner_before_next_dense_group() -> N
             and node.node_meta["role"] == "source"
             and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
         )
-        backward_relay_destination = next(
+        backward_state_destination = next(
             node
-            for node in relays
+            for node in state_transfers
             if node.node_kind == "RECV_COMM"
             and node.tag["PASS"] == "B"
             and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
         )
-        assert backward_relay_destination.device == dispatch_source.device
-        assert backward_dispatch_source.device == dispatch_source.device
+        assert backward_state_destination.device == dispatch_source.device
+        assert backward_dispatch_source.device == combine_destination.device

@@ -1618,37 +1618,27 @@ def _validate_route_owned_parameters(
 def _validate_cross_group_routed_interface(
     state_owner: TrainingDAGNode,
     routed_node: TrainingDAGNode,
-) -> None:
-    """Validate the retained-buffer ABI used only by disjoint M/N routes."""
+    combine_consumer: TrainingDAGNode,
+) -> dict[str, Any]:
+    """Validate and describe the dense state that bypasses a disjoint route."""
     boundary = state_owner.node_meta.get("a2a_boundary_after")
     combine_boundary = routed_node.node_meta.get("a2a_boundary_after")
     assert isinstance(boundary, dict)
     assert isinstance(combine_boundary, dict)
     routing_counts_idx = boundary.get("routing_counts_idx")
-    state_owner_output_arity = len(state_owner.node_meta.get("output_names", ()))
+    state_owner_output_arity = len(
+        state_owner.node_meta.get("output_names", ())
+    )
     routed_input_names = _routed_activation_input_names(routed_node)
     routed_output_names = routed_node.node_meta.get("output_names", ())
     routed_input_arity = len(routed_input_names)
     routed_output_arity = len(routed_output_names)
-    if (
-        state_owner_output_arity != routed_input_arity
-        or routed_input_arity != routed_output_arity + 1
-    ):
+    if routed_input_arity != 2 or routed_output_arity != 1:
         raise ValueError(
             f"routed boundary {state_owner.uid}->{routed_node.uid} requires "
-            "the dense state-owner output arity to equal the routed region "
-            "input arity, with the final counts slot dropped from routed "
-            "outputs; got "
-            f"state_owner_output_arity={state_owner_output_arity}, "
-            f"routed_input_arity={routed_input_arity}, "
-            f"routed_output_arity={routed_output_arity}"
-        )
-    if routing_counts_idx != state_owner_output_arity - 1:
-        raise ValueError(
-            f"routed boundary {state_owner.uid}->{routed_node.uid} requires "
-            "dispatch counts in the final dense state-owner output slot, "
-            f"got routing_counts_idx={routing_counts_idx!r}, "
-            f"final_index={state_owner_output_arity - 1}"
+            "the routed region ABI to contain exactly dispatch payload/count "
+            "inputs and one combine-payload output; got "
+            f"inputs={routed_input_names}, outputs={routed_output_names}"
         )
     payload_idx = boundary.get("tensor_idx")
     combine_idx = combine_boundary.get("tensor_idx")
@@ -1656,51 +1646,114 @@ def _validate_cross_group_routed_interface(
         isinstance(payload_idx, bool)
         or not isinstance(payload_idx, int)
         or payload_idx < 0
-        or payload_idx >= routed_output_arity
-        or combine_idx != payload_idx
+        or payload_idx >= state_owner_output_arity
+        or isinstance(routing_counts_idx, bool)
+        or not isinstance(routing_counts_idx, int)
+        or routing_counts_idx < 0
+        or routing_counts_idx >= state_owner_output_arity
+        or payload_idx == routing_counts_idx
+        or combine_idx != 0
     ):
         raise ValueError(
             f"routed boundary {state_owner.uid}->{routed_node.uid} requires "
-            "dispatch and combine payloads at the same valid prefix slot, "
+            "valid distinct dispatch payload/count slots and one combine "
+            "payload output, "
             f"got dispatch_idx={payload_idx!r}, combine_idx={combine_idx!r}, "
-            f"routed_output_arity={routed_output_arity}"
+            f"routing_counts_idx={routing_counts_idx!r}, "
+            f"state_owner_output_arity={state_owner_output_arity}"
         )
-    non_routed_indices = set(range(routed_output_arity)) - {payload_idx}
-    non_identity_indices = [
-        index
-        for index in sorted(non_routed_indices)
-        if routed_input_names[index] != routed_output_names[index]
-    ]
-    if non_identity_indices:
-        raise ValueError(
-            f"routed region {routed_node.uid} must identity-pass every "
-            "non-routed input through the same output prefix slot; "
-            f"mismatched_indices={non_identity_indices}"
-        )
-    routed_gm = routed_node.node_meta.get("gm")
-    if isinstance(routed_gm, fx.GraphModule):
-        placeholders = [
-            graph_node
-            for graph_node in routed_gm.graph.nodes
-            if graph_node.op == "placeholder"
-        ]
-        runtime_input_idxs = routed_node.node_meta.get("input_idxs")
-        if runtime_input_idxs is None:
-            runtime_input_idxs = list(range(len(routed_input_names)))
-        used_non_routed_indices = [
-            index
-            for index in sorted(non_routed_indices)
-            if any(
-                user.op != "output"
-                for user in placeholders[runtime_input_idxs[index]].users
-            )
-        ]
-        if used_non_routed_indices:
+    def _runtime_mapping(
+        source: TrainingDAGNode,
+        destination: TrainingDAGNode,
+    ) -> list[dict[str, Any]] | None:
+        mappings = source.node_meta.get("runtime_outputs_by_destination")
+        if not isinstance(mappings, dict):
+            return None
+        mapping = mappings.get(destination.uid)
+        if mapping is None:
+            return []
+        if not isinstance(mapping, list) or not all(
+            isinstance(item, dict) for item in mapping
+        ):
             raise ValueError(
-                f"routed region {routed_node.uid} may only compute from its "
-                "payload/count inputs; non-routed identity inputs are used "
-                f"by compute at indices={used_non_routed_indices}"
+                f"runtime value mapping {source.uid}->{destination.uid} must "
+                f"be a list of slot descriptors, got {mapping!r}"
             )
+        return mapping
+
+    dispatch_mapping = _runtime_mapping(state_owner, routed_node)
+    if dispatch_mapping is None:
+        owner_output_names = list(
+            state_owner.node_meta.get("output_names", ())
+        )
+        routed_input_slot_by_name = {
+            name: index for index, name in enumerate(routed_input_names)
+        }
+        dispatch_mapping = [
+            {
+                "value_id": str(owner_output_names[payload_idx]),
+                "source_output_idx": payload_idx,
+                "destination_input_idx": routed_input_slot_by_name.get(
+                    owner_output_names[payload_idx], payload_idx
+                ),
+                "is_tensor": True,
+            },
+            {
+                "value_id": str(owner_output_names[routing_counts_idx]),
+                "source_output_idx": routing_counts_idx,
+                "destination_input_idx": routed_input_slot_by_name.get(
+                    owner_output_names[routing_counts_idx], routing_counts_idx
+                ),
+                "is_tensor": True,
+            },
+        ]
+    dispatch_by_source_slot = {
+        item.get("source_output_idx"): item for item in dispatch_mapping
+    }
+    if (
+        len(dispatch_mapping) != 2
+        or set(dispatch_by_source_slot) != {payload_idx, routing_counts_idx}
+        or {item.get("destination_input_idx") for item in dispatch_mapping}
+        != {0, 1}
+        or any(item.get("is_tensor") is not True for item in dispatch_mapping)
+    ):
+        raise ValueError(
+            f"routed boundary {state_owner.uid}->{routed_node.uid} must map "
+            "only its marked payload/count tensors into the two routed "
+            f"inputs, got mapping={dispatch_mapping!r}"
+        )
+
+    combine_mapping = _runtime_mapping(routed_node, combine_consumer)
+    if combine_mapping is not None and (
+        len(combine_mapping) != 1
+        or combine_mapping[0].get("source_output_idx") != combine_idx
+        or combine_mapping[0].get("is_tensor") is not True
+    ):
+        raise ValueError(
+            f"routed boundary {routed_node.uid}->{combine_consumer.uid} must "
+            "map only its marked combine tensor, got "
+            f"mapping={combine_mapping!r}"
+        )
+
+    bypass_mapping = _runtime_mapping(state_owner, combine_consumer) or []
+    if any(
+        item.get("is_tensor") is not True
+        or item.get("source_output_idx") in {payload_idx, routing_counts_idx}
+        or not isinstance(item.get("destination_input_idx"), int)
+        for item in bypass_mapping
+    ):
+        raise ValueError(
+            f"direct dense-state path {state_owner.uid}->{combine_consumer.uid} "
+            "supports only tensor-valued FX bypasses distinct from the routed "
+            f"payload/count slots, got mapping={bypass_mapping!r}"
+        )
+    if len(
+        {item["destination_input_idx"] for item in bypass_mapping}
+    ) != len(bypass_mapping):
+        raise ValueError(
+            f"direct dense-state path {state_owner.uid}->{combine_consumer.uid} "
+            "has duplicate destination input slots"
+        )
     state_owner_diff_indices = state_owner.node_meta.get(
         "differentiable_output_indices"
     )
@@ -1710,13 +1763,14 @@ def _validate_cross_group_routed_interface(
     if (
         not isinstance(state_owner_diff_indices, list)
         or not isinstance(routed_diff_indices, list)
-        or state_owner_diff_indices != routed_diff_indices
         or payload_idx not in state_owner_diff_indices
+        or combine_idx not in routed_diff_indices
+        or routing_counts_idx in state_owner_diff_indices
     ):
         raise ValueError(
             f"routed boundary {state_owner.uid}->{routed_node.uid} requires "
-            "dense state-owner differentiable output indices to align with "
-            "the routed region backward payload and include the routed slot, "
+            "differentiable dispatch/combine payloads and non-differentiable "
+            "route counts, "
             f"got state_owner_indices={state_owner_diff_indices!r}, "
             f"routed_indices={routed_diff_indices!r}, "
             f"payload_idx={payload_idx}"
@@ -1755,6 +1809,47 @@ def _validate_cross_group_routed_interface(
                 f"combine={combine_dtype}"
             )
 
+    spec = {
+        "arity": len(bypass_mapping),
+        "model_tensor_indices": [
+            int(item["source_output_idx"]) for item in bypass_mapping
+        ],
+        "destination_input_indices": [
+            int(item["destination_input_idx"]) for item in bypass_mapping
+        ],
+        "differentiable_model_indices": [
+            int(item["source_output_idx"])
+            for item in bypass_mapping
+            if bool((item.get("schema") or {}).get("requires_grad"))
+        ],
+        "model_value_names": [
+            str(item["value_id"]) for item in bypass_mapping
+        ],
+        "model_value_schemas": [
+            item.get("schema") for item in bypass_mapping
+        ],
+        "dispatch_payload_idx": int(payload_idx),
+        "routing_counts_idx": int(routing_counts_idx),
+        "combine_payload_idx": int(combine_idx),
+        "routed_dispatch_input_idx": int(
+            dispatch_by_source_slot[payload_idx]["destination_input_idx"]
+        ),
+        "routed_counts_input_idx": int(
+            dispatch_by_source_slot[routing_counts_idx][
+                "destination_input_idx"
+            ]
+        ),
+        "combine_destination_input_idx": (
+            int(combine_mapping[0]["destination_input_idx"])
+            if combine_mapping
+            else int(combine_idx)
+        ),
+        "routing_counts_schema": boundary.get("routing_counts_schema"),
+        "carries_routing_layout": True,
+    }
+    routed_node.node_meta["dense_state_spec"] = spec
+    return spec
+
 
 def _validate_placed_routed_regions(
     dag: TrainingDAG,
@@ -1771,7 +1866,7 @@ def _validate_placed_routed_regions(
     The two boundaries must either both stay within one ActorGroup or both
     cross out of the sharded ActorGroup.  A cross-group combine may target a
     later dense ActorGroup, but the original dense state owner and that target
-    must have equal widths so the retained buffer can be relayed lane-wise.
+    must have equal widths so bypass state can be transferred lane-wise.
 
     ActorGroup identity is compared as an unordered device set. Route
     ownership maps equal contiguous ranges of the global route axis to the
@@ -1920,14 +2015,25 @@ def _validate_placed_routed_regions(
             or boundary.get("routing_counts_idx") is not None
         )
         if is_dispatch:
-            outgoing = _activation_compute_edges(node.uid, incoming=False)
-            if len(outgoing) != 1:
+            routed_outgoing = [
+                edge
+                for edge in _activation_compute_edges(
+                    node.uid, incoming=False
+                )
+                if edge.dst_uid in sharded_fwd_uids
+            ]
+            if not routed_outgoing:
+                raise ValueError(
+                    f"routed dispatch boundary on {node.uid} is missing a "
+                    "shard directive on its routed forward region"
+                )
+            if len(routed_outgoing) != 1:
                 raise ValueError(
                     f"routed dispatch boundary on {node.uid} must feed exactly "
-                    "one adjacent forward region; got "
-                    f"outgoing={[edge.dst_uid for edge in outgoing]}"
+                    "one shard-matched forward region; got "
+                    f"outgoing={[edge.dst_uid for edge in routed_outgoing]}"
                 )
-            marker_routed_fwd_uids.add(outgoing[0].dst_uid)
+            marker_routed_fwd_uids.add(routed_outgoing[0].dst_uid)
         if boundary.get("routed_boundary") == "combine":
             explicit_combine_fwd_uids.add(node.uid)
 
@@ -2060,7 +2166,9 @@ def _validate_placed_routed_regions(
                 "both routed boundaries must use the same communication mode"
             )
         if dispatch_crosses_group:
-            _validate_cross_group_routed_interface(dispatch_owner, fwd_node)
+            _validate_cross_group_routed_interface(
+                dispatch_owner, fwd_node, combine_consumer
+            )
         if dispatch_crosses_group and consumer_devices != owner_devices:
             dense_overlap = set(owner_devices) & set(consumer_devices)
             if dense_overlap:
@@ -2073,7 +2181,7 @@ def _validate_placed_routed_regions(
             if len(owner_devices) != len(consumer_devices):
                 raise ValueError(
                     f"routed region {fwd_uid} requires equal-width dense "
-                    "ActorGroups for its state relay; got "
+                    "ActorGroups for direct state transfer; got "
                     f"owner={list(owner_devices)} (width={len(owner_devices)}), "
                     f"consumer={list(consumer_devices)} "
                     f"(width={len(consumer_devices)})"
@@ -2087,8 +2195,8 @@ def _validate_placed_routed_regions(
                 and owner_tensor_indices != list(range(len(owner_output_names)))
             ):
                 raise ValueError(
-                    f"routed region {fwd_uid} relays its retained dense buffer "
-                    "between ActorGroups, so every relayed output must be a "
+                    f"routed region {fwd_uid} transfers bypass state "
+                    "between ActorGroups, so every transferred output must be a "
                     f"tensor; output_arity={len(owner_output_names)}, "
                     f"tensor_indices={owner_tensor_indices}"
                 )
@@ -2177,10 +2285,13 @@ def _insert_cross_group_routed_comm_nodes(
                 f"got node_devices={node.device}"
             )
 
-    # The source dense group owns both the passthrough activation buffer and
-    # the dispatch permutation/splits that an eventual combine must reverse.
-    # Record that owner per sharded forward node before replacing any edges.
+    # Record the complete dense -> routed -> dense lifecycle before replacing
+    # any edges.  Model values that bypass the routed compute, together with
+    # Piper's private dispatch layout, follow the direct dense-to-dense path.
     state_owner_by_expert_fwd_uid: dict[str, TrainingDAGNode] = {}
+    combine_consumer_by_expert_fwd_uid: dict[str, TrainingDAGNode] = {}
+    dense_state_spec_by_expert_fwd_uid: dict[str, dict[str, Any]] = {}
+    forward_dense_recv_by_expert_fwd_uid: dict[str, str] = {}
     for uid in matched_uids:
         node = dag.nodes[uid]
         if node.compute_subkind != "FWD":
@@ -2203,6 +2314,18 @@ def _insert_cross_group_routed_comm_nodes(
             )
         if owners:
             state_owner = owners[0]
+            consumers = [
+                dag.nodes[edge.dst_uid]
+                for edge in dag.outgoing_edges(uid, dep_kind="data")
+                if dag.nodes[edge.dst_uid].node_kind == "COMPUTE"
+                and dag.nodes[edge.dst_uid].compute_subkind == "FWD"
+            ]
+            if len(consumers) != 1:
+                raise ValueError(
+                    f"Sharded node {uid} requires exactly one dense combine "
+                    f"consumer, got {[consumer.uid for consumer in consumers]}"
+                )
+            combine_consumer = consumers[0]
             if (
                 state_owner.device is not None
                 and node.device is not None
@@ -2216,12 +2339,15 @@ def _insert_cross_group_routed_comm_nodes(
             # Schedule-level lowering normally ran this before any edges were
             # replaced. Keep the same pure check here for direct/internal
             # callers as a defense in depth.
-            _validate_cross_group_routed_interface(state_owner, node)
+            dense_state_spec = _validate_cross_group_routed_interface(
+                state_owner, node, combine_consumer
+            )
             state_owner_by_expert_fwd_uid[uid] = state_owner
+            combine_consumer_by_expert_fwd_uid[uid] = combine_consumer
+            dense_state_spec_by_expert_fwd_uid[uid] = dense_state_spec
 
     edges_to_replace: list[TrainingDAGEdge] = []
     replaced_keys: set[tuple[str, str, str, str | None]] = set()
-    incoming_state_source_uid_by_sharded_uid: dict[str, str] = {}
 
     def _add_paired_comm_nodes(
         *,
@@ -2268,83 +2394,43 @@ def _insert_cross_group_routed_comm_nodes(
         )
         return source_uid, destination_uid
 
-    def _add_dense_state_relay(
+    def _add_dense_state_transfer(
         *,
         source_devices: list[int],
         destination_devices: list[int],
         source_tag: dict[str, Any],
         destination_tag: dict[str, Any],
         expert_fwd_uid: str,
-        state_owner: TrainingDAGNode,
         expert_fwd_node: TrainingDAGNode,
+        state_owner: TrainingDAGNode,
+        combine_consumer: TrainingDAGNode,
+        dense_state_spec: dict[str, Any],
         direction: str,
-        edge: TrainingDAGEdge,
-        bucket_key: Any,
-        source_bucket_key: Any,
-        destination_bucket_key: Any,
     ) -> tuple[str, str]:
         if len(source_devices) != len(destination_devices):
             raise ValueError(
-                "dense routed-state relay currently requires equal replicated "
+                "direct dense-state transfer requires equal replicated "
                 f"degrees, got source={source_devices} and "
                 f"destination={destination_devices}"
             )
         if set(source_devices) & set(destination_devices):
             raise ValueError(
-                "dense routed-state relay requires disjoint actor groups, got "
+                "direct dense-state transfer requires disjoint actor groups, got "
                 f"source={source_devices}, destination={destination_devices}"
             )
         participants = sorted((*source_devices, *destination_devices))
-        payload_arity = len(expert_fwd_node.node_meta.get("output_names", ()))
-        forward_tensor_indices = expert_fwd_node.node_meta.get(
-            "tensor_output_indices"
-        )
-        backward_tensor_indices = expert_fwd_node.node_meta.get(
-            "differentiable_output_indices"
-        )
-        if (
-            not isinstance(forward_tensor_indices, list)
-            or any(
-                isinstance(index, bool) or not isinstance(index, int)
-                for index in forward_tensor_indices
-            )
-            or sorted(set(forward_tensor_indices)) != forward_tensor_indices
-            or any(index < 0 or index >= payload_arity for index in forward_tensor_indices)
-            or len(forward_tensor_indices) != payload_arity
-        ):
-            raise ValueError(
-                f"dense relay for {expert_fwd_uid} cannot prove all "
-                f"payload_arity={payload_arity} forward slots are tensors: "
-                f"tensor_output_indices={forward_tensor_indices!r}"
-            )
-        if (
-            not isinstance(backward_tensor_indices, list)
-            or any(
-                isinstance(index, bool) or not isinstance(index, int)
-                for index in backward_tensor_indices
-            )
-            or sorted(set(backward_tensor_indices)) != backward_tensor_indices
-            or any(
-                index < 0 or index >= payload_arity
-                for index in backward_tensor_indices
-            )
-            or not set(backward_tensor_indices).issubset(forward_tensor_indices)
-        ):
-            raise ValueError(
-                f"dense relay for {expert_fwd_uid} has invalid differentiable "
-                f"output indices={backward_tensor_indices!r} for "
-                f"payload_arity={payload_arity}"
-            )
-        relay_comm_id = (
-            f"dense_relay:{direction}:{edge.src_uid}->{edge.dst_uid}:"
-            f"{edge.tensor_name or '-'}:{expert_fwd_uid}"
+        comm_id = (
+            f"dense_state:{direction}:{state_owner.uid}->"
+            f"{combine_consumer.uid}:{expert_fwd_uid}"
         )
         source_key = tuple(source_devices)
         destination_key = tuple(destination_devices)
         source_pp_rank = device_to_pp_rank[source_key]
         destination_pp_rank = device_to_pp_rank[destination_key]
         comm_group_kind = (
-            "pp_lo_hi" if source_pp_rank < destination_pp_rank else "pp_hi_lo"
+            "dense_state_lo_hi"
+            if source_pp_rank < destination_pp_rank
+            else "dense_state_hi_lo"
         )
         rank_pairs = [
             [source_rank, destination_rank]
@@ -2352,8 +2438,8 @@ def _insert_cross_group_routed_comm_nodes(
                 source_devices, destination_devices
             )
         ]
-        relay_meta = {
-            "dense_relay": True,
+        transfer_meta = {
+            "dense_state_transfer": True,
             "direction": direction,
             "source_devices": list(source_devices),
             "destination_devices": list(destination_devices),
@@ -2361,22 +2447,78 @@ def _insert_cross_group_routed_comm_nodes(
             "destination_degree": len(destination_devices),
             "participants": participants,
             "expert_fwd_uid": expert_fwd_uid,
-            "payload_arity": payload_arity,
-            "forward_tensor_indices": list(forward_tensor_indices),
-            "backward_tensor_indices": list(backward_tensor_indices),
-            "bucket_key": bucket_key,
+            "dispatch_devices": list(source_devices)
+            if direction == "forward"
+            else list(destination_devices),
+            "routed_devices": sorted(
+                int(device) for device in (expert_fwd_node.device or ())
+            ),
+            "combine_devices": list(destination_devices)
+            if direction == "forward"
+            else list(source_devices),
+            "dense_state_arity": int(dense_state_spec["arity"]),
+            "model_tensor_indices": list(
+                dense_state_spec["model_tensor_indices"]
+            ),
+            "destination_input_indices": list(
+                dense_state_spec["destination_input_indices"]
+            ),
+            "differentiable_model_indices": list(
+                dense_state_spec["differentiable_model_indices"]
+            ),
+            "model_value_names": list(dense_state_spec["model_value_names"]),
+            "model_value_schemas": list(
+                dense_state_spec["model_value_schemas"]
+            ),
+            "dispatch_payload_idx": int(
+                dense_state_spec["dispatch_payload_idx"]
+            ),
+            "dispatch_output_arity": len(
+                state_owner.node_meta.get("output_names", ())
+            ),
+            "routing_counts_idx": int(dense_state_spec["routing_counts_idx"]),
+            "combine_payload_idx": int(
+                dense_state_spec["combine_payload_idx"]
+            ),
+            "routed_dispatch_input_idx": int(
+                dense_state_spec["routed_dispatch_input_idx"]
+            ),
+            "routed_counts_input_idx": int(
+                dense_state_spec["routed_counts_input_idx"]
+            ),
+            "combine_destination_input_idx": int(
+                dense_state_spec["combine_destination_input_idx"]
+            ),
+            "routing_counts_schema": dense_state_spec[
+                "routing_counts_schema"
+            ],
+            "payload_schema": (
+                expert_fwd_node.node_meta.get("a2a_boundary_after") or {}
+            ).get("payload_schema"),
+            "carries_routing_layout": True,
+            "bucket_key": state_owner.node_meta.get("bucket_key"),
             "state_owner_bucket_key": state_owner.node_meta.get("bucket_key"),
-            "source_bucket_key": source_bucket_key,
-            "destination_bucket_key": destination_bucket_key,
-            "shape_reference_fwd_uid": state_owner.uid,
-            "shape_reference_bucket_key": state_owner.node_meta.get("bucket_key"),
-            "comm_id": relay_comm_id,
+            "combine_consumer_bucket_key": combine_consumer.node_meta.get(
+                "bucket_key"
+            ),
+            "state_owner_fwd_uid": state_owner.uid,
+            "combine_consumer_fwd_uid": combine_consumer.uid,
+            "comm_id": comm_id,
             "comm_group_kind": comm_group_kind,
-            "relay_mode": "ordinal_one_to_one",
+            "transfer_mode": "ordinal_one_to_one",
             "rank_pairs": rank_pairs,
-            "from_uid": edge.src_uid,
-            "to_uid": edge.dst_uid,
+            "from_uid": (
+                state_owner.uid
+                if direction == "forward"
+                else combine_consumer.uid
+            ),
+            "to_uid": (
+                combine_consumer.uid
+                if direction == "forward"
+                else state_owner.uid
+            ),
         }
+        transfer_meta.update(_route_ownership_meta(expert_fwd_node))
         send_uid = _reserve_comm_uid(
             dag,
             node_kind="SEND_COMM",
@@ -2387,7 +2529,11 @@ def _insert_cross_group_routed_comm_nodes(
             node_kind="RECV_COMM",
             prefix="recv",
         )
-        stream = comm_stream if comm_stream is not None else "pp_stream"
+        # The dense-to-dense envelope is independent of both routed collectives
+        # and ordinary pipeline traffic.  Its own logical stream and process-
+        # group channel prevent either traffic class from serializing this
+        # direct path before the matching receive is posted.
+        stream = "dense_state_stream"
         dag.add_node(
             TrainingDAGNode(
                 uid=send_uid,
@@ -2397,7 +2543,7 @@ def _insert_cross_group_routed_comm_nodes(
                 device=list(source_devices),
                 stream=stream,
                 node_meta={
-                    **relay_meta,
+                    **transfer_meta,
                     "role": "source",
                     "peer_pp_rank": destination_pp_rank,
                     "peer_devices": list(destination_devices),
@@ -2413,7 +2559,7 @@ def _insert_cross_group_routed_comm_nodes(
                 device=list(destination_devices),
                 stream=stream,
                 node_meta={
-                    **relay_meta,
+                    **transfer_meta,
                     "role": "destination",
                     "peer_pp_rank": source_pp_rank,
                     "peer_devices": list(source_devices),
@@ -2421,6 +2567,122 @@ def _insert_cross_group_routed_comm_nodes(
             )
         )
         return send_uid, recv_uid
+
+    def _backward_for(forward_node: TrainingDAGNode) -> TrainingDAGNode:
+        matches = [
+            candidate
+            for candidate in dag.nodes.values()
+            if candidate.node_kind == "COMPUTE"
+            and _is_backward_activation_subkind(candidate.compute_subkind)
+            and candidate.node_meta.get("fwd_uid") == forward_node.uid
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"forward node {forward_node.uid} requires exactly one backward "
+                f"activation node, got {[node.uid for node in matches]}"
+            )
+        return matches[0]
+
+    for expert_fwd_uid, state_owner in state_owner_by_expert_fwd_uid.items():
+        combine_consumer = combine_consumer_by_expert_fwd_uid[expert_fwd_uid]
+        dense_state_spec = dense_state_spec_by_expert_fwd_uid[expert_fwd_uid]
+        assert state_owner.device is not None
+        assert combine_consumer.device is not None
+        owner_devices = sorted(int(device) for device in state_owner.device)
+        consumer_devices = sorted(
+            int(device) for device in combine_consumer.device
+        )
+        expert_fwd_node = dag.nodes[expert_fwd_uid]
+        expert_fwd_node.node_meta["dense_state_spec"] = dense_state_spec
+        if owner_devices == consumer_devices:
+            expert_fwd_node.node_meta["dense_state_mode"] = "local"
+            continue
+
+        expert_fwd_node.node_meta["dense_state_mode"] = "direct"
+        forward_state_edges = [
+            edge
+            for edge in dag.outgoing_edges(state_owner.uid, dep_kind="data")
+            if edge.dst_uid == combine_consumer.uid
+        ]
+        if len(forward_state_edges) > 1:
+            raise ValueError(
+                f"dense state {state_owner.uid}->{combine_consumer.uid} must "
+                "be represented by at most one structured data edge"
+            )
+        edges_to_replace.extend(forward_state_edges)
+        forward_send_uid, forward_recv_uid = _add_dense_state_transfer(
+            source_devices=owner_devices,
+            destination_devices=consumer_devices,
+            source_tag=state_owner.tag,
+            destination_tag=combine_consumer.tag,
+            expert_fwd_uid=expert_fwd_uid,
+            expert_fwd_node=expert_fwd_node,
+            state_owner=state_owner,
+            combine_consumer=combine_consumer,
+            dense_state_spec=dense_state_spec,
+            direction="forward",
+        )
+        forward_dense_recv_by_expert_fwd_uid[expert_fwd_uid] = (
+            forward_recv_uid
+        )
+        dag.add_edge(
+            TrainingDAGEdge(
+                src_uid=state_owner.uid,
+                dst_uid=forward_send_uid,
+                dep_kind="data",
+                tensor_name="dense_state",
+            )
+        )
+        dag.add_edge(
+            TrainingDAGEdge(
+                src_uid=forward_recv_uid,
+                dst_uid=combine_consumer.uid,
+                dep_kind="data",
+                tensor_name="dense_state",
+            )
+        )
+
+        owner_bwd = _backward_for(state_owner)
+        consumer_bwd = _backward_for(combine_consumer)
+        backward_state_edges = [
+            edge
+            for edge in dag.outgoing_edges(consumer_bwd.uid, dep_kind="data")
+            if edge.dst_uid == owner_bwd.uid
+        ]
+        if len(backward_state_edges) > 1:
+            raise ValueError(
+                f"dense-state gradient {consumer_bwd.uid}->{owner_bwd.uid} "
+                "must be represented by at most one structured data edge"
+            )
+        edges_to_replace.extend(backward_state_edges)
+        backward_send_uid, backward_recv_uid = _add_dense_state_transfer(
+            source_devices=consumer_devices,
+            destination_devices=owner_devices,
+            source_tag=consumer_bwd.tag,
+            destination_tag=owner_bwd.tag,
+            expert_fwd_uid=expert_fwd_uid,
+            expert_fwd_node=expert_fwd_node,
+            state_owner=state_owner,
+            combine_consumer=combine_consumer,
+            dense_state_spec=dense_state_spec,
+            direction="backward",
+        )
+        dag.add_edge(
+            TrainingDAGEdge(
+                src_uid=consumer_bwd.uid,
+                dst_uid=backward_send_uid,
+                dep_kind="data",
+                tensor_name="dense_state_grad",
+            )
+        )
+        dag.add_edge(
+            TrainingDAGEdge(
+                src_uid=backward_recv_uid,
+                dst_uid=owner_bwd.uid,
+                dep_kind="data",
+                tensor_name="dense_state_grad",
+            )
+        )
 
     for uid in matched_uids:
         if uid not in dag.nodes:
@@ -2493,47 +2755,14 @@ def _insert_cross_group_routed_comm_nodes(
                     f"routed edge {src_node.uid}->{dst_node.uid} references "
                     f"missing expert forward node {expert_fwd_uid}"
                 )
-            state_owner = state_owner_by_expert_fwd_uid.get(expert_fwd_uid)
-            if state_owner is None:
+            if expert_fwd_uid not in state_owner_by_expert_fwd_uid:
                 raise ValueError(
                     f"routed edge {src_node.uid}->{dst_node.uid} cannot resolve "
                     f"the dense state owner for {expert_fwd_uid}"
                 )
-            if state_owner.device is None:
-                raise ValueError(
-                    f"routed state owner {state_owner.uid} is unplaced"
-                )
-            state_owner_devices = sorted(int(d) for d in state_owner.device)
 
-            relay_direction: str | None = None
-            effective_src_devices = src_devices
-            effective_dst_devices = dst_devices
             source_tag = dict(src_node.tag)
             destination_tag = dict(dst_node.tag)
-            if (
-                expert_node.compute_subkind == "FWD"
-                and direction == "outgoing"
-                and dst_devices != state_owner_devices
-            ):
-                # Combine back to the group that owns the dispatch layout and
-                # passthrough buffer, then relay the patched dense buffer to the
-                # next dense pipeline group.
-                relay_direction = "forward"
-                effective_dst_devices = state_owner_devices
-                destination_tag = dict(state_owner.tag)
-            elif (
-                _is_backward_activation_subkind(expert_node.compute_subkind)
-                and direction == "incoming"
-                and src_devices != state_owner_devices
-            ):
-                # Reverse the forward relay before applying the gradient of the
-                # forward combine on the original state-owning dense group.
-                relay_direction = "backward"
-                effective_src_devices = state_owner_devices
-                source_tag = {
-                    **state_owner.tag,
-                    "PASS": expert_node.tag.get("PASS"),
-                }
 
             node_kind = (
                 "M_TO_N_COMM" if direction == "incoming" else "N_TO_M_COMM"
@@ -2543,13 +2772,13 @@ def _insert_cross_group_routed_comm_nodes(
                 f"{prefix}:{src_node.uid}->{dst_node.uid}:"
                 f"{edge.tensor_name or '-'}:{tensor_idx}"
             )
-            participants = sorted((*effective_src_devices, *effective_dst_devices))
+            participants = sorted((*src_devices, *dst_devices))
             common_meta: dict[str, Any] = {
                 "direction": direction,
-                "source_devices": effective_src_devices,
-                "destination_devices": effective_dst_devices,
-                "source_degree": len(effective_src_devices),
-                "destination_degree": len(effective_dst_devices),
+                "source_devices": src_devices,
+                "destination_devices": dst_devices,
+                "source_degree": len(src_devices),
+                "destination_degree": len(dst_devices),
                 "participants": participants,
                 "expert_fwd_uid": expert_fwd_uid,
                 "expert_input_arity": len(
@@ -2567,6 +2796,60 @@ def _insert_cross_group_routed_comm_nodes(
                 "comm_group_kind": "routed_cross_group",
             }
             common_meta.update(_route_ownership_meta(expert_fwd_node))
+            state_owner = state_owner_by_expert_fwd_uid[expert_fwd_uid]
+            combine_consumer = combine_consumer_by_expert_fwd_uid[
+                expert_fwd_uid
+            ]
+            dense_state_spec = dense_state_spec_by_expert_fwd_uid[
+                expert_fwd_uid
+            ]
+            common_meta.update(
+                {
+                    "dispatch_devices": sorted(
+                        int(device) for device in (state_owner.device or ())
+                    ),
+                    "routed_devices": sorted(
+                        int(device)
+                        for device in (expert_fwd_node.device or ())
+                    ),
+                    "combine_devices": sorted(
+                        int(device)
+                        for device in (combine_consumer.device or ())
+                    ),
+                    "dispatch_payload_idx": dense_state_spec[
+                        "dispatch_payload_idx"
+                    ],
+                    "dispatch_output_arity": len(
+                        state_owner.node_meta.get("output_names", ())
+                    ),
+                    "routing_counts_idx": dense_state_spec[
+                        "routing_counts_idx"
+                    ],
+                    "routing_counts_schema": dense_state_spec[
+                        "routing_counts_schema"
+                    ],
+                    "combine_payload_idx": dense_state_spec[
+                        "combine_payload_idx"
+                    ],
+                    "routed_dispatch_input_idx": dense_state_spec[
+                        "routed_dispatch_input_idx"
+                    ],
+                    "routed_counts_input_idx": dense_state_spec[
+                        "routed_counts_input_idx"
+                    ],
+                    "combine_destination_input_idx": dense_state_spec[
+                        "combine_destination_input_idx"
+                    ],
+                    "payload_schema": (
+                        expert_fwd_node.node_meta.get("a2a_boundary_after")
+                        or {}
+                    ).get("payload_schema"),
+                    "source_bucket_key": src_node.node_meta.get("bucket_key"),
+                    "destination_bucket_key": dst_node.node_meta.get(
+                        "bucket_key"
+                    ),
+                }
+            )
             if direction == "incoming" and expert_node.compute_subkind == "FWD":
                 routing_counts_idx = boundary_info.get("routing_counts_idx")
                 if routing_counts_idx is None:
@@ -2579,134 +2862,43 @@ def _insert_cross_group_routed_comm_nodes(
             source_uid, destination_uid = _add_paired_comm_nodes(
                 node_kind=node_kind,
                 prefix=prefix,
-                source_devices=effective_src_devices,
-                destination_devices=effective_dst_devices,
+                source_devices=src_devices,
+                destination_devices=dst_devices,
                 source_tag=source_tag,
                 destination_tag=destination_tag,
                 common_meta=common_meta,
             )
-            if direction == "incoming":
-                incoming_state_source_uid_by_sharded_uid[uid] = source_uid
-            else:
-                incoming_source_uid = incoming_state_source_uid_by_sharded_uid.get(uid)
-                if incoming_source_uid is None:
-                    raise ValueError(
-                        f"routed outgoing edge {src_node.uid}->{dst_node.uid} "
-                        "was lowered before its matching incoming state boundary"
-                    )
-                # Both endpoints run on the original dense state owner. This
-                # expresses the real dispatch-state lifetime, connects the
-                # communication-only relay fragment to its actor DAG, and
-                # fixes dispatch order without inventing a cross-group edge.
-                if dag.nodes[incoming_source_uid].device != dag.nodes[destination_uid].device:
-                    raise ValueError(
-                        f"routed state endpoints for {expert_fwd_uid} disagree on "
-                        f"owner devices: incoming={dag.nodes[incoming_source_uid].device}, "
-                        f"outgoing={dag.nodes[destination_uid].device}"
-                    )
+            if (
+                direction == "outgoing"
+                and expert_node.compute_subkind == "FWD"
+                and expert_fwd_uid in forward_dense_recv_by_expert_fwd_uid
+            ):
                 dag.add_edge(
                     TrainingDAGEdge(
-                        src_uid=incoming_source_uid,
+                        src_uid=forward_dense_recv_by_expert_fwd_uid[
+                            expert_fwd_uid
+                        ],
                         dst_uid=destination_uid,
-                        dep_kind="temporal",
-                        tensor_name=None,
-                    )
-                )
-            if relay_direction == "forward":
-                relay_source_uid, relay_destination_uid = _add_dense_state_relay(
-                    source_devices=state_owner_devices,
-                    destination_devices=dst_devices,
-                    source_tag=state_owner.tag,
-                    destination_tag=dst_node.tag,
-                    expert_fwd_uid=expert_fwd_uid,
-                    state_owner=state_owner,
-                    expert_fwd_node=expert_fwd_node,
-                    direction="forward",
-                    edge=edge,
-                    bucket_key=common_meta["bucket_key"],
-                    source_bucket_key=state_owner.node_meta.get("bucket_key"),
-                    destination_bucket_key=dst_node.node_meta.get("bucket_key"),
-                )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=src_node.uid,
-                        dst_uid=source_uid,
                         dep_kind="data",
-                        tensor_name=edge.tensor_name,
+                        tensor_name="routing_layout",
                     )
                 )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=destination_uid,
-                        dst_uid=relay_source_uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=src_node.uid,
+                    dst_uid=source_uid,
+                    dep_kind="data",
+                    tensor_name=edge.tensor_name,
                 )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=relay_destination_uid,
-                        dst_uid=dst_node.uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
+            )
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=destination_uid,
+                    dst_uid=dst_node.uid,
+                    dep_kind="data",
+                    tensor_name=edge.tensor_name,
                 )
-            elif relay_direction == "backward":
-                relay_source_uid, relay_destination_uid = _add_dense_state_relay(
-                    source_devices=src_devices,
-                    destination_devices=state_owner_devices,
-                    source_tag=src_node.tag,
-                    destination_tag=source_tag,
-                    expert_fwd_uid=expert_fwd_uid,
-                    state_owner=state_owner,
-                    expert_fwd_node=expert_fwd_node,
-                    direction="backward",
-                    edge=edge,
-                    bucket_key=common_meta["bucket_key"],
-                    source_bucket_key=src_node.node_meta.get("bucket_key"),
-                    destination_bucket_key=state_owner.node_meta.get("bucket_key"),
-                )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=src_node.uid,
-                        dst_uid=relay_source_uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
-                )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=relay_destination_uid,
-                        dst_uid=source_uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
-                )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=destination_uid,
-                        dst_uid=dst_node.uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
-                )
-            else:
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=src_node.uid,
-                        dst_uid=source_uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
-                )
-                dag.add_edge(
-                    TrainingDAGEdge(
-                        src_uid=destination_uid,
-                        dst_uid=dst_node.uid,
-                        dep_kind="data",
-                        tensor_name=edge.tensor_name,
-                    )
-                )
+            )
             edges_to_replace.append(edge)
             replaced_keys.add(edge_key)
 
@@ -2777,6 +2969,31 @@ def _insert_shard_a2a_comm_nodes(
                 f"Expert backward node {compute_node.uid} is missing fwd_uid"
             )
         return fwd_uid
+
+    def _runtime_mapping_for_edge(
+        src_node: TrainingDAGNode,
+        dst_node: TrainingDAGNode,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if (
+            _is_backward_activation_subkind(src_node.compute_subkind)
+            and _is_backward_activation_subkind(dst_node.compute_subkind)
+        ):
+            producer = dag.nodes[dst_node.node_meta["fwd_uid"]]
+            consumer = dag.nodes[src_node.node_meta["fwd_uid"]]
+        else:
+            producer = src_node
+            consumer = dst_node
+        mappings = producer.node_meta.get(
+            "runtime_outputs_by_destination", {}
+        )
+        mapping = mappings.get(consumer.uid) if isinstance(mappings, dict) else None
+        if not isinstance(mapping, list) or not mapping:
+            raise ValueError(
+                f"A2A_COMM edge {src_node.uid}->{dst_node.uid} lacks an "
+                f"explicit runtime value mapping for {producer.uid}->"
+                f"{consumer.uid}"
+            )
+        return list(mapping), len(producer.node_meta.get("output_names", ()))
 
     # Routed A2A is the expert-parallel contract. The forward incoming edge
     # supplies token counts; the outgoing and backward nodes reuse the
@@ -2896,6 +3113,9 @@ def _insert_shard_a2a_comm_nodes(
         for e in incoming:
             src_node = dag.nodes[e.src_uid]
             binfo = _a2a_boundary_for_edge(src_node, node)
+            runtime_mapping, producer_output_arity = _runtime_mapping_for_edge(
+                src_node, node
+            )
             a2a_tensor_idx = binfo["tensor_idx"]
             expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = _reserve_comm_uid(
@@ -2912,6 +3132,8 @@ def _insert_shard_a2a_comm_nodes(
                 "comm_id": f"a2a:{e.src_uid}->{uid}:{a2a_tensor_idx}",
                 "comm_group_kind": "ep",
                 "participants": sorted(int(rank) for rank in node.device),
+                "runtime_value_mapping": runtime_mapping,
+                "producer_output_arity": producer_output_arity,
             }
             comm_meta.update(_route_ownership_meta(dag.nodes[expert_fwd_uid]))
             if node.compute_subkind == "FWD":
@@ -2934,6 +3156,9 @@ def _insert_shard_a2a_comm_nodes(
         for e in outgoing:
             dst_node = dag.nodes[e.dst_uid]
             binfo = _a2a_boundary_for_edge(node, dst_node)
+            runtime_mapping, producer_output_arity = _runtime_mapping_for_edge(
+                node, dst_node
+            )
             a2a_tensor_idx = binfo["tensor_idx"]
             expert_fwd_uid = _expert_fwd_uid(node)
             comm_uid = _reserve_comm_uid(
@@ -2957,6 +3182,8 @@ def _insert_shard_a2a_comm_nodes(
                     "comm_id": f"a2a:{uid}->{e.dst_uid}:{a2a_tensor_idx}",
                     "comm_group_kind": "ep",
                     "participants": sorted(int(rank) for rank in node.device),
+                    "runtime_value_mapping": runtime_mapping,
+                    "producer_output_arity": producer_output_arity,
                     **_route_ownership_meta(dag.nodes[expert_fwd_uid]),
                 },
             )
@@ -3065,6 +3292,8 @@ def _apply_split_directive(
         "from_uid",
         "to_uid",
         "shape_reference_fwd_uid",
+        "state_owner_fwd_uid",
+        "combine_consumer_fwd_uid",
     )
     for mb in range(1, num_microbatches):
         for uid in topo:
@@ -3077,6 +3306,21 @@ def _apply_split_directive(
                 v = copied_meta.get(k)
                 if isinstance(v, str) and v in matched:
                     copied_meta[k] = copy_uid[(v, mb)]
+            for mapping_field in (
+                "runtime_inputs_by_source",
+                "runtime_outputs_by_destination",
+                "runtime_output_grads_by_source",
+            ):
+                runtime_mapping = copied_meta.get(mapping_field)
+                if isinstance(runtime_mapping, dict):
+                    copied_meta[mapping_field] = {
+                        (
+                            copy_uid[(peer_uid, mb)]
+                            if peer_uid in matched
+                            else peer_uid
+                        ): list(value_mapping)
+                        for peer_uid, value_mapping in runtime_mapping.items()
+                    }
             if (
                 (
                     n.node_kind in {
@@ -3085,7 +3329,7 @@ def _apply_split_directive(
                     }
                     or (
                         n.node_kind in {"SEND_COMM", "RECV_COMM"}
-                        and bool(copied_meta.get("dense_relay"))
+                        and bool(copied_meta.get("dense_state_transfer"))
                     )
                 )
                 and isinstance(copied_meta.get("comm_id"), str)
@@ -3365,14 +3609,16 @@ def _apply_order_directive(
                 dag.nodes[uid].node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}
                 or (
                     dag.nodes[uid].node_kind in {"SEND_COMM", "RECV_COMM"}
-                    and bool(dag.nodes[uid].node_meta.get("dense_relay"))
+                    and bool(
+                        dag.nodes[uid].node_meta.get("dense_state_transfer")
+                    )
                 )
                 for uid in matched
             )
             # Cross-group routed regions include their local communication
             # endpoints in the ordered boundary. This keeps both actors on a
             # collective channel in the same order and connects any dense
-            # relay fragment through ordinary order edges. Other schedules
+            # direct dense-state path through ordinary order edges. Other schedules
             # retain the existing compute-boundary ordering semantics.
             group_sources.append(srcs if has_cross_group_boundary else _csrcs)
             group_sinks.append(snks if has_cross_group_boundary else _csnks)

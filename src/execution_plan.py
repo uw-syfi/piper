@@ -24,7 +24,12 @@ _RELAXABLE_DIRECTIONAL_COMM_REASONS = {
     "same_stream_temporal",
     "cross_stream_temporal",
 }
-_P2P_DIRECTIONS = {"pp_lo_hi", "pp_hi_lo"}
+_P2P_DIRECTIONS = {
+    "pp_lo_hi",
+    "pp_hi_lo",
+    "dense_state_lo_hi",
+    "dense_state_hi_lo",
+}
 _ROUTED_DIRECTION_BY_KIND = {
     "M_TO_N_COMM": "m_to_n",
     "N_TO_M_COMM": "n_to_m",

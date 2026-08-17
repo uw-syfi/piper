@@ -15,6 +15,9 @@ retain the best-effort simulated-arrival-skew subtraction.
 P2P SEND/RECV endpoints retain distinct completion vertices.  Both arrivals
 gate their shared rendezvous, but send-side successors wait only for send
 completion and receive-side consumers wait only for receive completion.
+Nonblocking dense-state sends complete locally when they are posted while
+their arrivals continue to gate the peer's rendezvous; the retained work is
+drained separately by the runtime.
 Ordering-only dependencies between opposite directional P2P streams remain
 relaxable because schedule lowering can materialize logical ``pp_stream`` FIFO
 as explicit edges; data dependencies are always preserved.
@@ -691,6 +694,14 @@ def _p2p_group(record: _InstanceRecord) -> str:
     return "pp_lo_hi" if source_pp < destination_pp else "pp_hi_lo"
 
 
+def _is_nonblocking_p2p_send(record: _InstanceRecord) -> bool:
+    """Whether local successors wait for posting rather than peer arrival."""
+    return (
+        record.node.node_kind == "SEND_COMM"
+        and bool(record.node.node_meta.get("dense_state_transfer"))
+    )
+
+
 def _representative(vertex: _Vertex, preferred_rank: int | None = None) -> NodeInstance:
     members = sorted((member.key for member in vertex.members))
     if preferred_rank is not None:
@@ -1052,37 +1063,50 @@ def simulate_training_step(
                 communication_id=communication_id,
                 emit_timeline=False,
             )
-            vertices[completion_id] = _Vertex(
-                vertex_id=completion_id,
-                members=[member],
-                # Calibrated profiles provide a fixed tail derived from the
-                # observed rendezvous. Legacy profiles resolve the tail from
-                # the measured interval minus graph-predicted peer wait.
-                duration_us=0.0,
-                communication_id=communication_id,
-                endpoint_arrival_vertex_id=arrival_id,
-                endpoint_rendezvous_vertex_id=rendezvous_id,
-                endpoint_profile_interval_us=(
-                    None
-                    if observed_rendezvous_us is not None
-                    else member.profile_duration_us
-                ),
-                endpoint_observed_service_us=(
-                    None
-                    if observed_rendezvous_us is None
-                    else (
-                        member.observed_profile_start_offset_us
-                        + member.profile_duration_us
-                        - observed_rendezvous_us
-                    )
-                ),
-            )
-            if observed_rendezvous_us is None:
+            nonblocking_send = _is_nonblocking_p2p_send(member)
+            if nonblocking_send:
+                vertices[completion_id] = _Vertex(
+                    vertex_id=completion_id,
+                    members=[member],
+                    duration_us=member.profile_duration_us,
+                    communication_id=communication_id,
+                )
+            else:
+                vertices[completion_id] = _Vertex(
+                    vertex_id=completion_id,
+                    members=[member],
+                    # Calibrated profiles provide a fixed tail derived from the
+                    # observed rendezvous. Legacy profiles resolve the tail from
+                    # the measured interval minus graph-predicted peer wait.
+                    duration_us=0.0,
+                    communication_id=communication_id,
+                    endpoint_arrival_vertex_id=arrival_id,
+                    endpoint_rendezvous_vertex_id=rendezvous_id,
+                    endpoint_profile_interval_us=(
+                        None
+                        if observed_rendezvous_us is not None
+                        else member.profile_duration_us
+                    ),
+                    endpoint_observed_service_us=(
+                        None
+                        if observed_rendezvous_us is None
+                        else (
+                            member.observed_profile_start_offset_us
+                            + member.profile_duration_us
+                            - observed_rendezvous_us
+                        )
+                    ),
+                )
+            if observed_rendezvous_us is None and not nonblocking_send:
                 rendezvous_endpoint_intervals.append(
                     (arrival_id, member.profile_duration_us)
                 )
             _add_vertex_edge(vertices, arrival_id, rendezvous_id)
-            _add_vertex_edge(vertices, rendezvous_id, completion_id)
+            _add_vertex_edge(
+                vertices,
+                arrival_id if nonblocking_send else rendezvous_id,
+                completion_id,
+            )
             instance_start_vertex[member.key] = arrival_id
             instance_vertex[member.key] = completion_id
         rendezvous.rendezvous_endpoint_intervals = tuple(

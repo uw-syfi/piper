@@ -365,6 +365,67 @@ def test_p2p_send_and_recv_have_distinct_local_completions() -> None:
     assert result.step_time_us == pytest.approx(6.0)
 
 
+def test_nonblocking_dense_state_send_does_not_wait_for_peer_receive() -> None:
+    send = _node(
+        "send",
+        {0: 1.0},
+        stream="dense_state_stream",
+        kind="SEND_COMM",
+        meta={
+            "comm_id": "state-transfer",
+            "peer_pp_rank": 1,
+            "comm_group_kind": "dense_state_lo_hi",
+            "dense_state_transfer": True,
+        },
+    )
+    collective_0 = _node(
+        "collective",
+        {0: 2.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        meta={"comm_id": "routed", "participants": [0, 1]},
+    )
+    collective_1 = _node(
+        "collective",
+        {1: 2.0},
+        stream="ep_stream",
+        kind="M_TO_N_COMM",
+        meta={"comm_id": "routed", "participants": [0, 1]},
+    )
+    recv = _node(
+        "recv",
+        {1: 3.0},
+        stream="dense_state_stream",
+        kind="RECV_COMM",
+        meta={
+            "comm_id": "state-transfer",
+            "peer_pp_rank": 0,
+            "comm_group_kind": "dense_state_lo_hi",
+            "dense_state_transfer": True,
+        },
+    )
+
+    result = simulate_training_step(
+        [
+            _dag(
+                send,
+                collective_0,
+                edges=(("send", "collective", "temporal"),),
+            ),
+            _dag(
+                collective_1,
+                recv,
+                edges=(("collective", "recv", "temporal"),),
+            ),
+        ]
+    )
+
+    assert result.event(0, "send").end_us == pytest.approx(1.0)
+    assert result.event(0, "collective").start_us == pytest.approx(1.0)
+    assert result.event(1, "recv").start_us == pytest.approx(2.0)
+    assert result.step_time_us == pytest.approx(5.0)
+
+
 def test_p2p_profile_interval_subtracts_rendezvous_wait() -> None:
     send = _node(
         "send",

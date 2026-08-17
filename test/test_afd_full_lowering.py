@@ -18,7 +18,7 @@ from src.ordering import resolve_total_order_per_stream
 from src.piper import (
     _reset_annotation_state,
     _split_global_training_dag_by_pp_rank,
-    _validate_dense_relay_sequences,
+    _validate_dense_state_sequences,
     _validate_p2p_sequences,
     _validate_routed_collective_sequences,
 )
@@ -111,7 +111,7 @@ def _lower_afd_schedule(base_name: str, *, actor_groups: int) -> tuple[TrainingD
         resolve_total_order_per_stream(local_dag)
         _add_inter_chain_temporal_edges(local_dag, zero_chains)
     _validate_routed_collective_sequences(local_dags)
-    _validate_dense_relay_sequences(local_dags)
+    _validate_dense_state_sequences(local_dags)
     _validate_p2p_sequences(local_dags)
     return global_dag, local_dags
 
@@ -238,8 +238,69 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
         for node in global_dag.nodes.values()
         if node.node_kind in {"SEND_COMM", "RECV_COMM"}
     ]
-    assert all(node.node_meta.get("dense_relay") for node in p2p_nodes)
+    assert all(node.node_meta.get("dense_state_transfer") for node in p2p_nodes)
     assert len(p2p_nodes) == (0 if actor_groups == 2 else 32)
+    routed_fwd_nodes = [
+        node
+        for node in global_dag.nodes.values()
+        if node.node_kind == "COMPUTE"
+        and node.compute_subkind == "FWD"
+        and "FFN" in node.tag
+    ]
+    assert all(
+        node.node_meta.get("dense_state_spec", {}).get("arity", 0) > 0
+        for node in routed_fwd_nodes
+    )
+    if actor_groups == 2:
+        assert all(
+            node.node_meta.get("dense_state_mode") == "local"
+            for node in routed_fwd_nodes
+        )
+    else:
+        assert all(
+            node.node_meta.get("dense_state_mode") == "direct"
+            for node in routed_fwd_nodes
+        )
+        for expert_fwd_uid in {
+            node.node_meta["expert_fwd_uid"]
+            for node in routed
+            if node.node_kind == "M_TO_N_COMM"
+            and node.node_meta["role"] == "source"
+            and node.tag["PASS"] == "F"
+        }:
+            dispatch_source = next(
+                node
+                for node in routed
+                if node.node_kind == "M_TO_N_COMM"
+                and node.node_meta["role"] == "source"
+                and node.tag["PASS"] == "F"
+                and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
+            )
+            combine_destination = next(
+                node
+                for node in routed
+                if node.node_kind == "N_TO_M_COMM"
+                and node.node_meta["role"] == "destination"
+                and node.tag["PASS"] == "F"
+                and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
+            )
+            state_source = next(
+                node
+                for node in p2p_nodes
+                if node.node_kind == "SEND_COMM"
+                and node.tag["PASS"] == "F"
+                and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
+            )
+            state_destination = next(
+                node
+                for node in p2p_nodes
+                if node.node_kind == "RECV_COMM"
+                and node.tag["PASS"] == "F"
+                and node.node_meta["expert_fwd_uid"] == expert_fwd_uid
+            )
+            assert dispatch_source.device == state_source.device
+            assert combine_destination.device == state_destination.device
+            assert combine_destination.device != dispatch_source.device
 
     by_comm_id: dict[str, list] = {}
     for node in routed:

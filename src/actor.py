@@ -690,6 +690,29 @@ class PiperActor:
                 )
                 self.runtime.process_groups_by_participants[key] = process_group
 
+        # Force the directional P2P communicators to initialize in the same
+        # global order before schedule execution. A collective on the process
+        # group does not initialize NCCL's separate lazy P2P connection.
+        p2p_warmup = torch.zeros(1, dtype=torch.uint8, device=self.runtime.device)
+        for participants, channel in self.runtime.required_p2p_process_group_specs():
+            if self.runtime.global_rank not in participants:
+                continue
+            process_group = self.runtime.process_group_for_participants(
+                participants,
+                channel=channel,
+            )
+            low_rank, high_rank = participants
+            if channel in {"pp_lo_hi", "dense_state_lo_hi"}:
+                source_rank, destination_rank = low_rank, high_rank
+            elif channel in {"pp_hi_lo", "dense_state_hi_lo"}:
+                source_rank, destination_rank = high_rank, low_rank
+            else:
+                raise RuntimeError(f"unknown P2P channel {channel!r}")
+            if self.runtime.global_rank == source_rank:
+                dist.send(p2p_warmup, dst=destination_rank, group=process_group)
+            else:
+                dist.recv(p2p_warmup, src=source_rank, group=process_group)
+
         own_group = tuple(sorted(self.runtime.actor_group_devices))
         if own_group:
             self.runtime.actor_group_routed_group = (

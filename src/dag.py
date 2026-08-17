@@ -475,7 +475,10 @@ def build_training_dag(
     """Build a TrainingDAG where each node is one annotated GraphModule segment."""
     dag = TrainingDAG()
 
-    global_prev_uid: str | None = None
+    uid_by_segment_id: dict[int, str] = {}
+    segment_by_id = {
+        segment.segment_id: segment for segment in annotation_segments
+    }
 
     for segment in annotation_segments:
         uid = f"s{segment.stage_id}.seg{segment.segment_id}"
@@ -506,17 +509,78 @@ def build_training_dag(
                 "output_names": out_names,
                 "tensor_output_indices": tensor_output_indices,
                 "differentiable_output_indices": differentiable_output_indices,
+                "runtime_input_values": list(segment.runtime_input_values),
+                "runtime_output_values": list(segment.runtime_output_values),
+                "runtime_inputs_by_source": {},
+                "runtime_outputs_by_destination": {},
                 "a2a_boundary_after": segment.a2a_boundary_after,
                 "triton_kernels": triton_side_table["kernels"],
                 "triton_constant_args": triton_side_table["constant_args"],
             },
         )
         dag.add_node(node)
+        uid_by_segment_id[segment.segment_id] = uid
 
-        # Explicit activation-flow ordering in annotation segment order.
-        if global_prev_uid is not None:
-            dag.add_edge(TrainingDAGEdge(src_uid=global_prev_uid, dst_uid=uid, dep_kind="data"))
-        global_prev_uid = uid
+    # Build activation dependencies from actual FX value producers. Multiple
+    # values shared by the same producer/consumer pair form one structured DAG
+    # edge; a value that skips a segment therefore becomes a direct edge rather
+    # than an artificial identity slot in the intervening GraphModule ABI.
+    for segment in annotation_segments:
+        dst_uid = uid_by_segment_id[segment.segment_id]
+        values_by_source: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+        for input_slot, descriptor in enumerate(segment.runtime_input_values):
+            source_segment_id = descriptor.get("source_segment_id")
+            if source_segment_id is None:
+                continue
+            values_by_source.setdefault(int(source_segment_id), []).append(
+                (input_slot, descriptor)
+            )
+        for source_segment_id, input_values in values_by_source.items():
+            source_segment = segment_by_id[source_segment_id]
+            src_uid = uid_by_segment_id[source_segment_id]
+            output_slot_by_value = {
+                descriptor["value_id"]: output_slot
+                for output_slot, descriptor in enumerate(
+                    source_segment.runtime_output_values
+                )
+            }
+            mapping: list[dict[str, Any]] = []
+            for input_slot, descriptor in input_values:
+                value_id = descriptor["value_id"]
+                if value_id not in output_slot_by_value:
+                    raise ValueError(
+                        f"segment {source_segment_id} does not expose runtime "
+                        f"value {value_id!r} required by segment "
+                        f"{segment.segment_id}"
+                    )
+                mapping.append(
+                    {
+                        "value_id": value_id,
+                        "source_output_idx": output_slot_by_value[value_id],
+                        "destination_input_idx": input_slot,
+                        "destination_grapharg_idx": segment.input_idxs[
+                            input_slot
+                        ],
+                        "schema": descriptor.get("schema"),
+                        "is_tensor": descriptor.get("is_tensor"),
+                    }
+                )
+            dag.nodes[src_uid].node_meta["runtime_outputs_by_destination"][
+                dst_uid
+            ] = mapping
+            dag.nodes[dst_uid].node_meta["runtime_inputs_by_source"][src_uid] = (
+                mapping
+            )
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=src_uid,
+                    dst_uid=dst_uid,
+                    dep_kind="data",
+                    tensor_name="runtime_values:" + ",".join(
+                        item["value_id"] for item in mapping
+                    ),
+                )
+            )
 
     # Build backward-pass nodes and dependencies by reversing forward data edges.
     fwd_compute_uids = [
@@ -558,6 +622,13 @@ def build_training_dag(
     for e in fwd_edges:
         bwd_src = fwd_uid_to_bwd_uid[e.dst_uid]
         bwd_dst = fwd_uid_to_bwd_uid[e.src_uid]
+        value_mapping = dag.nodes[e.src_uid].node_meta.get(
+            "runtime_outputs_by_destination", {}
+        ).get(e.dst_uid)
+        if isinstance(value_mapping, list):
+            dag.nodes[bwd_dst].node_meta.setdefault(
+                "runtime_output_grads_by_source", {}
+            )[bwd_src] = list(value_mapping)
         dag.add_edge(
             TrainingDAGEdge(
                 src_uid=bwd_src,

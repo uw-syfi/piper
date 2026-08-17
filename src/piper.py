@@ -139,6 +139,11 @@ def mark_dispatch_payload(tensor: torch.Tensor) -> torch.Tensor:
     inside the routed region owns any expert-local regrouping or
     kernel-specific padding.
 
+    Tensor values produced before the routed region and consumed afterward may
+    bypass it in the FX graph. Piper records their actual producer/consumer
+    slots and carries them on a separate dense-to-dense path; they must not be
+    consumed or produced by the routed model region.
+
     The Piper user is responsible for packing each row into the semantically
     correct route block. Piper can validate the payload shape and total row
     count, but cannot infer a row's intended route from its tensor values.
@@ -176,7 +181,8 @@ def mark_combine_payload(tensor: torch.Tensor) -> torch.Tensor:
     routed region. Its dtype and trailing shape must match the dispatch
     payload. Piper reverses the transport from saved split metadata and cannot
     recover an ordering changed by model-side expert computation. This is the
-    only dynamic activation allowed to leave the routed region.
+    only dynamic activation produced by the routed region; tensor values that
+    bypass it retain their original FX producer/consumer identity instead.
 
     The Piper user is responsible for restoring the semantic identity of every
     row to the exact source-major, local-route order received by the region.
@@ -563,6 +569,16 @@ def _validate_routed_collective_sequences(
         "expert_fwd_uid",
         "expert_input_arity",
         "expert_output_arity",
+        "dispatch_devices",
+        "routed_devices",
+        "combine_devices",
+        "dispatch_payload_idx",
+        "dispatch_output_arity",
+        "combine_payload_idx",
+        "routed_dispatch_input_idx",
+        "routed_counts_input_idx",
+        "combine_destination_input_idx",
+        "payload_schema",
         "a2a_tensor_idx",
         "routing_counts_idx",
         "bucket_key",
@@ -700,8 +716,15 @@ def _validate_p2p_sequences(
             role = "source" if node.node_kind == "SEND_COMM" else "destination"
             source_rank = local_rank if role == "source" else peer_rank
             destination_rank = peer_rank if role == "source" else local_rank
+            group_prefix = (
+                "dense_state"
+                if bool(meta.get("dense_state_transfer"))
+                else "pp"
+            )
             expected_group_kind = (
-                "pp_lo_hi" if source_rank < destination_rank else "pp_hi_lo"
+                f"{group_prefix}_lo_hi"
+                if source_rank < destination_rank
+                else f"{group_prefix}_hi_lo"
             )
             group_kind = meta.get("comm_group_kind")
             if group_kind != expected_group_kind:
@@ -822,10 +845,10 @@ def _validate_p2p_sequences(
             )
 
 
-def _validate_dense_relay_sequences(
+def _validate_dense_state_sequences(
     actor_group_dags: Sequence[TrainingDAG],
 ) -> None:
-    """Validate paired dense-relay P2P endpoints and their call order."""
+    """Validate paired direct dense-state P2P endpoints and call order."""
 
     def dag_device_key(dag: TrainingDAG) -> tuple[int, ...]:
         keys = {
@@ -835,7 +858,7 @@ def _validate_dense_relay_sequences(
         }
         if len(keys) != 1:
             raise ValueError(
-                "dense relay validation requires one device set per actor "
+                "dense-state validation requires one device set per actor "
                 f"DAG, got {sorted(keys)}"
             )
         return next(iter(keys))
@@ -846,7 +869,7 @@ def _validate_dense_relay_sequences(
     }
     if len(device_to_pp_rank) != len(actor_devices):
         raise ValueError(
-            "dense relay validation requires distinct actor-group device sets"
+            "dense-state validation requires distinct actor-group device sets"
         )
 
     channel_sequences: dict[
@@ -875,7 +898,7 @@ def _validate_dense_relay_sequences(
             meta = node.node_meta
             if (
                 node.node_kind not in {"SEND_COMM", "RECV_COMM"}
-                or not bool(meta.get("dense_relay"))
+                or not bool(meta.get("dense_state_transfer"))
             ):
                 continue
 
@@ -885,7 +908,7 @@ def _validate_dense_relay_sequences(
             )
             if role != expected_role:
                 raise ValueError(
-                    f"dense relay node {uid} kind={node.node_kind} must have "
+                    f"dense-state node {uid} kind={node.node_kind} must have "
                     f"role={expected_role!r}, got {role!r}"
                 )
             try:
@@ -897,22 +920,22 @@ def _validate_dense_relay_sequences(
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
-                    f"dense relay node {uid} has invalid source/destination "
+                    f"dense-state node {uid} has invalid source/destination "
                     "device metadata"
                 ) from error
             if not source_devices or not destination_devices:
                 raise ValueError(
-                    f"dense relay node {uid} requires non-empty device sets"
+                    f"dense-state node {uid} requires non-empty device sets"
                 )
             if set(source_devices) & set(destination_devices):
                 raise ValueError(
-                    f"dense relay node {uid} requires disjoint actor groups, "
+                    f"dense-state node {uid} requires disjoint actor groups, "
                     f"got source={source_devices}, destination="
                     f"{destination_devices}"
                 )
             if len(source_devices) != len(destination_devices):
                 raise ValueError(
-                    f"dense relay node {uid} currently requires equal actor "
+                    f"dense-state node {uid} currently requires equal actor "
                     f"degrees, got {len(source_devices)} and "
                     f"{len(destination_devices)}"
                 )
@@ -921,7 +944,7 @@ def _validate_dense_relay_sequences(
             )
             if local_devices != expected_local:
                 raise ValueError(
-                    f"dense relay node {uid} role={role} is in actor DAG "
+                    f"dense-state node {uid} role={role} is in actor DAG "
                     f"devices={local_devices}, expected {expected_local}"
                 )
 
@@ -933,24 +956,24 @@ def _validate_dense_relay_sequences(
             )
             if participants != expected_participants:
                 raise ValueError(
-                    f"dense relay node {uid} has participants={participants}, "
+                    f"dense-state node {uid} has participants={participants}, "
                     f"expected {expected_participants}"
                 )
             if meta.get("source_degree") != len(source_devices):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid source_degree="
+                    f"dense-state node {uid} has invalid source_degree="
                     f"{meta.get('source_degree')!r}"
                 )
             if meta.get("destination_degree") != len(destination_devices):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid destination_degree="
+                    f"dense-state node {uid} has invalid destination_degree="
                     f"{meta.get('destination_degree')!r}"
                 )
 
             direction = meta.get("direction")
             if direction not in {"forward", "backward"}:
                 raise ValueError(
-                    f"dense relay node {uid} has invalid direction="
+                    f"dense-state node {uid} has invalid direction="
                     f"{direction!r}"
                 )
             node_pass = node.tag.get("PASS")
@@ -958,40 +981,143 @@ def _validate_dense_relay_sequences(
                 direction == "backward" and node_pass not in {"B", "BI"}
             ):
                 raise ValueError(
-                    f"dense relay node {uid} direction={direction!r} is "
+                    f"dense-state node {uid} direction={direction!r} is "
                     f"incompatible with PASS={node_pass!r}"
                 )
 
-            payload_arity = meta.get("payload_arity")
+            dense_state_arity = meta.get("dense_state_arity")
             if (
-                isinstance(payload_arity, bool)
-                or not isinstance(payload_arity, int)
-                or payload_arity <= 0
+                isinstance(dense_state_arity, bool)
+                or not isinstance(dense_state_arity, int)
+                or dense_state_arity < 0
             ):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid payload_arity="
-                    f"{payload_arity!r}"
+                    f"dense-state node {uid} has invalid dense_state_arity="
+                    f"{dense_state_arity!r}"
                 )
-            forward_indices = meta.get("forward_tensor_indices")
-            backward_indices = meta.get("backward_tensor_indices")
-            if forward_indices != list(range(payload_arity)):
-                raise ValueError(
-                    f"dense relay node {uid} must prove every forward payload "
-                    f"slot is a tensor, got indices={forward_indices!r} for "
-                    f"payload_arity={payload_arity}"
-                )
+            dispatch_payload_idx = meta.get("dispatch_payload_idx")
+            combine_payload_idx = meta.get("combine_payload_idx")
+            dispatch_output_arity = meta.get("dispatch_output_arity")
             if (
-                not isinstance(backward_indices, list)
+                isinstance(dispatch_payload_idx, bool)
+                or not isinstance(dispatch_payload_idx, int)
+                or dispatch_payload_idx < 0
+                or isinstance(combine_payload_idx, bool)
+                or not isinstance(combine_payload_idx, int)
+                or combine_payload_idx < 0
+                or isinstance(meta.get("routing_counts_idx"), bool)
+                or not isinstance(meta.get("routing_counts_idx"), int)
+                or meta["routing_counts_idx"] < 0
+                or meta["routing_counts_idx"] == dispatch_payload_idx
+                or isinstance(dispatch_output_arity, bool)
+                or not isinstance(dispatch_output_arity, int)
+                or dispatch_output_arity <= max(
+                    dispatch_payload_idx, meta["routing_counts_idx"]
+                )
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid dispatch/combine "
+                    f"indices={dispatch_payload_idx!r}/{combine_payload_idx!r} "
+                    f"and counts={meta.get('routing_counts_idx')!r}"
+                )
+            model_indices = meta.get("model_tensor_indices")
+            if (
+                not isinstance(model_indices, list)
+                or len(model_indices) != dense_state_arity
+                or any(
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                    for index in model_indices
+                )
+                or len(set(model_indices)) != len(model_indices)
+                or dispatch_payload_idx in model_indices
+                or meta["routing_counts_idx"] in model_indices
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid model tensor slots="
+                    f"{model_indices!r}"
+                )
+            destination_indices = meta.get("destination_input_indices")
+            if (
+                not isinstance(destination_indices, list)
+                or len(destination_indices) != dense_state_arity
+                or any(
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                    for index in destination_indices
+                )
+                or len(set(destination_indices)) != len(destination_indices)
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid destination input "
+                    f"slots={destination_indices!r}"
+                )
+            differentiable_indices = meta.get("differentiable_model_indices")
+            if (
+                not isinstance(differentiable_indices, list)
                 or any(
                     isinstance(index, bool) or not isinstance(index, int)
-                    for index in backward_indices
+                    for index in differentiable_indices
                 )
-                or sorted(set(backward_indices)) != backward_indices
-                or any(index < 0 or index >= payload_arity for index in backward_indices)
+                or sorted(set(differentiable_indices))
+                != differentiable_indices
+                or not set(differentiable_indices).issubset(model_indices)
             ):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid backward tensor "
-                    f"indices={backward_indices!r}"
+                    f"dense-state node {uid} has invalid differentiable model "
+                    f"indices={differentiable_indices!r}"
+                )
+            model_value_names = meta.get("model_value_names")
+            model_value_schemas = meta.get("model_value_schemas")
+            if (
+                not isinstance(model_value_names, list)
+                or len(model_value_names) != len(model_indices)
+                or not all(isinstance(name, str) for name in model_value_names)
+                or not isinstance(model_value_schemas, list)
+                or len(model_value_schemas) != len(model_indices)
+                or not all(
+                    isinstance(schema, dict) for schema in model_value_schemas
+                )
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid model value "
+                    f"descriptors names={model_value_names!r}, "
+                    f"schemas={model_value_schemas!r}"
+                )
+            for field in (
+                "routed_dispatch_input_idx",
+                "routed_counts_input_idx",
+                "combine_destination_input_idx",
+            ):
+                value = meta.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"dense-state node {uid} has invalid {field}={value!r}"
+                    )
+            if (
+                meta["routed_dispatch_input_idx"]
+                == meta["routed_counts_input_idx"]
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} maps dispatch payload and counts "
+                    "to the same routed input slot"
+                )
+            if meta.get("carries_routing_layout") is not True:
+                raise ValueError(
+                    f"dense-state node {uid} must carry Piper's private "
+                    "routing layout"
+                )
+            routing_counts_schema = meta.get("routing_counts_schema")
+            if (
+                not isinstance(routing_counts_schema, dict)
+                or not isinstance(routing_counts_schema.get("dtype"), str)
+                or routing_counts_schema.get("shape") is None
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid routing-count schema="
+                    f"{routing_counts_schema!r}"
                 )
 
             rank_pairs = meta.get("rank_pairs")
@@ -1001,11 +1127,11 @@ def _validate_dense_relay_sequences(
                     source_devices, destination_devices
                 )
             ]
-            if meta.get("relay_mode") != "ordinal_one_to_one" or (
+            if meta.get("transfer_mode") != "ordinal_one_to_one" or (
                 rank_pairs != expected_rank_pairs
             ):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid ordinal rank mapping="
+                    f"dense-state node {uid} has invalid ordinal rank mapping="
                     f"{rank_pairs!r}, expected {expected_rank_pairs!r}"
                 )
 
@@ -1013,16 +1139,16 @@ def _validate_dense_relay_sequences(
             destination_pp_rank = device_to_pp_rank.get(destination_devices)
             if source_pp_rank is None or destination_pp_rank is None:
                 raise ValueError(
-                    f"dense relay node {uid} references an unknown actor group"
+                    f"dense-state node {uid} references an unknown actor group"
                 )
             expected_group_kind = (
-                "pp_lo_hi"
+                "dense_state_lo_hi"
                 if source_pp_rank < destination_pp_rank
-                else "pp_hi_lo"
+                else "dense_state_hi_lo"
             )
             if meta.get("comm_group_kind") != expected_group_kind:
                 raise ValueError(
-                    f"dense relay node {uid} has comm_group_kind="
+                    f"dense-state node {uid} has comm_group_kind="
                     f"{meta.get('comm_group_kind')!r}, expected "
                     f"{expected_group_kind!r}"
                 )
@@ -1034,13 +1160,13 @@ def _validate_dense_relay_sequences(
             )
             if meta.get("peer_pp_rank") != expected_peer_pp_rank:
                 raise ValueError(
-                    f"dense relay node {uid} has peer_pp_rank="
+                    f"dense-state node {uid} has peer_pp_rank="
                     f"{meta.get('peer_pp_rank')!r}, expected "
                     f"{expected_peer_pp_rank}"
                 )
             if tuple(meta.get("peer_devices", ())) != expected_peer_devices:
                 raise ValueError(
-                    f"dense relay node {uid} has peer_devices="
+                    f"dense-state node {uid} has peer_devices="
                     f"{meta.get('peer_devices')!r}, expected "
                     f"{expected_peer_devices}"
                 )
@@ -1048,44 +1174,45 @@ def _validate_dense_relay_sequences(
             for field in (
                 "bucket_key",
                 "state_owner_bucket_key",
-                "source_bucket_key",
-                "destination_bucket_key",
-                "shape_reference_bucket_key",
+                "combine_consumer_bucket_key",
             ):
                 if meta.get(field) is None:
                     raise ValueError(
-                        f"dense relay node {uid} is missing {field}"
+                        f"dense-state node {uid} is missing {field}"
                     )
-            shape_reference_fwd_uid = meta.get("shape_reference_fwd_uid")
-            if not isinstance(shape_reference_fwd_uid, str):
+            state_owner_fwd_uid = meta.get("state_owner_fwd_uid")
+            combine_consumer_fwd_uid = meta.get("combine_consumer_fwd_uid")
+            if not isinstance(state_owner_fwd_uid, str) or not isinstance(
+                combine_consumer_fwd_uid, str
+            ):
                 raise ValueError(
-                    f"dense relay node {uid} has invalid "
-                    f"shape_reference_fwd_uid={shape_reference_fwd_uid!r}"
+                    f"dense-state node {uid} has invalid lifecycle endpoints "
+                    f"{state_owner_fwd_uid!r}->{combine_consumer_fwd_uid!r}"
                 )
-            if node.node_kind == "RECV_COMM" and direction == "backward":
-                shape_node = dag.nodes.get(shape_reference_fwd_uid)
-                if (
-                    shape_node is None
-                    or shape_node.node_kind != "COMPUTE"
-                    or shape_node.compute_subkind != "FWD"
-                ):
-                    raise ValueError(
-                        f"backward dense relay RECV {uid} requires local FWD "
-                        f"shape reference {shape_reference_fwd_uid!r}"
-                    )
-                if (
-                    shape_node.node_meta.get("bucket_key")
-                    != meta.get("shape_reference_bucket_key")
-                ):
-                    raise ValueError(
-                        f"backward dense relay RECV {uid} shape reference "
-                        "bucket does not match its local FWD node"
-                    )
+            expected_from_uid = (
+                state_owner_fwd_uid
+                if direction == "forward"
+                else combine_consumer_fwd_uid
+            )
+            expected_to_uid = (
+                combine_consumer_fwd_uid
+                if direction == "forward"
+                else state_owner_fwd_uid
+            )
+            if (
+                meta.get("from_uid") != expected_from_uid
+                or meta.get("to_uid") != expected_to_uid
+            ):
+                raise ValueError(
+                    f"dense-state node {uid} has invalid logical endpoints "
+                    f"{meta.get('from_uid')!r}->{meta.get('to_uid')!r}; "
+                    f"expected {expected_from_uid!r}->{expected_to_uid!r}"
+                )
 
             comm_id = meta.get("comm_id")
             if not isinstance(comm_id, str) or not comm_id:
                 raise ValueError(
-                    f"dense relay node {uid} has invalid comm_id={comm_id!r}"
+                    f"dense-state node {uid} has invalid comm_id={comm_id!r}"
                 )
             channel = (source_devices, destination_devices, direction)
             transactions.setdefault(comm_id, []).append(
@@ -1099,7 +1226,7 @@ def _validate_dense_relay_sequences(
                 if previous_role != role:
                     raise ValueError(
                         f"actor DAG devices={local_devices} appears as both "
-                        f"roles on dense relay channel {channel}"
+                        f"roles on dense-state channel {channel}"
                     )
                 sequence.append(comm_id)
 
@@ -1108,7 +1235,7 @@ def _validate_dense_relay_sequences(
             if role in roles:
                 previous_devices, _previous_sequence = roles[role]
                 raise ValueError(
-                    f"dense relay channel {channel} has multiple {role} actor "
+                    f"dense-state channel {channel} has multiple {role} actor "
                     f"DAGs: {previous_devices} and {local_devices}"
                 )
             roles[role] = (local_devices, sequence)
@@ -1121,22 +1248,37 @@ def _validate_dense_relay_sequences(
         "destination_degree",
         "participants",
         "expert_fwd_uid",
-        "payload_arity",
-        "forward_tensor_indices",
-        "backward_tensor_indices",
+        "dispatch_devices",
+        "routed_devices",
+        "combine_devices",
+        "dense_state_arity",
+        "dispatch_output_arity",
+        "model_tensor_indices",
+        "destination_input_indices",
+        "differentiable_model_indices",
+        "model_value_names",
+        "model_value_schemas",
+        "dispatch_payload_idx",
+        "routing_counts_idx",
+        "combine_payload_idx",
+        "routed_dispatch_input_idx",
+        "routed_counts_input_idx",
+        "combine_destination_input_idx",
+        "routing_counts_schema",
+        "payload_schema",
+        "carries_routing_layout",
         "bucket_key",
         "state_owner_bucket_key",
-        "source_bucket_key",
-        "destination_bucket_key",
-        "shape_reference_fwd_uid",
-        "shape_reference_bucket_key",
+        "combine_consumer_bucket_key",
+        "state_owner_fwd_uid",
+        "combine_consumer_fwd_uid",
         "comm_group_kind",
-        "relay_mode",
+        "transfer_mode",
         "rank_pairs",
         "from_uid",
         "to_uid",
     )
-    relay_lifecycles: dict[
+    dense_state_lifecycles: dict[
         tuple[str, object],
         dict[str, TrainingDAGNode],
     ] = {}
@@ -1146,7 +1288,7 @@ def _validate_dense_relay_sequences(
             "destination",
         }:
             raise ValueError(
-                f"dense relay transaction {comm_id!r} requires exactly one "
+                f"dense-state transaction {comm_id!r} requires exactly one "
                 "SEND source and RECV destination endpoint"
             )
         source = next(endpoint for endpoint in endpoints if endpoint[1] == "source")
@@ -1155,7 +1297,7 @@ def _validate_dense_relay_sequences(
         )
         if source[0] != destination[0]:
             raise ValueError(
-                f"dense relay transaction {comm_id!r} endpoints disagree on "
+                f"dense-state transaction {comm_id!r} endpoints disagree on "
                 f"channel: source={source[0]}, destination={destination[0]}"
             )
         source_node = source[3]
@@ -1163,36 +1305,36 @@ def _validate_dense_relay_sequences(
         for field in shared_meta_fields:
             if source_node.node_meta.get(field) != destination_node.node_meta.get(field):
                 raise ValueError(
-                    f"dense relay transaction {comm_id!r} endpoints disagree "
+                    f"dense-state transaction {comm_id!r} endpoints disagree "
                     f"on {field}: source={source_node.node_meta.get(field)!r}, "
                     f"destination={destination_node.node_meta.get(field)!r}"
                 )
         for tag_name in ("PASS", "MB"):
             if source_node.tag.get(tag_name) != destination_node.tag.get(tag_name):
                 raise ValueError(
-                    f"dense relay transaction {comm_id!r} endpoints disagree "
+                    f"dense-state transaction {comm_id!r} endpoints disagree "
                     f"on {tag_name}"
                 )
         expert_fwd_uid = source_node.node_meta.get("expert_fwd_uid")
         if not isinstance(expert_fwd_uid, str) or not expert_fwd_uid:
             raise ValueError(
-                f"dense relay transaction {comm_id!r} has invalid "
+                f"dense-state transaction {comm_id!r} has invalid "
                 f"expert_fwd_uid={expert_fwd_uid!r}"
             )
         direction = source_node.node_meta["direction"]
         lifecycle_key = (expert_fwd_uid, source_node.tag.get("MB"))
-        directions = relay_lifecycles.setdefault(lifecycle_key, {})
+        directions = dense_state_lifecycles.setdefault(lifecycle_key, {})
         if direction in directions:
             raise ValueError(
-                f"dense relay lifecycle {lifecycle_key} has multiple "
+                f"dense-state lifecycle {lifecycle_key} has multiple "
                 f"{direction} transactions"
             )
         directions[direction] = source_node
 
-    for lifecycle_key, directions in relay_lifecycles.items():
+    for lifecycle_key, directions in dense_state_lifecycles.items():
         if set(directions) != {"forward", "backward"}:
             raise ValueError(
-                f"dense relay lifecycle {lifecycle_key} requires paired "
+                f"dense-state lifecycle {lifecycle_key} requires paired "
                 f"forward/backward transactions, got {sorted(directions)}"
             )
         forward = directions["forward"].node_meta
@@ -1202,27 +1344,44 @@ def _validate_dense_relay_sequences(
             or forward.get("destination_devices") != backward.get("source_devices")
         ):
             raise ValueError(
-                f"dense relay lifecycle {lifecycle_key} backward transaction "
+                f"dense-state lifecycle {lifecycle_key} backward transaction "
                 "must reverse the forward actor-group pair"
             )
         for field in (
-            "payload_arity",
-            "forward_tensor_indices",
-            "backward_tensor_indices",
+            "dense_state_arity",
+            "model_tensor_indices",
+            "destination_input_indices",
+            "differentiable_model_indices",
+            "model_value_names",
+            "model_value_schemas",
+            "dispatch_payload_idx",
+            "routing_counts_idx",
+            "combine_payload_idx",
+            "routed_dispatch_input_idx",
+            "routed_counts_input_idx",
+            "combine_destination_input_idx",
+            "routing_counts_schema",
+            "payload_schema",
+            "dispatch_output_arity",
+            "dispatch_devices",
+            "routed_devices",
+            "combine_devices",
+            "carries_routing_layout",
             "state_owner_bucket_key",
-            "shape_reference_fwd_uid",
-            "shape_reference_bucket_key",
+            "combine_consumer_bucket_key",
+            "state_owner_fwd_uid",
+            "combine_consumer_fwd_uid",
         ):
             if forward.get(field) != backward.get(field):
                 raise ValueError(
-                    f"dense relay lifecycle {lifecycle_key} forward/backward "
+                    f"dense-state lifecycle {lifecycle_key} forward/backward "
                     f"transactions disagree on {field}"
                 )
 
     for channel, roles in channel_sequences.items():
         if set(roles) != {"source", "destination"}:
             raise ValueError(
-                f"dense relay channel {channel} requires source and destination "
+                f"dense-state channel {channel} requires source and destination "
                 f"actor DAGs, got roles={sorted(roles)}"
             )
         source_devices, source_sequence = roles["source"]
@@ -1239,7 +1398,7 @@ def _validate_dense_relay_sequences(
                 min(len(source_sequence), len(destination_sequence)),
             )
             raise ValueError(
-                "dense relay call-sequence mismatch on shared channel "
+                "dense-state call-sequence mismatch on shared channel "
                 f"{channel}: source actor {source_devices} sequence="
                 f"{source_sequence}, destination actor {destination_devices} "
                 f"sequence={destination_sequence}; first mismatch at index "
@@ -1288,7 +1447,7 @@ def piper(gm, example_inputs, **kwargs):
             print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
             # render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
     _validate_routed_collective_sequences(per_pp_training_dags)
-    _validate_dense_relay_sequences(per_pp_training_dags)
+    _validate_dense_state_sequences(per_pp_training_dags)
     _validate_p2p_sequences(per_pp_training_dags)
     piper_metadata.per_pp_training_dags = per_pp_training_dags
 

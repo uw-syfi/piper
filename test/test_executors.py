@@ -600,22 +600,42 @@ def test_a2a_dispatch_rejects_invalid_routed_layout(
 
 def _routed_state(**overrides):
     values = {
-        "source_devices": (0, 2),
-        "destination_devices": (1,),
+        "dispatch_devices": (0, 2),
+        "routed_devices": (1,),
+        "combine_devices": (0, 2),
         "shard_devices": (1,),
         "num_global_routes": 4,
         "route_partitions": ((0, 4),),
-        "participants": (0, 1, 2),
+        "dispatch_participants": (0, 1, 2),
+        "combine_participants": (0, 1, 2),
         "layout_group": "layout",
-        "m_to_n_group": "m-to-n",
-        "n_to_m_group": "n-to-m",
-        "input_splits": [0, 4, 0],
-        "output_splits": [0, 0, 0],
+        "dispatch_m_to_n_group": "dispatch-m-to-n",
+        "dispatch_n_to_m_group": "dispatch-n-to-m",
+        "combine_m_to_n_group": "combine-m-to-n",
+        "combine_n_to_m_group": "combine-n-to-m",
+        "dispatch_input_splits": [0, 4, 0],
+        "routed_dispatch_output_splits": [0, 0, 0],
+        "routed_combine_input_splits": [0, 0, 0],
+        "combine_output_splits": [0, 4, 0],
+        "combine_counts": torch.tensor([[1, 1, 1, 1]]),
         "payload_shape": (4, 3),
         "payload_dtype": torch.float32,
+        "routing_counts_dtype": torch.int64,
     }
     values.update(overrides)
     return executors._RoutedCrossGroupState(**values)
+
+
+def _routed_node_meta(**overrides):
+    values = {
+        "expert_fwd_uid": "expert",
+        "dispatch_devices": [0, 2],
+        "routed_devices": [1],
+        "combine_devices": [0, 2],
+        **_route_meta([1], 4),
+    }
+    values.update(overrides)
+    return values
 
 
 def test_dense_n_to_m_destination_needs_splits_but_not_expert_permutation(
@@ -637,12 +657,11 @@ def test_dense_n_to_m_destination_needs_splits_but_not_expert_permutation(
     node = SimpleNamespace(
         uid="combine-destination",
         task_type=TaskType.FWD_N_TO_M,
-        node_meta={
-            "direction": "outgoing",
-            "role": "destination",
-            "expert_fwd_uid": "expert",
-            "a2a_tensor_idx": 3,
-        },
+        node_meta=_routed_node_meta(
+            direction="outgoing",
+            role="destination",
+            a2a_tensor_idx=3,
+        ),
     )
     received = torch.randn(4, 3)
     calls = []
@@ -658,24 +677,29 @@ def test_dense_n_to_m_destination_needs_splits_but_not_expert_permutation(
 
     assert result is received
     assert calls[0][0].shape == (0, 3)
-    assert calls[0][1:] == ([0, 4, 0], [0, 0, 0], "n-to-m")
+    assert calls[0][1:] == (
+        [0, 4, 0],
+        [0, 0, 0],
+        "combine-n-to-m",
+    )
 
 
 def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None:
     state = _routed_state(
-        source_devices=(0, 2),
-        destination_devices=(1, 3),
+        dispatch_devices=(0, 2),
+        routed_devices=(1, 3),
+        combine_devices=(4, 6),
         shard_devices=(1, 3),
         num_global_routes=4,
         route_partitions=((0, 2), (2, 4)),
-        participants=(0, 1, 2, 3),
-        input_splits=[0, 3, 0, 7],
-        output_splits=[5, 0, 6, 0],
+        dispatch_participants=(0, 1, 2, 3),
+        combine_participants=(1, 3, 4, 6),
+        routed_counts=torch.tensor([[2, 3], [4, 1]]),
         payload_shape=(11, 2),
         payload_dtype=torch.float32,
     )
     executor = DagExecutor(
-        runtime=SimpleNamespace(device="cpu", global_rank=2),
+        runtime=SimpleNamespace(device="cpu", global_rank=1),
         stages=None,
         buffers=None,
         events=None,
@@ -688,15 +712,18 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
     node = SimpleNamespace(
         uid="combine-source",
         task_type=TaskType.FWD_N_TO_M,
-        node_meta={
-            "direction": "outgoing",
-            "role": "source",
-            "expert_fwd_uid": "expert",
-            "a2a_tensor_idx": 0,
-        },
+        node_meta=_routed_node_meta(
+            direction="outgoing",
+            role="source",
+            a2a_tensor_idx=0,
+            dispatch_devices=[0, 2],
+            routed_devices=[1, 3],
+            combine_devices=[4, 6],
+            **_route_meta([1, 3], 4),
+        ),
     )
-    source_major = torch.cat((torch.zeros(5, 2), torch.full((6, 2), 2.0)))
-    communicator_output = torch.cat((torch.ones(3, 2), torch.full((7, 2), 3.0)))
+    source_major = torch.cat((torch.zeros(5, 2), torch.full((5, 2), 2.0)))
+    communicator_output = source_major.new_empty((0, 2))
     calls = []
 
     def fake_a2a(tensor, output_splits, input_splits, group):
@@ -710,38 +737,32 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
 
     assert result is None
     assert torch.equal(calls[0][0], source_major)
-    assert calls[0][1:] == ([0, 3, 0, 7], [5, 0, 6, 0], "n-to-m")
-
-    destination_node = SimpleNamespace(
-        uid="combine-destination",
-        task_type=TaskType.FWD_N_TO_M,
-        node_meta={
-            "direction": "outgoing",
-            "role": "destination",
-            "expert_fwd_uid": "expert",
-            "a2a_tensor_idx": 0,
-        },
+    assert calls[0][1:] == (
+        [0, 0, 0, 0],
+        [0, 0, 5, 5],
+        "combine-n-to-m",
     )
-    executor.runtime.global_rank = 1
-    result = executor._routed_cross_group_boundary(
-        destination_node, None, object()
-    )
-    assert result is communicator_output
 
 
 def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     monkeypatch,
 ) -> None:
     state = executors._RoutedCrossGroupState(
-        source_devices=(0, 2),
-        destination_devices=(1, 3),
+        dispatch_devices=(0, 2),
+        routed_devices=(1, 3),
+        combine_devices=(0, 2),
         shard_devices=(1, 3),
         num_global_routes=4,
         route_partitions=((0, 2), (2, 4)),
-        participants=(0, 1, 2, 3),
+        dispatch_participants=(0, 1, 2, 3),
+        combine_participants=(0, 1, 2, 3),
         layout_group="layout",
-        m_to_n_group="m-to-n",
-        n_to_m_group="n-to-m",
+        dispatch_m_to_n_group="dispatch-m-to-n",
+        dispatch_n_to_m_group="dispatch-n-to-m",
+        combine_m_to_n_group="combine-m-to-n",
+        combine_n_to_m_group="combine-n-to-m",
+        payload_dtype=torch.float32,
+        routing_counts_dtype=torch.int64,
     )
     runtime = SimpleNamespace(device="cpu", global_rank=1)
     stages = SimpleNamespace(
@@ -766,14 +787,15 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     node = SimpleNamespace(
         uid="dispatch-destination",
         task_type=TaskType.FWD_M_TO_N,
-        node_meta={
-            "direction": "incoming",
-            "role": "destination",
-            "expert_fwd_uid": "expert",
-            "bucket_key": "expert",
-            "a2a_tensor_idx": 0,
-            "routing_counts_idx": 1,
-        },
+        node_meta=_routed_node_meta(
+            direction="incoming",
+            role="destination",
+            bucket_key="expert",
+            a2a_tensor_idx=0,
+            routing_counts_idx=1,
+            routed_devices=[1, 3],
+            **_route_meta([1, 3], 4),
+        ),
     )
     gathered_counts = torch.tensor(
         [
@@ -789,7 +811,12 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     layout_calls = []
 
     def fake_all_gather(output, _counts, *, group, async_op):
-        output.copy_(gathered_counts)
+        if tuple(output.shape) == tuple(gathered_counts.shape):
+            output.copy_(gathered_counts)
+        else:
+            output.copy_(
+                torch.tensor([[10, 3], [0, 0], [20, 3], [0, 0]])
+            )
         layout_calls.append((group, async_op))
         return SimpleNamespace(wait=lambda: None)
 
@@ -808,24 +835,33 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
 
     assert routed is received
     assert torch.equal(local_counts, torch.tensor([[1, 2], [5, 6]]))
-    assert state.input_splits == [0, 0, 0, 0]
-    assert state.output_splits == [3, 0, 11, 0]
-    assert layout_calls == [("layout", True)]
+    assert state.dispatch_input_splits == [0, 0, 0, 0]
+    assert state.routed_dispatch_output_splits == [3, 0, 11, 0]
+    assert layout_calls == [("layout", True), ("layout", True)]
     assert calls[0][0].shape == (0, 3)
-    assert calls[0][1:] == ([3, 0, 11, 0], [0, 0, 0, 0], "m-to-n")
+    assert calls[0][1:] == (
+        [3, 0, 11, 0],
+        [0, 0, 0, 0],
+        "dispatch-m-to-n",
+    )
 
 
 def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
     state = executors._RoutedCrossGroupState(
-        source_devices=(0, 2),
-        destination_devices=(1, 3),
+        dispatch_devices=(0, 2),
+        routed_devices=(1, 3),
+        combine_devices=(0, 2),
         shard_devices=(1, 3),
         num_global_routes=4,
         route_partitions=((0, 2), (2, 4)),
-        participants=(0, 1, 2, 3),
+        dispatch_participants=(0, 1, 2, 3),
+        combine_participants=(0, 1, 2, 3),
         layout_group="layout",
-        m_to_n_group="m-to-n",
-        n_to_m_group="n-to-m",
+        dispatch_m_to_n_group="dispatch-m-to-n",
+        dispatch_n_to_m_group="dispatch-n-to-m",
+        combine_m_to_n_group="combine-m-to-n",
+        combine_n_to_m_group="combine-n-to-m",
+        routing_counts_dtype=torch.int64,
     )
     executor = DagExecutor(
         runtime=SimpleNamespace(device="cpu", global_rank=0),
@@ -844,29 +880,35 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
     )
     local_counts = torch.tensor([[4, 1, 2, 3]])
     waited = []
-    work = SimpleNamespace(wait=lambda: waited.append(True))
+    works = [
+        SimpleNamespace(wait=lambda: waited.append("counts")),
+        SimpleNamespace(wait=lambda: waited.append("shape")),
+    ]
 
     def fake_all_gather(output, _counts, *, group, async_op):
         assert group == "layout"
         assert async_op
         output.zero_()
-        return work
+        return works.pop(0)
 
     monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
 
     returned_counts, grouped_counts = (
-        executor._initialize_routed_cross_group_layout(
+        executor._initialize_dispatch_layout(
             node,
             state,
             local_counts,
+            torch.empty(10, 3),
         )
     )
 
     assert returned_counts is local_counts
     assert grouped_counts is None
-    assert state.input_splits == [0, 5, 0, 5]
-    assert state.layout_work is work
+    assert state.dispatch_input_splits == [0, 5, 0, 5]
+    assert state.layout_work is not None
     assert state.layout_output is not None
+    assert state.layout_shape_work is not None
+    assert state.layout_shape_output is not None
     assert waited == []
 
 
@@ -874,15 +916,20 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
     monkeypatch,
 ) -> None:
     state = executors._RoutedCrossGroupState(
-        source_devices=(0,),
-        destination_devices=(1, 3),
+        dispatch_devices=(0,),
+        routed_devices=(1, 3),
+        combine_devices=(0,),
         shard_devices=(1, 3),
         num_global_routes=4,
         route_partitions=((0, 2), (2, 4)),
-        participants=(0, 1, 3),
+        dispatch_participants=(0, 1, 3),
+        combine_participants=(0, 1, 3),
         layout_group="layout",
-        m_to_n_group="m-to-n",
-        n_to_m_group="n-to-m",
+        dispatch_m_to_n_group="dispatch-m-to-n",
+        dispatch_n_to_m_group="dispatch-n-to-m",
+        combine_m_to_n_group="combine-m-to-n",
+        combine_n_to_m_group="combine-n-to-m",
+        routing_counts_dtype=torch.int64,
     )
     executor = DagExecutor(
         runtime=SimpleNamespace(device="cpu", global_rank=0),
@@ -898,13 +945,16 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
     node = SimpleNamespace(
         uid="dispatch-source",
         task_type=TaskType.FWD_M_TO_N,
-        node_meta={
-            "direction": "incoming",
-            "role": "source",
-            "expert_fwd_uid": "expert",
-            "a2a_tensor_idx": 0,
-            "routing_counts_idx": 1,
-        },
+        node_meta=_routed_node_meta(
+            direction="incoming",
+            role="source",
+            a2a_tensor_idx=0,
+            routing_counts_idx=1,
+            dispatch_devices=[0],
+            routed_devices=[1, 3],
+            combine_devices=[0],
+            **_route_meta([1, 3], 4),
+        ),
     )
     counts = torch.tensor([[1, 2, 3, 4]])
     payload = torch.arange(30, dtype=torch.float32).view(10, 3)
@@ -927,116 +977,60 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
     )
 
     assert result is None
-    assert state.input_splits == [0, 3, 7]
+    assert state.dispatch_input_splits == [0, 3, 7]
     assert torch.equal(calls[0][0], payload)
-    assert calls[0][1:] == ([0, 0, 0], [0, 3, 7], "m-to-n")
-
-
-def test_cross_group_forward_and_backward_rejoin_dense_passthroughs(
-    monkeypatch,
-) -> None:
-    dense_forward = [
-        torch.randn(2, 3, requires_grad=True),
-        torch.randn(2, 2),
-        torch.ones(2, dtype=torch.int64),
-        torch.randn(4, 3, requires_grad=True),
-        torch.ones(8, dtype=torch.int64),
-    ]
-    dense_backward = {
-        "inp_grads": [
-            torch.randn(2, 3),
-            torch.randn(2, 2),
-            None,
-            torch.randn(4, 3),
-        ]
-    }
-    state = _routed_state(
-        retained_forward_buffer={"detached_outs": dense_forward},
-        retained_backward_buffer=dense_backward,
-    )
-    buffers = SimpleNamespace(task={}, release=Mock())
-    events = SimpleNamespace(a2a={})
-    executor = DagExecutor(
-        runtime=SimpleNamespace(),
-        stages=None,
-        buffers=buffers,
-        events=events,
-        params=None,
-        communication=None,
-        compute=None,
-        logger=None,
-        routed_cross_group_states={"expert": state},
-    )
-    common_meta = {
-        "direction": "outgoing",
-        "role": "destination",
-        "expert_fwd_uid": "expert",
-        "expert_input_arity": 5,
-        "expert_output_arity": 4,
-        "a2a_tensor_idx": 3,
-    }
-    fwd_node = SimpleNamespace(
-        uid="fwd-combine",
-        task_type=TaskType.FWD_N_TO_M,
-        node_meta=common_meta,
-    )
-    bwd_node = SimpleNamespace(
-        uid="bwd-combine",
-        task_type=TaskType.BWD_N_TO_M,
-        node_meta=common_meta,
-    )
-    combined = torch.randn(4, 3)
-    combined_grad = torch.randn(4, 3)
-    results = iter((combined, combined_grad))
-    monkeypatch.setattr(
-        executor,
-        "_routed_cross_group_boundary",
-        lambda *_args, **_kwargs: next(results),
+    assert calls[0][1:] == (
+        [0, 0, 0],
+        [0, 3, 7],
+        "dispatch-m-to-n",
     )
 
-    class FakeEvent:
-        def record(self, _stream):
-            pass
 
-    monkeypatch.setattr(executors.torch.cuda, "Event", FakeEvent)
-
-    executor._run_forward_routed_cross_group(fwd_node, object())
-    fwd_inputs = buffers.task[fwd_node.uid]["detached_outs"]
-    assert len(fwd_inputs) == 4
-    assert all(
-        actual is expected
-        for actual, expected in zip(fwd_inputs[:3], dense_forward[:3])
+def _dense_state_meta(direction: str) -> dict:
+    return _routed_node_meta(
+        dense_state_transfer=True,
+        direction=direction,
+        routing_counts_idx=1,
+        routing_counts_schema={
+            "rank": 2,
+            "shape": [1, 4],
+            "dtype": "torch.int64",
+            "requires_grad": False,
+        },
+        model_tensor_indices=[0, 2],
+        destination_input_indices=[0, 1],
+        model_value_schemas=[
+            {
+                "rank": 2,
+                "shape": [None, 3],
+                "dtype": "torch.float32",
+                "requires_grad": True,
+            },
+            {
+                "rank": 1,
+                "shape": [None],
+                "dtype": "torch.int64",
+                "requires_grad": False,
+            },
+        ],
+        differentiable_model_indices=[0],
+        dispatch_payload_idx=3,
+        dispatch_output_arity=4,
     )
-    assert fwd_inputs[3] is combined
-    assert all(
-        actual is expected
-        for actual, expected in zip(
-            buffers.task[fwd_node.uid]["send_output"], fwd_inputs
-        )
-    )
-    assert state.retained_forward_buffer is None
-
-    executor._run_backward_routed_cross_group(bwd_node, object())
-    bwd_inputs = buffers.task[bwd_node.uid]["inp_grads"]
-    assert len(bwd_inputs) == 5
-    assert all(
-        actual is expected
-        for actual, expected in zip(bwd_inputs[:3], dense_backward["inp_grads"][:3])
-    )
-    assert bwd_inputs[3] is combined_grad
-    assert bwd_inputs[4] is None
-    assert state.retained_backward_buffer is None
 
 
-def test_backward_dense_relay_reconstructs_full_gradient_payload() -> None:
-    grad_a = torch.randn(2, 3)
-    grad_b = torch.randn(4, 3)
-    shape_meta = [(grad_a.shape, grad_a.dtype), (grad_b.shape, grad_b.dtype)]
+def test_direct_dense_state_forward_envelope_transfers_counts_and_bypasses() -> None:
+    bypass = torch.randn(2, 3, requires_grad=True)
+    counts = torch.tensor([[1, 1, 1, 1]])
+    indices = torch.tensor([2, 0])
+    payload = torch.randn(4, 3, requires_grad=True)
+    producer = SimpleNamespace(uid="dispatch", task_type=TaskType.FWD)
     buffers = SimpleNamespace(
-        task={("shape_ref", "dense-bucket", "dense-fwd"): shape_meta}
+        task={producer.uid: {"detached_outs": [bypass, counts, indices, payload]}},
+        release=Mock(),
     )
     communication = Mock()
-    communication.recv_bwd.return_value = [grad_a, grad_b]
+    state = _routed_state()
     executor = DagExecutor(
         runtime=None,
         stages=None,
@@ -1046,48 +1040,206 @@ def test_backward_dense_relay_reconstructs_full_gradient_payload() -> None:
         communication=communication,
         compute=None,
         logger=None,
+        routed_cross_group_states={"expert": state},
     )
-    stream = object()
-    node = SimpleNamespace(
-        uid="backward-relay-recv",
+    send = SimpleNamespace(
+        uid="dense-state-send",
+        task_type=TaskType.SEND,
+        peer_pp_rank=1,
+        data_preds=[producer],
+        node_meta=_dense_state_meta("forward"),
+    )
+
+    executor._send_dense_state(send, object())
+
+    sent, peer, stream = communication.send_sized_tensors.call_args.args[:3]
+    assert sent[0] is counts
+    assert torch.equal(sent[1], torch.tensor([4, 3]))
+    assert sent[2:] == [bypass, indices]
+    assert peer == 1
+    assert stream is not None
+    assert communication.send_sized_tensors.call_args.kwargs == {"task": send}
+    assert state.dispatch_counts is counts
+    buffers.release.assert_called_once_with(producer.uid)
+
+    communication.recv_sized_tensors.reset_mock()
+    communication.recv_sized_tensors.return_value = [
+        counts,
+        torch.tensor([4, 3]),
+        bypass,
+        indices,
+    ]
+    recv = SimpleNamespace(
+        uid="dense-state-recv",
+        task_type=TaskType.RECV,
         peer_pp_rank=0,
-        node_meta={
-            "dense_relay": True,
-            "direction": "backward",
-            "payload_arity": 4,
-            "backward_tensor_indices": [0, 3],
-            "shape_reference_bucket_key": "dense-bucket",
-            "shape_reference_fwd_uid": "dense-fwd",
-        },
+        node_meta=_dense_state_meta("forward"),
     )
+    result = executor._recv_dense_state(recv, object())
 
-    result = executor._recv_backward_dense_relay(node, stream)
-
-    assert result["inp_grads"][0] is grad_a
-    assert result["inp_grads"][1:3] == [None, None]
-    assert result["inp_grads"][3] is grad_b
-    communication.recv_bwd.assert_called_once_with(
-        shape_meta,
-        0,
-        stream=stream,
-        task=node,
-    )
+    assert state.combine_counts is counts
+    assert result["routing_counts"] is counts
+    assert result["runtime_inputs"] == {0: bypass, 1: indices}
 
 
-def test_backward_m_to_n_consumes_dense_relay_receive(monkeypatch) -> None:
-    routed_grad = torch.randn(4, 3)
-    relay_recv = SimpleNamespace(uid="relay-recv", task_type=TaskType.RECV)
+def test_direct_dense_state_backward_envelope_reconstructs_dispatch_slots() -> None:
+    bypass_grad = torch.randn(2, 3)
+    consumer = SimpleNamespace(uid="combine-bwd", task_type=TaskType.BWD)
     buffers = SimpleNamespace(
-        task={relay_recv.uid: {"inp_grads": [None, routed_grad]}},
+        task={consumer.uid: {"inp_grads": [bypass_grad, None]}},
         release=Mock(),
     )
-    events = SimpleNamespace(a2a={})
-    state = _routed_state()
+    communication = Mock()
     executor = DagExecutor(
         runtime=None,
         stages=None,
         buffers=buffers,
-        events=events,
+        events=None,
+        params=None,
+        communication=communication,
+        compute=None,
+        logger=None,
+        routed_cross_group_states={"expert": _routed_state()},
+    )
+    send = SimpleNamespace(
+        uid="dense-state-bwd-send",
+        task_type=TaskType.SEND,
+        peer_pp_rank=0,
+        data_preds=[consumer],
+        node_meta=_dense_state_meta("backward"),
+    )
+
+    executor._send_dense_state(send, object())
+
+    assert communication.send_sized_tensors.call_args.args[0] == [bypass_grad]
+    buffers.release.assert_called_once_with(consumer.uid)
+
+    communication.recv_sized_tensors.return_value = [bypass_grad]
+    recv = SimpleNamespace(
+        uid="dense-state-bwd-recv",
+        task_type=TaskType.RECV,
+        peer_pp_rank=1,
+        node_meta=_dense_state_meta("backward"),
+    )
+    result = executor._recv_dense_state(recv, object())
+
+    assert result["inp_grads"] == [bypass_grad, None, None, None]
+
+
+def test_sized_tensor_transport_carries_dynamic_shapes_and_dtypes(
+    monkeypatch,
+) -> None:
+    runtime = SimpleNamespace(
+        device="cpu",
+        pipeline_peer_global_rank=lambda _rank: 7,
+        p2p_process_group_for_task=lambda _task: "p2p",
+    )
+    communication = CommunicationExecutor(runtime, stages=None, logger=None)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    sent = []
+    completed = []
+
+    class _Work:
+        def wait(self):
+            completed.append(True)
+
+    monkeypatch.setattr(
+        executors.dist,
+        "isend",
+        lambda tensor, *, dst, group: (
+            sent.append((tensor.clone(), dst, group)) or _Work()
+        ),
+    )
+    payload = torch.randn(3, 5, requires_grad=True)
+    indices = torch.tensor([4, 1, 0], dtype=torch.int64)
+    task = object()
+
+    communication.send_sized_tensors(
+        [payload, indices], 1, object(), task=task
+    )
+
+    assert [tuple(entry[0].shape) for entry in sent] == [
+        (2,),
+        (3, 5),
+        (1,),
+        (3,),
+    ]
+    assert torch.equal(sent[0][0], torch.tensor([3, 5]))
+    assert torch.equal(sent[1][0], payload)
+    assert torch.equal(sent[2][0], torch.tensor([3]))
+    assert torch.equal(sent[3][0], indices)
+    assert all((dst, group) == (7, "p2p") for _tensor, dst, group in sent)
+    assert len(communication.pending_sized_sends) == 4
+    communication.wait_for_pending_sized_sends()
+    assert completed == [True] * 4
+    assert communication.pending_sized_sends == []
+
+    incoming = iter(
+        (
+            torch.tensor([4, 5]),
+            torch.arange(20, dtype=torch.float32).view(4, 5),
+            torch.tensor([2]),
+            torch.tensor([8, 9], dtype=torch.int64),
+        )
+    )
+
+    def fake_recv(tensor, *, src, group):
+        assert (src, group) == (7, "p2p")
+        tensor.copy_(next(incoming))
+
+    monkeypatch.setattr(executors.dist, "recv", fake_recv)
+    received = communication.recv_sized_tensors(
+        [
+            {
+                "rank": 2,
+                "shape": None,
+                "dtype": "torch.float32",
+                "requires_grad": True,
+            },
+            {
+                "rank": 1,
+                "shape": [None],
+                "dtype": "torch.int64",
+                "requires_grad": False,
+            },
+        ],
+        1,
+        object(),
+        task=task,
+    )
+
+    assert tuple(received[0].shape) == (4, 5)
+    assert received[0].dtype == torch.float32
+    assert received[0].requires_grad
+    assert torch.equal(received[1], torch.tensor([8, 9]))
+
+
+@pytest.mark.parametrize(
+    ("task_type", "output_splits", "input_splits", "group"),
+    [
+        (
+            TaskType.BWD_M_TO_N,
+            [0, 0, 0],
+            [0, 4, 0],
+            "combine-m-to-n",
+        ),
+        (
+            TaskType.BWD_N_TO_M,
+            [0, 4, 0],
+            [0, 0, 0],
+            "dispatch-n-to-m",
+        ),
+    ],
+)
+def test_cross_group_backward_reverses_the_matching_forward_boundary(
+    monkeypatch, task_type, output_splits, input_splits, group
+) -> None:
+    state = _routed_state()
+    executor = DagExecutor(
+        runtime=SimpleNamespace(device="cpu", global_rank=0),
+        stages=None,
+        buffers=None,
+        events=None,
         params=None,
         communication=None,
         compute=None,
@@ -1095,29 +1247,24 @@ def test_backward_m_to_n_consumes_dense_relay_receive(monkeypatch) -> None:
         routed_cross_group_states={"expert": state},
     )
     node = SimpleNamespace(
-        uid="backward-dispatch-source",
-        task_type=TaskType.BWD_M_TO_N,
-        data_preds=[relay_recv],
-        node_meta={
-            "direction": "incoming",
-            "role": "source",
-            "expert_fwd_uid": "expert",
-            "a2a_tensor_idx": 1,
-        },
+        uid="backward-source",
+        task_type=task_type,
+        node_meta=_routed_node_meta(
+            direction="incoming",
+            role="source",
+            a2a_tensor_idx=0,
+        ),
     )
-    boundary = Mock(return_value=None)
-    monkeypatch.setattr(executor, "_routed_cross_group_boundary", boundary)
+    tensor = torch.randn(4, 3)
+    calls = []
 
-    class FakeEvent:
-        def record(self, _stream):
-            pass
+    def fake_a2a(value, recv_splits, send_splits, process_group):
+        calls.append((value, recv_splits, send_splits, process_group))
+        return value.new_empty((0, 3))
 
-    monkeypatch.setattr(executors.torch.cuda, "Event", FakeEvent)
-    stream = object()
+    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
-    executor._run_backward_routed_cross_group(node, stream)
-
-    boundary.assert_called_once_with(node, routed_grad, stream)
-    buffers.release.assert_called_once_with(relay_recv.uid)
-    assert state.retained_backward_buffer is not None
-    assert state.retained_backward_buffer["inp_grads"][1] is routed_grad
+    assert executor._routed_cross_group_boundary(node, tensor, object()) is None
+    assert calls[0][0] is tensor
+    assert calls[0][1:] == (output_splits, input_splits, group)

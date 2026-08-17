@@ -18,6 +18,8 @@ def _runtime(global_pp_rank: int = 1) -> RuntimeState:
     runtime.directional_p2p_streams = {
         "pp_lo_hi": object(),
         "pp_hi_lo": object(),
+        "dense_state_lo_hi": object(),
+        "dense_state_hi_lo": object(),
     }
     runtime.directional_routed_streams = {
         "m_to_n": object(),
@@ -77,6 +79,25 @@ def test_declared_p2p_channel_is_shared_by_both_endpoints() -> None:
     assert (
         runtime.directional_p2p_stream_for_task(recv)
         is runtime.directional_p2p_streams["pp_lo_hi"]
+    )
+
+
+def test_dense_state_uses_its_declared_dedicated_stream() -> None:
+    runtime = _runtime(global_pp_rank=1)
+    send = SimpleNamespace(
+        uid="dense-state-send",
+        node_kind="SEND_COMM",
+        peer_pp_rank=2,
+        node_meta={
+            "dense_state_transfer": True,
+            "comm_group_kind": "dense_state_lo_hi",
+        },
+    )
+
+    assert runtime.p2p_channel_for_task(send) == "dense_state_lo_hi"
+    assert (
+        runtime.directional_p2p_stream_for_task(send)
+        is runtime.directional_p2p_streams["dense_state_lo_hi"]
     )
 
 

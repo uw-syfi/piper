@@ -927,7 +927,32 @@ def test_shard_uses_routed_contract_for_all_ep_collectives() -> None:
         "tensor_idx": 0,
         "routing_counts_idx": 1,
     }
+    pre.node_meta["output_names"] = ["payload", "counts"]
+    pre.node_meta["runtime_outputs_by_destination"] = {
+        "expert.fwd": [
+            {
+                "value_id": "payload",
+                "source_output_idx": 0,
+                "destination_input_idx": 0,
+            },
+            {
+                "value_id": "counts",
+                "source_output_idx": 1,
+                "destination_input_idx": 1,
+            },
+        ]
+    }
     expert.node_meta["a2a_boundary_after"] = {"tensor_idx": 0}
+    expert.node_meta["output_names"] = ["combined"]
+    expert.node_meta["runtime_outputs_by_destination"] = {
+        "post.fwd": [
+            {
+                "value_id": "combined",
+                "source_output_idx": 0,
+                "destination_input_idx": 0,
+            }
+        ]
+    }
 
     post_bwd = _bwd(
         "post.bwd",
