@@ -723,7 +723,8 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
         ),
     )
     source_major = torch.cat((torch.zeros(5, 2), torch.full((5, 2), 2.0)))
-    communicator_output = source_major.new_empty((0, 2))
+    completed = []
+    communicator_output = SimpleNamespace(wait=lambda: completed.append(True))
     calls = []
 
     def fake_a2a(tensor, output_splits, input_splits, group):
@@ -742,6 +743,13 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
         [0, 0, 5, 5],
         "combine-n-to-m",
     )
+    assert executor.pending_routed_source_results == [communicator_output]
+    assert completed == []
+
+    executor._drain_routed_source_results()
+
+    assert completed == [True]
+    assert executor.pending_routed_source_results == []
 
 
 def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
@@ -959,6 +967,8 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
     counts = torch.tensor([[1, 2, 3, 4]])
     payload = torch.arange(30, dtype=torch.float32).view(10, 3)
     calls = []
+    completed = []
+    communicator_output = SimpleNamespace(wait=lambda: completed.append(True))
 
     def fake_all_gather(output, _counts, *, group, async_op):
         output.zero_()
@@ -966,7 +976,7 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
 
     def fake_a2a(tensor, output_splits, input_splits, group):
         calls.append((tensor.clone(), output_splits, input_splits, group))
-        return tensor.new_empty((0, tensor.shape[1]))
+        return communicator_output
 
     monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
     monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
@@ -984,6 +994,13 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
         [0, 3, 7],
         "dispatch-m-to-n",
     )
+    assert executor.pending_routed_source_results == [communicator_output]
+    assert completed == []
+
+    executor._drain_routed_source_results()
+
+    assert completed == [True]
+    assert executor.pending_routed_source_results == []
 
 
 def _dense_state_meta(direction: str) -> dict:

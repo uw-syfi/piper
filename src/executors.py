@@ -855,10 +855,27 @@ class DagExecutor:
     routed_cross_group_states: dict[str, _RoutedCrossGroupState] = field(
         default_factory=dict
     )
+    pending_routed_source_results: list[torch.Tensor] = field(
+        default_factory=list
+    )
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
         return getattr(node, "node_meta", {}) or {}
+
+    def _drain_routed_source_results(self) -> None:
+        """Complete source-only functional collectives after DAG launch."""
+        pending, self.pending_routed_source_results = (
+            self.pending_routed_source_results,
+            [],
+        )
+        for result in pending:
+            wait = getattr(result, "wait", None)
+            if not callable(wait):
+                raise TypeError(
+                    "routed source collective result must provide wait()"
+                )
+            wait()
 
     def _node_bucket_key(self, node: Any) -> Any | None:
         return self._node_meta(node).get("bucket_key")
@@ -1915,6 +1932,12 @@ class DagExecutor:
                 process_group,
             )
             if role == "source":
+                # Source ranks receive zero rows, so no model consumer will
+                # trigger AsyncCollectiveTensor's implicit wait. Keep the
+                # result alive until this actor has enqueued its complete DAG;
+                # waiting here can prevent later matching collectives from
+                # being launched and deadlock a relaxed pipeline schedule.
+                self.pending_routed_source_results.append(collective_output)
                 return None
             if task_type == TaskType.FWD_M_TO_N:
                 assert grouped_counts is not None
@@ -2837,6 +2860,7 @@ class DagExecutor:
             # per-node sync can deadlock rendezvous communication.
             torch.cuda.synchronize()
             timing_recorder.finish()
+        self._drain_routed_source_results()
         return update_result
 
     def _update(
