@@ -238,6 +238,8 @@ _QWEN3_COMM_1TO1 = Qwen3ConfigSpec(
 # presets.
 QWEN3_CONFIG_SPECS = {
     "comm-1to1-L4": _QWEN3_COMM_1TO1,
+    "Qwen3-30B-A3B-L1": replace(_QWEN3_30B, n_layers=1),
+    "Qwen3-30B-A3B-L2": replace(_QWEN3_30B, n_layers=2),
     # Preserve Qwen3-30B-A3B's architecture and change only the routed expert
     # width from 768 to the H100-NVLink 1:1 roofline width of 864.  The local
     # proxy uses eight layers; the other variants bracket H100 capacity.

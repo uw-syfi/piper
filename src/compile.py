@@ -1,7 +1,6 @@
 import ray
 import torch
 import copy
-import time
 from pathlib import Path
 
 from .actor import _create_actors
@@ -18,17 +17,6 @@ from .schedule import (
     load_schedule_directives,
 )
 logger = create_logger("compile", LOG_LEVEL)
-
-_COMPILED_DATA_ACTOR = "piper_compiled_data"
-
-@ray.remote
-class _CompiledDataStore:
-    """Coordinator-owned monotonic clock used to align actor profiles."""
-
-    def monotonic_time_ns(self) -> int:
-        """Return the coordinator's monotonic clock for actor calibration."""
-
-        return time.monotonic_ns()
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -303,7 +291,6 @@ def piper_setup(
     # this run if the backend is somehow not re-invoked.
     piper_metadata.training_dag = None
     piper_metadata.per_pp_training_dags = None
-    piper_metadata.compiled_data_store = None
     piper_metadata.profiled_training_plan = None
 
     actor_groups = tuple(
@@ -321,13 +308,6 @@ def piper_setup(
         use_inductor=use_inductor,
         model_seed=model_seed,
     )
-
-    piper_metadata.compiled_data_store = _CompiledDataStore.options(
-        name=_COMPILED_DATA_ACTOR,
-        lifetime="detached",
-        num_cpus=0,
-        get_if_exists=True,
-    ).remote()
 
     # The sole program driver controls every actor, so it can obtain the
     # process-group rendezvous endpoint directly from global rank zero.

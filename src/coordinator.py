@@ -408,19 +408,6 @@ class PiperProgramCoordinator:
         self.pp_outer = pp_outer
 
     def run_program(self, training_func: Callable, pg, *args, **kwargs):
-        from .compile import _COMPILED_DATA_ACTOR
-
-        logger = create_logger("coordinator", LOG_LEVEL)
-        # Kill any stale compiled-data store from a previous run so a new
-        # program always gets a fresh profile-calibration clock.
-        try:
-            ray.kill(ray.get_actor(_COMPILED_DATA_ACTOR))
-        except ValueError:
-            logger.debug("No stale Ray actor named %s to kill", _COMPILED_DATA_ACTOR)
-        except Exception:
-            logger.exception("Failed to kill stale Ray actor named %s", _COMPILED_DATA_ACTOR)
-            raise
-
         ray_pg = getattr(pg, "placement_group", pg)
         plan = getattr(pg, "plan", None)
         bundle_index = plan.driver_bundle_index() if plan is not None else 0

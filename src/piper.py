@@ -1,7 +1,10 @@
 import time
+import json
+from pathlib import Path
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import ray
 import torch
@@ -43,6 +46,7 @@ from .profiling import (
     INTERFERENCE_FREE_PROFILE_MODE,
     ProfileConfig,
     ProfiledTrainingPlan,
+    estimate_profile_time,
     merge_actor_profiles,
     normalize_profile_mode,
 )
@@ -52,6 +56,8 @@ from .visualization import (
     print_training_dag_order,
     render_training_dag,
 )
+_MAX_KINETO_CAPTURE_LOSS_RATE = 1e-4
+_MAX_KINETO_CPU_LAUNCH_LOSS_RATE = 1e-4
 from .zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
 
 logger = create_logger("piper_backend", LOG_LEVEL)
@@ -1467,11 +1473,13 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
-def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
+def piper_exec_dag(
+    loss_fn, log_stats: bool = False, *, return_losses: bool = True
+) -> list:
     """Execute one training step using the loaded per-rank TrainingDAG."""
     actors = piper_metadata.actors
     run_refs = [
-        actor.run_dag.remote(loss_fn=loss_fn)
+        actor.run_dag.remote(loss_fn=loss_fn, return_losses=return_losses)
         for actor in actors.values()
     ]
     t0 = time.perf_counter()
@@ -1480,6 +1488,9 @@ def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
 
     if log_stats:
         _log_step_stats(step_time, log_stats, actors)
+
+    if not return_losses:
+        return []
 
     schedule_info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
     actor_ranks = list(actors)
@@ -1553,7 +1564,11 @@ def piper_measure_dags(
                 for actor in actors.values()
             ])
         started = time.perf_counter()
-        piper_exec_dag(loss_fn, log_stats=log_stats)
+        piper_exec_dag(
+            loss_fn,
+            log_stats=log_stats,
+            return_losses=False,
+        )
         step_samples_s.append(time.perf_counter() - started)
         if collect_peak_memory:
             for rank, peak_bytes in ray.get([
@@ -1578,6 +1593,698 @@ def piper_measure_dags(
     )
 
 
+def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any]:
+    """Compare exact per-node-range GPU activity sequences across IF/normal."""
+
+    by_mode_rank = {
+        (normalize_profile_mode(result.profile_mode), int(result.global_rank)): result
+        for result in results
+    }
+    if_ranks = {
+        rank for mode, rank in by_mode_rank
+        if mode == INTERFERENCE_FREE_PROFILE_MODE
+    }
+    normal_ranks = {
+        rank for mode, rank in by_mode_rank
+        if mode == NORMAL_PROFILE_MODE
+    }
+    common_ranks = sorted(if_ranks & normal_ranks)
+    summary: dict[str, Any] = {
+        "comparison": (
+            "exact ordered (GPU activity category, Kineto name) sequence and "
+            "multiplicity per node-range occurrence"
+        ),
+        "actors_compared": len(common_ranks),
+        "nodes_compared": 0,
+        "node_ranges_compared": 0,
+        "gpu_activities_compared": 0,
+        "expected_gpu_activity_records": 0,
+        "missing_gpu_activity_records": 0,
+        "capture_loss_rate": 0.0,
+        "capture_loss_threshold": _MAX_KINETO_CAPTURE_LOSS_RATE,
+        "expected_cpu_launch_records": 0,
+        "missing_cpu_launch_records": 0,
+        "cpu_launch_loss_rate": 0.0,
+        "cpu_launch_loss_threshold": _MAX_KINETO_CPU_LAUNCH_LOSS_RATE,
+        "launch_evidence_complete": True,
+        "capture_loss_only": False,
+        "capture_loss_within_tolerance": False,
+        "mismatched_nodes": 0,
+        "mismatched_node_ranges": 0,
+        "unclassified_node_ranges": 0,
+        "missing_mode_ranks": {
+            INTERFERENCE_FREE_PROFILE_MODE: sorted(normal_ranks - if_ranks),
+            NORMAL_PROFILE_MODE: sorted(if_ranks - normal_ranks),
+        },
+        "mismatches": [],
+    }
+
+    def activity_counts(occurrence: Mapping[str, Any]) -> dict[tuple[str, str], int]:
+        return {
+            (str(item["category"]), str(item["name"])): int(item["count"])
+            for item in occurrence.get("activities", ())
+        }
+
+    def missing_subsequence_entries(
+        captured: Sequence[Any],
+        expected: Sequence[Any],
+    ) -> list[tuple[int, Any]] | None:
+        """Return expected entries deleted from captured, or None if reordered."""
+
+        captured_index = 0
+        missing = []
+        for expected_index, expected_entry in enumerate(expected):
+            if (
+                captured_index < len(captured)
+                and captured[captured_index] == expected_entry
+            ):
+                captured_index += 1
+            else:
+                missing.append((expected_index, expected_entry))
+        return missing if captured_index == len(captured) else None
+
+    for rank in common_ranks:
+        mode_audits = {}
+        for mode in (INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE):
+            result = by_mode_rank[(mode, rank)]
+            mode_audits[mode] = result.device_metadata.get(
+                "kineto_attribution_audit", {}
+            )
+        node_uids = sorted(set(mode_audits[INTERFERENCE_FREE_PROFILE_MODE]) | set(
+            mode_audits[NORMAL_PROFILE_MODE]
+        ))
+        for uid in node_uids:
+            if_audit = mode_audits[INTERFERENCE_FREE_PROFILE_MODE].get(uid)
+            normal_audit = mode_audits[NORMAL_PROFILE_MODE].get(uid)
+            summary["nodes_compared"] += 1
+            if if_audit is None or normal_audit is None:
+                summary["mismatched_nodes"] += 1
+                summary["mismatches"].append({
+                    "global_rank": rank,
+                    "uid": uid,
+                    "reason": "node audit missing from one profile mode",
+                    "if_present": if_audit is not None,
+                    "normal_present": normal_audit is not None,
+                })
+                continue
+            if_ranges = list(if_audit.get("range_activity_signatures", ()))
+            normal_ranges = list(normal_audit.get("range_activity_signatures", ()))
+            range_mismatches = []
+            for occurrence in range(max(len(if_ranges), len(normal_ranges))):
+                if_range = if_ranges[occurrence] if occurrence < len(if_ranges) else None
+                normal_range = (
+                    normal_ranges[occurrence]
+                    if occurrence < len(normal_ranges)
+                    else None
+                )
+                if if_range is not None and normal_range is not None:
+                    summary["node_ranges_compared"] += 1
+                range_detail: dict[str, Any] = {
+                    "occurrence": occurrence,
+                    "classification": "unclassified",
+                    "missing_activities": [],
+                }
+                if if_range is None or normal_range is None:
+                    range_detail["reason"] = "node range missing from one mode"
+                else:
+                    if_launch_sequence = if_range.get("cpu_launch_sequence")
+                    normal_launch_sequence = normal_range.get(
+                        "cpu_launch_sequence"
+                    )
+                    if_launches = if_range.get("cpu_launches")
+                    normal_launches = normal_range.get("cpu_launches")
+                    has_launch_evidence = all(
+                        isinstance(value, list)
+                        for value in (
+                            if_launch_sequence,
+                            normal_launch_sequence,
+                            if_launches,
+                            normal_launches,
+                        )
+                    )
+                    exact_gpu_match = (
+                        if_range.get("signature_sha256")
+                        == normal_range.get("signature_sha256")
+                        and if_range.get("activity_sequence_sha256")
+                        == normal_range.get("activity_sequence_sha256")
+                    )
+                    if has_launch_evidence:
+                        summary["expected_cpu_launch_records"] += max(
+                            len(if_launch_sequence), len(normal_launch_sequence)
+                        )
+                    if not has_launch_evidence:
+                        summary["launch_evidence_complete"] = False
+                        if exact_gpu_match:
+                            expected_count = int(
+                                if_range.get("activity_count", 0)
+                            )
+                            summary["expected_gpu_activity_records"] += (
+                                expected_count
+                            )
+                            summary["gpu_activities_compared"] += expected_count
+                            continue
+                        range_detail["reason"] = (
+                            "per-occurrence CPU launch evidence is missing"
+                        )
+                    elif if_launch_sequence != normal_launch_sequence:
+                        if (
+                            len(if_launch_sequence) != len(if_launches)
+                            or len(normal_launch_sequence) != len(normal_launches)
+                        ):
+                            range_detail.update({
+                                "reason": (
+                                    "canonical CPU launch records do not match "
+                                    "their normalized sequences"
+                                ),
+                                "if_cpu_launch_count": len(if_launches),
+                                "normal_cpu_launch_count": len(normal_launches),
+                            })
+                            if_missing_launches = None
+                            normal_missing_launches = None
+                        else:
+                            if_missing_launches = missing_subsequence_entries(
+                                if_launch_sequence, normal_launch_sequence
+                            )
+                            normal_missing_launches = missing_subsequence_entries(
+                                normal_launch_sequence, if_launch_sequence
+                            )
+                        if if_missing_launches is not None:
+                            expected_launches = normal_launches
+                            missing_mode = INTERFERENCE_FREE_PROFILE_MODE
+                            missing_launches = if_missing_launches
+                            nondeficient_range = normal_range
+                        elif normal_missing_launches is not None:
+                            expected_launches = if_launches
+                            missing_mode = NORMAL_PROFILE_MODE
+                            missing_launches = normal_missing_launches
+                            nondeficient_range = if_range
+                        else:
+                            expected_launches = []
+                            missing_mode = None
+                            missing_launches = []
+                            nondeficient_range = None
+                        missing_cpu_launch_details = [
+                                {
+                                    "launch_index": launch_index,
+                                    "missing_mode": missing_mode,
+                                    "operation": str(operation),
+                                    "api_name": str(
+                                        expected_launches[launch_index].get(
+                                            "api_name", ""
+                                        )
+                                    ),
+                                }
+                                for launch_index, operation in missing_launches
+                            ]
+                        if missing_mode is None:
+                            range_detail.update({
+                                "classification": "execution_divergence",
+                                "reason": "normalized CPU launch sequences differ",
+                                "if_cpu_launch_sequence": if_launch_sequence,
+                                "normal_cpu_launch_sequence": normal_launch_sequence,
+                                "missing_cpu_launches": [],
+                            })
+                        elif any(
+                            launch.get("mapping_status") != "unambiguous"
+                            for launch in (*if_launches, *normal_launches)
+                        ) or bool(
+                            nondeficient_range.get("unmapped_activities", ())
+                        ):
+                            range_detail.update({
+                                "reason": (
+                                    "CPU launch deletion has unrelated ambiguous "
+                                    "launch/activity mapping"
+                                ),
+                                "missing_cpu_launches": missing_cpu_launch_details,
+                                "if_unmapped_activities": if_range.get(
+                                    "unmapped_activities", []
+                                ),
+                                "normal_unmapped_activities": normal_range.get(
+                                    "unmapped_activities", []
+                                ),
+                            })
+                        else:
+                            if_activity_sequence = if_range.get(
+                                "activity_sequence"
+                            )
+                            normal_activity_sequence = normal_range.get(
+                                "activity_sequence"
+                            )
+                            if not isinstance(if_activity_sequence, list) or not isinstance(
+                                normal_activity_sequence, list
+                            ):
+                                summary["launch_evidence_complete"] = False
+                                range_detail.update({
+                                    "reason": (
+                                        "per-occurrence GPU activity sequence "
+                                        "evidence is missing"
+                                    ),
+                                    "missing_cpu_launches": missing_cpu_launch_details,
+                                })
+                            else:
+                                if_missing_activities = missing_subsequence_entries(
+                                    if_activity_sequence,
+                                    normal_activity_sequence,
+                                )
+                                normal_missing_activities = missing_subsequence_entries(
+                                    normal_activity_sequence,
+                                    if_activity_sequence,
+                                )
+                                if if_missing_activities is not None:
+                                    expected_activities = normal_activity_sequence
+                                    gpu_missing_mode = (
+                                        INTERFERENCE_FREE_PROFILE_MODE
+                                    )
+                                    missing_activity_entries = if_missing_activities
+                                elif normal_missing_activities is not None:
+                                    expected_activities = if_activity_sequence
+                                    gpu_missing_mode = NORMAL_PROFILE_MODE
+                                    missing_activity_entries = normal_missing_activities
+                                else:
+                                    expected_activities = []
+                                    gpu_missing_mode = None
+                                    missing_activity_entries = []
+                                if gpu_missing_mode is None:
+                                    range_detail.update({
+                                        "classification": "execution_divergence",
+                                        "reason": (
+                                            "GPU activities were substituted or "
+                                            "reordered alongside CPU launch loss"
+                                        ),
+                                        "missing_cpu_launches": (
+                                            missing_cpu_launch_details
+                                        ),
+                                    })
+                                else:
+                                    missing_activities = [
+                                        {
+                                            "launch_index": None,
+                                            "missing_mode": gpu_missing_mode,
+                                            "operation": "",
+                                            "if_api_name": "",
+                                            "normal_api_name": "",
+                                            "expected_activity_index": (
+                                                activity_index
+                                            ),
+                                            "category": str(activity["category"]),
+                                            "name": str(activity["name"]),
+                                        }
+                                        for activity_index, activity in (
+                                            missing_activity_entries
+                                        )
+                                    ]
+                                    summary["missing_cpu_launch_records"] += len(
+                                        missing_launches
+                                    )
+                                    summary["expected_gpu_activity_records"] += len(
+                                        expected_activities
+                                    )
+                                    summary["gpu_activities_compared"] += len(
+                                        expected_activities
+                                    )
+                                    summary["missing_gpu_activity_records"] += len(
+                                        missing_activities
+                                    )
+                                    range_detail.update({
+                                        "classification": "capture_loss",
+                                        "reason": (
+                                            "deletion-only CPU launch loss"
+                                            + (
+                                                " and GPU activity loss"
+                                                if missing_activities
+                                                else ""
+                                            )
+                                        ),
+                                        "missing_cpu_launches": (
+                                            missing_cpu_launch_details
+                                        ),
+                                        "missing_activities": missing_activities,
+                                    })
+                    elif len(if_launches) != len(normal_launches):
+                        range_detail.update({
+                            "classification": "execution_divergence",
+                            "reason": "canonical CPU launch counts differ",
+                            "if_cpu_launch_count": len(if_launches),
+                            "normal_cpu_launch_count": len(normal_launches),
+                        })
+                    elif (
+                        not bool(if_range.get("launch_mapping_unambiguous", False))
+                        or not bool(
+                            normal_range.get("launch_mapping_unambiguous", False)
+                        )
+                    ):
+                        range_detail.update({
+                            "reason": "launch/activity mapping is ambiguous",
+                            "if_unmapped_activities": if_range.get(
+                                "unmapped_activities", []
+                            ),
+                            "normal_unmapped_activities": normal_range.get(
+                                "unmapped_activities", []
+                            ),
+                        })
+                    else:
+                        missing_activities = []
+                        expected_count = 0
+                        launch_divergence = None
+                        for launch_index, (if_launch, normal_launch) in enumerate(
+                            zip(if_launches, normal_launches)
+                        ):
+                            if (
+                                if_launch.get("operation")
+                                != normal_launch.get("operation")
+                            ):
+                                launch_divergence = {
+                                    "classification": "execution_divergence",
+                                    "reason": (
+                                        f"launch {launch_index} operation differs"
+                                    ),
+                                }
+                                break
+                            if_activities = list(if_launch.get("activities", ()))
+                            normal_activities = list(
+                                normal_launch.get("activities", ())
+                            )
+                            if not if_activities and not normal_activities:
+                                launch_divergence = {
+                                    "classification": "unclassified",
+                                    "reason": (
+                                        f"launch {launch_index} has no captured "
+                                        "GPU activity in either mode"
+                                    ),
+                                }
+                                break
+                            if if_activities == normal_activities:
+                                expected_count += len(if_activities)
+                                continue
+                            if_missing = missing_subsequence_entries(
+                                if_activities, normal_activities
+                            )
+                            normal_missing = missing_subsequence_entries(
+                                normal_activities, if_activities
+                            )
+                            if if_missing is not None:
+                                expected = normal_activities
+                                missing_mode = INTERFERENCE_FREE_PROFILE_MODE
+                                missing_entries = if_missing
+                            elif normal_missing is not None:
+                                expected = if_activities
+                                missing_mode = NORMAL_PROFILE_MODE
+                                missing_entries = normal_missing
+                            else:
+                                launch_divergence = {
+                                    "classification": "execution_divergence",
+                                    "reason": (
+                                        f"launch {launch_index} GPU activities "
+                                        "were substituted or reordered"
+                                    ),
+                                }
+                                break
+                            expected_count += len(expected)
+                            missing_activities.extend({
+                                "launch_index": launch_index,
+                                "missing_mode": missing_mode,
+                                "operation": str(if_launch.get("operation", "")),
+                                "if_api_name": str(if_launch.get("api_name", "")),
+                                "normal_api_name": str(
+                                    normal_launch.get("api_name", "")
+                                ),
+                                "expected_activity_index": activity_index,
+                                "category": str(activity["category"]),
+                                "name": str(activity["name"]),
+                            } for activity_index, activity in missing_entries)
+
+                        summary["expected_gpu_activity_records"] += expected_count
+                        summary["gpu_activities_compared"] += expected_count
+                        if launch_divergence is not None:
+                            range_detail.update(launch_divergence)
+                        elif missing_activities:
+                            range_detail.update({
+                                "classification": "capture_loss",
+                                "reason": "deletion-only GPU activity loss",
+                                "missing_activities": missing_activities,
+                            })
+                            summary["missing_gpu_activity_records"] += len(
+                                missing_activities
+                            )
+                        else:
+                            continue
+                summary["mismatched_node_ranges"] += 1
+                if range_detail["classification"] != "capture_loss":
+                    summary["unclassified_node_ranges"] += 1
+                if_counts = {} if if_range is None else activity_counts(if_range)
+                normal_counts = (
+                    {} if normal_range is None else activity_counts(normal_range)
+                )
+                deltas = []
+                for category, name in sorted(set(if_counts) | set(normal_counts)):
+                    if_count = if_counts.get((category, name), 0)
+                    normal_count = normal_counts.get((category, name), 0)
+                    if if_count != normal_count:
+                        deltas.append({
+                            "category": category,
+                            "name": name,
+                            "if_count": if_count,
+                            "normal_count": normal_count,
+                        })
+                range_mismatches.append({
+                    **range_detail,
+                    "if_activity_count": (
+                        None if if_range is None
+                        else int(if_range.get("activity_count", 0))
+                    ),
+                    "normal_activity_count": (
+                        None if normal_range is None
+                        else int(normal_range.get("activity_count", 0))
+                    ),
+                    "if_signature_sha256": (
+                        None if if_range is None
+                        else if_range.get("signature_sha256")
+                    ),
+                    "normal_signature_sha256": (
+                        None if normal_range is None
+                        else normal_range.get("signature_sha256")
+                    ),
+                    "if_activity_sequence_sha256": (
+                        None if if_range is None
+                        else if_range.get("activity_sequence_sha256")
+                    ),
+                    "normal_activity_sequence_sha256": (
+                        None if normal_range is None
+                        else normal_range.get("activity_sequence_sha256")
+                    ),
+                    "activity_order_match": (
+                        False
+                        if if_range is None or normal_range is None
+                        else if_range.get("activity_sequence_sha256")
+                        == normal_range.get("activity_sequence_sha256")
+                    ),
+                    "different_activity_entries": len(deltas),
+                    "activity_deltas": deltas[:25],
+                })
+            if range_mismatches:
+                summary["mismatched_nodes"] += 1
+                summary["mismatches"].append({
+                    "global_rank": rank,
+                    "uid": uid,
+                    "if_range_count": len(if_ranges),
+                    "normal_range_count": len(normal_ranges),
+                    "ranges": range_mismatches,
+                })
+
+    summary["exact_match"] = (
+        not any(summary["missing_mode_ranks"].values())
+        and summary["mismatched_nodes"] == 0
+    )
+    expected = int(summary["expected_gpu_activity_records"])
+    missing = int(summary["missing_gpu_activity_records"])
+    summary["capture_loss_rate"] = 0.0 if expected == 0 else missing / expected
+    expected_cpu = int(summary["expected_cpu_launch_records"])
+    missing_cpu = int(summary["missing_cpu_launch_records"])
+    summary["cpu_launch_loss_rate"] = (
+        0.0 if expected_cpu == 0 else missing_cpu / expected_cpu
+    )
+    summary["capture_loss_only"] = (
+        not summary["exact_match"]
+        and not any(summary["missing_mode_ranks"].values())
+        and summary["mismatched_node_ranges"] > 0
+        and summary["unclassified_node_ranges"] == 0
+        and (missing > 0 or missing_cpu > 0)
+        and bool(summary["launch_evidence_complete"])
+    )
+    summary["capture_loss_within_tolerance"] = (
+        bool(summary["capture_loss_only"])
+        and float(summary["capture_loss_rate"])
+        <= _MAX_KINETO_CAPTURE_LOSS_RATE
+        and float(summary["cpu_launch_loss_rate"])
+        <= _MAX_KINETO_CPU_LAUNCH_LOSS_RATE
+    )
+    summary["accepted"] = bool(
+        summary["exact_match"] or summary["capture_loss_within_tolerance"]
+    )
+    return summary
+
+
+def _strip_kineto_comparison_details(results: Sequence[Any]) -> None:
+    """Remove transient full launch/activity sequences after comparison."""
+
+    for result in results:
+        for audit in result.device_metadata.get(
+            "kineto_attribution_audit", {}
+        ).values():
+            for occurrence in audit.get("range_activity_signatures", ()):
+                occurrence.pop("activities", None)
+                occurrence.pop("activity_sequence", None)
+                occurrence.pop("cpu_launch_sequence", None)
+                occurrence.pop("cpu_launches", None)
+                occurrence.pop("unmapped_activities", None)
+
+
+def _filter_kineto_profile_iterations(
+    results: Sequence[Any], iteration_indices: Sequence[int]
+) -> list[Any]:
+    """Retain the same fully paired Kineto iterations in every actor shard."""
+
+    selected = tuple(int(index) for index in iteration_indices)
+    filtered_results = []
+    for result in results:
+        filtered_profiles = {}
+        for uid, profile in result.node_profiles.items():
+            if not profile.executed:
+                filtered_profiles[uid] = profile
+                continue
+            samples = tuple(profile.samples_us[index] for index in selected)
+            offsets = (
+                tuple(profile.start_offset_samples_us[index] for index in selected)
+                if profile.start_offset_samples_us
+                else ()
+            )
+            filtered_profiles[uid] = replace(
+                profile,
+                samples_us=samples,
+                sample_iteration_ids=tuple(range(len(samples))),
+                estimate_us=estimate_profile_time(samples, profile.estimator),
+                start_offset_samples_us=offsets,
+                start_offset_estimate_us=(
+                    estimate_profile_time(offsets, profile.estimator)
+                    if offsets
+                    else None
+                ),
+            )
+
+        metadata = dict(result.device_metadata)
+        filtered_audits = {}
+        for uid, raw_audit in metadata.get(
+            "kineto_attribution_audit", {}
+        ).items():
+            audit = dict(raw_audit)
+            signatures = list(audit.get("range_activity_signatures", ()))
+            durations = list(audit.get("simulator_duration_samples_us", ()))
+            audit["range_activity_signatures"] = [
+                signatures[index] for index in selected
+            ]
+            audit["simulator_duration_samples_us"] = [
+                durations[index] for index in selected
+            ]
+            audit["range_count"] = len(selected)
+            selected_signatures = audit["range_activity_signatures"]
+            if all(
+                "cpu_launch_count" in occurrence
+                and "matched_cpu_launch_count" in occurrence
+                for occurrence in selected_signatures
+            ):
+                launch_count = sum(
+                    int(occurrence["cpu_launch_count"])
+                    for occurrence in selected_signatures
+                )
+                matched_launch_count = sum(
+                    int(occurrence["matched_cpu_launch_count"])
+                    for occurrence in selected_signatures
+                )
+                audit["launch_count"] = launch_count
+                audit["matched_launch_count"] = matched_launch_count
+                audit["unmatched_launch_count"] = (
+                    launch_count - matched_launch_count
+                )
+                audit["launch_coverage_pct"] = (
+                    100.0
+                    if not launch_count
+                    else 100.0 * matched_launch_count / launch_count
+                )
+            filtered_audits[uid] = audit
+        metadata["kineto_attribution_audit"] = filtered_audits
+        allocator_stats = list(metadata.get("allocator_iteration_stats", ()))
+        if allocator_stats and max(selected, default=-1) < len(allocator_stats):
+            metadata["allocator_iteration_stats"] = [
+                allocator_stats[index] for index in selected
+            ]
+        filtered_results.append(
+            replace(
+                result,
+                node_profiles=filtered_profiles,
+                device_metadata=metadata,
+                timeline_origin_samples_us=tuple(
+                    result.timeline_origin_samples_us[index]
+                    for index in selected
+                ) if result.timeline_origin_samples_us else (),
+                timeline_origin_uncertainty_samples_us=tuple(
+                    result.timeline_origin_uncertainty_samples_us[index]
+                    for index in selected
+                ) if result.timeline_origin_uncertainty_samples_us else (),
+            )
+        )
+    return filtered_results
+
+
+def _select_actor_clock_calibration(
+    samples: Sequence[tuple[int, int, int]],
+) -> tuple[int, int]:
+    """Return actor-to-driver offset and uncertainty from midpoint samples."""
+
+    if not samples:
+        raise ValueError("actor clock calibration requires at least one sample")
+    candidates = []
+    for driver_before_ns, actor_ns, driver_after_ns in samples:
+        before = int(driver_before_ns)
+        actor_time = int(actor_ns)
+        after = int(driver_after_ns)
+        if after < before:
+            raise ValueError("actor clock calibration observed a negative round trip")
+        round_trip_ns = after - before
+        driver_midpoint_ns = (before + after) // 2
+        candidates.append(
+            (
+                round_trip_ns,
+                driver_midpoint_ns - actor_time,
+                (round_trip_ns + 1) // 2,
+            )
+        )
+    _round_trip_ns, offset_ns, uncertainty_ns = min(
+        candidates, key=lambda item: (item[0], item[2], item[1])
+    )
+    return offset_ns, uncertainty_ns
+
+
+def _calibrate_profile_actor_clocks(
+    actors: Mapping[int, Any], *, samples: int = 9
+) -> dict[int, tuple[int, int]]:
+    """Calibrate arbitrary Ray actors to this program driver's clock."""
+
+    if int(samples) <= 0:
+        raise ValueError("actor clock calibration sample count must be positive")
+    result: dict[int, tuple[int, int]] = {}
+    for raw_rank, actor in sorted(actors.items()):
+        observations = []
+        for _ in range(int(samples)):
+            driver_before_ns = time.monotonic_ns()
+            actor_ns = int(ray.get(actor.profile_clock_sample.remote()))
+            driver_after_ns = time.monotonic_ns()
+            observations.append(
+                (driver_before_ns, actor_ns, driver_after_ns)
+            )
+        result[int(raw_rank)] = _select_actor_clock_calibration(observations)
+    return result
+
+
 def piper_profile_dags(
     loss_fn,
     config: ProfileConfig | None = None,
@@ -1586,11 +2293,19 @@ def piper_profile_dags(
     profile_configs: Mapping[str, ProfileConfig] | None = None,
     output_path: str | None = None,
     measure_uninstrumented_modes: bool = False,
+    trace_output_dir: str | None = None,
+    trace_ranks: Sequence[int] | None = None,
 ) -> ProfiledTrainingPlan:
-    """Collect and merge one or more timing modes across every actor.
+    """Profile Piper nodes with Kineto/CUPTI and merge a replay plan.
 
-    The program driver launches all actors for every configured iteration and
-    merges their rank-local profile results into one durable plan.
+    Piper intentionally does *not* insert CUDA timing events around individual
+    nodes here: those events alter the concurrent-stream schedule being
+    measured.  Kineto correlates GPU activity to the existing node
+    ``record_function`` ranges.  The simulator subsequently derives every
+    execution start from its DAG dependencies and stream FIFO ordering.
+    Cross-actor-aligned activity offsets are collected only to decompose a
+    collective's measured endpoint interval into rendezvous wait and service;
+    they are not replay release constraints.
     """
     base_config = config or ProfileConfig()
     requested_modes = tuple(
@@ -1601,168 +2316,397 @@ def piper_profile_dags(
             else tuple(profile_configs or (INTERFERENCE_FREE_PROFILE_MODE,))
         )
     )
-    if not requested_modes:
-        raise ValueError("piper_profile_dags requires at least one profile mode")
-    if len(set(requested_modes)) != len(requested_modes):
-        raise ValueError(f"duplicate profile modes requested: {requested_modes!r}")
+    if not requested_modes or len(set(requested_modes)) != len(requested_modes):
+        raise ValueError(f"invalid requested profile modes: {requested_modes!r}")
     configs: dict[str, ProfileConfig] = {}
     for mode in requested_modes:
         selected = (profile_configs or {}).get(mode, base_config)
-        if mode == NORMAL_PROFILE_MODE and (
-            selected.isolation_scope != DEFAULT_NORMAL_SCOPE
-        ):
+        if mode == NORMAL_PROFILE_MODE and selected.isolation_scope != DEFAULT_NORMAL_SCOPE:
             selected = replace(selected, isolation_scope=DEFAULT_NORMAL_SCOPE)
         configs[mode] = selected
 
     actors = piper_metadata.actors
-    if not actors:
-        raise RuntimeError("piper_setup() must create actors before profiling")
-    if not piper_metadata.per_pp_training_dags:
-        raise RuntimeError("piper_setup() must finalize TrainingDAGs before profiling")
+    if not actors or not piper_metadata.per_pp_training_dags:
+        raise RuntimeError("piper_setup() must finalize actors and TrainingDAGs before profiling")
+    receive_spec_shards = ray.get([
+        actor.p2p_receive_specs.remote() for actor in actors.values()
+    ])
+    forward_specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]] = {}
+    for shard in receive_spec_shards:
+        for comm_id, specs in shard.items():
+            forward_specs_by_comm_id.setdefault(comm_id, specs)
+    forward_specs_by_edge: dict[tuple[str, str], list[tuple[tuple[int, ...], str]]] = {}
+    forward_uid_by_backward_uid: dict[str, str] = {}
+    for dag in piper_metadata.per_pp_training_dags:
+        for node in dag.nodes.values():
+            if node.node_kind == "COMPUTE" and node.compute_subkind in {"BWD", "BWD_I", "BWD_W"}:
+                fwd_uid = node.node_meta.get("fwd_uid")
+                if fwd_uid is not None:
+                    forward_uid_by_backward_uid[node.uid] = str(fwd_uid)
+            comm_id = str(node.node_meta.get("comm_id", ""))
+            if node.node_kind == "RECV_COMM" and node.tag.get("PASS") == "F" and comm_id in forward_specs_by_comm_id:
+                forward_specs_by_edge[(str(node.node_meta["from_uid"]), str(node.node_meta["to_uid"]))] = forward_specs_by_comm_id[comm_id]
+    p2p_specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]] = {}
+    for dag in piper_metadata.per_pp_training_dags:
+        for node in dag.nodes.values():
+            if node.node_kind not in {"SEND_COMM", "RECV_COMM"}:
+                continue
+            comm_id = str(node.node_meta["comm_id"])
+            if node.tag.get("PASS") == "F":
+                specs = forward_specs_by_comm_id.get(comm_id)
+            else:
+                source = forward_uid_by_backward_uid.get(str(node.node_meta["from_uid"]))
+                target = forward_uid_by_backward_uid.get(str(node.node_meta["to_uid"]))
+                specs = (
+                    None if source is None or target is None
+                    else forward_specs_by_edge.get((target, source))
+                )
+            if specs is None:
+                raise RuntimeError(f"missing receiver payload metadata for P2P {comm_id}")
+            p2p_specs_by_comm_id[comm_id] = specs
+    # Bucketing can leave large unused cached blocks after the measured
+    # training steps.  Release them before allocating the standalone P2P
+    # payloads so the microprofile does not fail from allocator fragmentation.
+    # This happens outside every measured interval and does not affect either
+    # policy's recorded node times.
+    ray.get([
+        actor.clear_profile_allocator_cache.remote()
+        for actor in actors.values()
+    ])
+    local_p2p_baseline_shards = ray.get([
+        actor.profile_p2p_transfer_baselines.remote(p2p_specs_by_comm_id)
+        for actor in actors.values()
+    ])
+    local_p2p_baselines = {
+        comm_id: max(shard[comm_id] for shard in local_p2p_baseline_shards if comm_id in shard)
+        for comm_id in p2p_specs_by_comm_id
+    }
 
-    store = piper_metadata.compiled_data_store
-    if store is None:
-        from .compile import _COMPILED_DATA_ACTOR
-
-        store = ray.get_actor(_COMPILED_DATA_ACTOR)
-        piper_metadata.compiled_data_store = store
-
-    actor_results = []
-    step_samples_us_by_mode: dict[str, list[float]] = {}
+    local_results = []
+    local_instrumented_step_samples_us: dict[str, tuple[float, ...]] = {}
+    requested_repeat_counts = {
+        int(configs[mode].repeat_iters) for mode in requested_modes
+    }
+    # CUPTI can very occasionally omit one activity in an otherwise complete
+    # node range.  Capture a few spare whole steps so those corrupt paired
+    # samples can be rejected without weakening exact activity validation.
+    kineto_spare_iters = (
+        6
+        if set(requested_modes)
+        == {INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE}
+        and len(requested_repeat_counts) == 1
+        else 0
+    )
+    # Every policy must profile the same training state.  Restoring only at a
+    # policy boundary is insufficient for data-dependent MoE kernels: small
+    # numerical differences between the normal and IF schedules accumulate
+    # across optimizer steps, alter expert token counts, and make grouped GEMM
+    # dispatch different CUTLASS kernels.  Capture once, then restore before
+    # every warmup/profile occurrence outside its timed interval.  This makes
+    # each occurrence a repeat measurement of the same logical CUDA work.
+    ray.get([
+        actor.capture_profile_training_state.remote()
+        for actor in actors.values()
+    ])
     for mode in requested_modes:
         mode_config = configs[mode]
-        # Give every actor a mapping to the same coordinator-owned monotonic
-        # clock before collecting CUDA timeline origins for this mode.
+        clock_calibrations = _calibrate_profile_actor_clocks(actors)
         ray.get([
-            actor.calibrate_profile_clock.remote(store)
+            actor.restore_profile_training_state.remote()
             for actor in actors.values()
         ])
+        ray.get([actor.synchronize_device.remote() for actor in actors.values()])
         ray.get([
-            actor.reset_profile_samples.remote(profile_mode=mode)
-            for actor in actors.values()
-        ])
-        for _ in range(mode_config.warmup_iters):
-            ray.get([
-                actor.profile_run_dag.remote(
-                    loss_fn=loss_fn,
-                    record=False,
-                    profile_mode=mode,
-                )
-                for actor in actors.values()
-            ])
-
-        # Memory-tight workloads can leave large, fragmented cached regions
-        # after warmup.  Release only unused blocks before starting the timed
-        # series; this call is outside every measured interval.
-        ray.get([
-            actor.clear_profile_allocator_cache.remote()
-            for actor in actors.values()
-        ])
-
-        step_samples_us: list[float] = []
-        for _ in range(mode_config.repeat_iters):
-            started = time.perf_counter()
-            ray.get([
-                actor.profile_run_dag.remote(
-                    loss_fn=loss_fn,
-                    record=True,
-                    profile_mode=mode,
-                )
-                for actor in actors.values()
-            ])
-            step_samples_us.append((time.perf_counter() - started) * 1_000_000.0)
-
-        step_samples_us_by_mode[mode] = step_samples_us
-        actor_results.extend(
-            ray.get([
-                actor.get_profile_result.remote(
-                    estimator=mode_config.estimator,
-                    profile_mode=mode,
-                )
-                for actor in actors.values()
-            ])
-        )
-
-    # CUDA events around every node perturb launch timing and can materially
-    # change overlap.  When requested, measure the two stream policies again
-    # without per-node events.  Alternate their order on every sample so
-    # allocator/cache drift is balanced instead of being attributed to one
-    # mode.  Actor-side synchronization makes each driver wall sample cover
-    # the work just launched rather than the preceding asynchronous step.
-    uninstrumented_step_samples_us_by_mode: dict[str, list[float]] = {}
-    if measure_uninstrumented_modes:
-        uninstrumented_step_samples_us_by_mode = {
-            mode: [] for mode in requested_modes
-        }
-        max_warmups = max(configs[mode].warmup_iters for mode in requested_modes)
-        for warmup_index in range(max_warmups):
-            order = (
-                requested_modes
-                if warmup_index % 2 == 0
-                else tuple(reversed(requested_modes))
+            actors[rank].start_cupti_node_profiler.remote(
+                warmup_iters=mode_config.warmup_iters,
+                active_iters=mode_config.repeat_iters + kineto_spare_iters,
+                coordinator_clock_offset_ns=clock_calibrations[rank][0],
+                clock_sync_uncertainty_ns=clock_calibrations[rank][1],
             )
-            for mode in order:
-                if warmup_index >= configs[mode].warmup_iters:
-                    continue
+            for rank in sorted(actors)
+        ])
+        mode_step_samples_us: list[float] = []
+        for iteration in range(
+            mode_config.warmup_iters
+            + mode_config.repeat_iters
+            + kineto_spare_iters
+        ):
+            ray.get([
+                actor.restore_profile_training_state.remote()
+                for actor in actors.values()
+            ])
+            active = iteration >= mode_config.warmup_iters
+            if active:
                 ray.get([
-                    actor.profile_run_dag.remote(
-                        loss_fn=loss_fn,
-                        record=False,
-                        synchronize=True,
-                        profile_mode=mode,
-                    )
+                    actor.synchronize_device.remote()
                     for actor in actors.values()
                 ])
-
-        max_repeats = max(configs[mode].repeat_iters for mode in requested_modes)
-        for sample_index in range(max_repeats):
-            order = (
-                requested_modes
-                if sample_index % 2 == 0
-                else tuple(reversed(requested_modes))
-            )
-            for mode in order:
-                if sample_index >= configs[mode].repeat_iters:
-                    continue
                 started = time.perf_counter()
+            ray.get([
+                actor.profile_run_dag.remote(
+                    loss_fn=loss_fn,
+                    synchronize_before=not active,
+                    profile_mode=mode,
+                    advance_profiler=False,
+                    # Allocator snapshots are diagnostics, not part of the
+                    # represented training step.  In particular,
+                    # memory_snapshot() can dominate short-kernel schedules.
+                    capture_allocator_stats=False,
+                )
+                for actor in actors.values()
+            ])
+            if active:
                 ray.get([
-                    actor.profile_run_dag.remote(
-                        loss_fn=loss_fn,
-                        record=False,
-                        synchronize=True,
-                        profile_mode=mode,
-                    )
+                    actor.synchronize_device.remote()
                     for actor in actors.values()
                 ])
-                uninstrumented_step_samples_us_by_mode[mode].append(
+                mode_step_samples_us.append(
                     (time.perf_counter() - started) * 1_000_000.0
                 )
+            # Keep the profiler state transition and final Kineto flush outside
+            # the same-ID synchronized step interval used by validation 4.
+            ray.get([
+                actor.step_pytorch_profiler.remote()
+                for actor in actors.values()
+            ])
+        local_instrumented_step_samples_us[mode] = tuple(
+            mode_step_samples_us
+        )
+        local_results.extend(ray.get([
+            actor.stop_cupti_profile_result.remote(
+                estimator=mode_config.estimator,
+                profile_mode=mode,
+                p2p_baselines_by_comm_id=local_p2p_baselines,
+                trace_output_dir=trace_output_dir,
+                trace_ranks=(
+                    None
+                    if trace_ranks is None
+                    else tuple(int(rank) for rank in trace_ranks)
+                ),
+            )
+            for actor in actors.values()
+        ]))
 
-    # A later profiling call replaces, rather than mixes with, old samples.
+    # Profiling is observational: leave the actors at the state at which the
+    # paired capture began rather than after the final policy's optimizer steps.
+    ray.get([
+        actor.restore_profile_training_state.remote()
+        for actor in actors.values()
+    ])
+
+    # Keep policy-level wall-clock measurements separate from node timing.
+    # They are diagnostics only; node durations above remain CUPTI-derived.
+    local_uninstrumented_step_samples_us: dict[str, tuple[float, ...]] = {}
+    if measure_uninstrumented_modes:
+        local_uninstrumented_step_samples_us = piper_measure_profile_modes(
+            loss_fn,
+            warmup_iters=max(configs[mode].warmup_iters for mode in requested_modes),
+            repeat_iters=max(configs[mode].repeat_iters for mode in requested_modes),
+            profile_modes=requested_modes,
+        )
+
+    all_results = local_results
+    compare_both_modes = set(requested_modes) == {
+        INTERFERENCE_FREE_PROFILE_MODE,
+        NORMAL_PROFILE_MODE,
+    }
+    raw_activity_equivalence = (
+        _compare_kineto_activity_signatures(all_results)
+        if compare_both_modes
+        else {
+            "comparison": "not_applicable_single_profile_mode",
+            "exact_match": True,
+            "accepted": True,
+            "capture_loss_only": False,
+            "capture_loss_within_tolerance": False,
+            "capture_loss_rate": 0.0,
+            "capture_loss_threshold": _MAX_KINETO_CAPTURE_LOSS_RATE,
+            "expected_cpu_launch_records": 0,
+            "missing_cpu_launch_records": 0,
+            "cpu_launch_loss_rate": 0.0,
+            "cpu_launch_loss_threshold": (
+                _MAX_KINETO_CPU_LAUNCH_LOSS_RATE
+            ),
+            "expected_gpu_activity_records": 0,
+            "missing_gpu_activity_records": 0,
+            "actors_compared": 0,
+            "nodes_compared": 0,
+            "node_ranges_compared": 0,
+            "gpu_activities_compared": 0,
+            "mismatched_nodes": 0,
+            "mismatched_node_ranges": 0,
+            "missing_mode_ranks": {
+                INTERFERENCE_FREE_PROFILE_MODE: [],
+                NORMAL_PROFILE_MODE: [],
+            },
+            "mismatches": [],
+        }
+    )
+    nonexact_iteration_ids = sorted({
+        int(item["occurrence"])
+        for mismatch in raw_activity_equivalence.get("mismatches", ())
+        for item in mismatch.get("ranges", ())
+        if item.get("occurrence") is not None
+    })
+    unfilterable_mismatches = [
+        mismatch
+        for mismatch in raw_activity_equivalence.get("mismatches", ())
+        if not mismatch.get("ranges")
+    ]
+    requested_iterations = (
+        next(iter(requested_repeat_counts))
+        if len(requested_repeat_counts) == 1
+        else 0
+    )
+    captured_iterations = min(
+        (
+            len(profile.samples_us)
+            for result in all_results
+            for profile in result.node_profiles.values()
+            if profile.executed
+        ),
+        default=0,
+    )
+    retained_iteration_ids = [
+        index
+        for index in range(captured_iterations)
+        if index not in set(nonexact_iteration_ids)
+    ][:requested_iterations]
+    can_select_exact = (
+        kineto_spare_iters > 0
+        and not any(raw_activity_equivalence["missing_mode_ranks"].values())
+        and not unfilterable_mismatches
+        and len(retained_iteration_ids) == requested_iterations
+    )
+    if can_select_exact:
+        selection_policy = "globally_exact_spare_filter"
+        all_results = _filter_kineto_profile_iterations(
+            all_results, retained_iteration_ids
+        )
+        activity_equivalence = _compare_kineto_activity_signatures(all_results)
+    else:
+        selection_policy = (
+            "deterministic_requested_prefix"
+            if requested_iterations > 0
+            else "all_captured_iterations"
+        )
+        retained_iteration_ids = list(range(
+            min(captured_iterations, requested_iterations)
+            if requested_iterations > 0
+            else captured_iterations
+        ))
+        if len(retained_iteration_ids) != captured_iterations:
+            all_results = _filter_kineto_profile_iterations(
+                all_results, retained_iteration_ids
+            )
+            activity_equivalence = _compare_kineto_activity_signatures(
+                all_results
+            )
+        else:
+            activity_equivalence = raw_activity_equivalence
+        if compare_both_modes:
+            raw_capture_accepted = bool(
+                raw_activity_equivalence.get("exact_match", False)
+                or raw_activity_equivalence.get(
+                    "capture_loss_within_tolerance", False
+                )
+            )
+            retained_capture_accepted = bool(
+                activity_equivalence.get("exact_match", False)
+                or activity_equivalence.get(
+                    "capture_loss_within_tolerance", False
+                )
+            )
+            activity_equivalence["raw_capture_accepted"] = (
+                raw_capture_accepted
+            )
+            activity_equivalence["accepted"] = bool(
+                raw_capture_accepted and retained_capture_accepted
+            )
+    _strip_kineto_comparison_details(all_results)
+    from .profile_validation import validate_kineto_profile_results
+
+    kineto_validation = validate_kineto_profile_results(
+        all_results,
+        activity_equivalence,
+        raise_on_error=False,
+    )
     for dag in piper_metadata.per_pp_training_dags:
         dag.prologue_profile_times_by_mode.clear()
         for node in dag.nodes.values():
             node.profile_times_by_mode.clear()
     plan = merge_actor_profiles(
         piper_metadata.per_pp_training_dags,
-        actor_results,
+        all_results,
         profile_configs=configs,
         topology=dict(getattr(piper_metadata, "schedule_info", {}) or {}),
     )
-    plan.profile_metadata["instrumented_global_step_samples_us_by_mode"] = {
-        mode: list(step_samples_us_by_mode[mode])
+    plan.profile_metadata["timing_source"] = "kineto_cupti"
+    plan.profile_metadata["kineto_activity_equivalence"] = activity_equivalence
+    plan.profile_metadata["kineto_raw_activity_equivalence"] = (
+        raw_activity_equivalence
+    )
+    plan.profile_metadata["kineto_sample_rejection"] = {
+        "captured_iterations": captured_iterations,
+        "requested_iterations": requested_iterations,
+        "spare_iterations": kineto_spare_iters,
+        "selection_policy": selection_policy,
+        "nonexact_iteration_ids": nonexact_iteration_ids,
+        "rejected_iteration_ids": [
+            index for index in range(captured_iterations)
+            if index not in set(retained_iteration_ids)
+        ],
+        "retained_iteration_ids": retained_iteration_ids,
+        "unused_spare_iteration_ids": [
+            index
+            for index in range(captured_iterations)
+            if index not in set(retained_iteration_ids)
+        ],
+        "raw_mismatched_node_ranges": int(
+            raw_activity_equivalence.get("mismatched_node_ranges", 0)
+        ),
+        "retained_exact_activity_match": bool(
+            activity_equivalence.get("exact_match", False)
+        ),
+        "retained_capture_loss_rate": float(
+            activity_equivalence.get("capture_loss_rate", 0.0)
+        ),
+        "retained_capture_loss_accepted": bool(
+            activity_equivalence.get("accepted", False)
+            and not activity_equivalence.get("exact_match", False)
+        ),
+    }
+    plan.profile_metadata["automatic_validations"] = {
+        "kineto_activity_and_timing": kineto_validation,
+    }
+    plan.profile_metadata[
+        "instrumented_global_step_samples_us_by_mode"
+    ] = {
+        mode: [
+            float(local_instrumented_step_samples_us[mode][index])
+            for index in retained_iteration_ids
+        ]
         for mode in requested_modes
     }
     if measure_uninstrumented_modes:
-        plan.profile_metadata[
-            "uninstrumented_global_step_samples_us_by_mode"
-        ] = {
-            mode: list(uninstrumented_step_samples_us_by_mode[mode])
+        plan.profile_metadata["uninstrumented_global_step_samples_us_by_mode"] = {
+            mode: list(local_uninstrumented_step_samples_us.get(mode, ()))
             for mode in requested_modes
         }
+    if output_path is not None:
+        plan.profile_metadata["profile_output_path"] = str(
+            Path(output_path).resolve()
+        )
     piper_metadata.profiled_training_plan = plan
     if output_path is not None:
         plan.save_json(output_path)
+    if not kineto_validation["passed"]:
+        from .profile_validation import ProfileAndSimulateValidationError
+
+        raise ProfileAndSimulateValidationError(
+            "Kineto profile validation failed: "
+            + "; ".join(kineto_validation["errors"][:8])
+        )
     return plan
 
 
@@ -1797,13 +2741,21 @@ def piper_measure_profile_modes(
     if not actors:
         raise RuntimeError("piper_setup() must create actors before mode timing")
 
+    samples: dict[str, list[float]] = {mode: [] for mode in modes}
+    ray.get([
+        actor.capture_profile_training_state.remote()
+        for actor in actors.values()
+    ])
     for mode in modes:
+        ray.get([
+            actor.restore_profile_training_state.remote()
+            for actor in actors.values()
+        ])
         ray.get([actor.synchronize_device.remote() for actor in actors.values()])
         for _ in range(int(warmup_iters)):
             ray.get([
                 actor.profile_run_dag.remote(
                     loss_fn=loss_fn,
-                    record=False,
                     synchronize_before=False,
                     synchronize=False,
                     profile_mode=mode,
@@ -1811,11 +2763,7 @@ def piper_measure_profile_modes(
                 for actor in actors.values()
             ])
         ray.get([actor.synchronize_device.remote() for actor in actors.values()])
-
-    samples: dict[str, list[float]] = {mode: [] for mode in modes}
-    for iteration in range(int(repeat_iters)):
-        order = modes if iteration % 2 == 0 else tuple(reversed(modes))
-        for mode in order:
+        for _ in range(int(repeat_iters)):
             ray.get([
                 actor.synchronize_device.remote() for actor in actors.values()
             ])
@@ -1824,7 +2772,6 @@ def piper_measure_profile_modes(
                 ray.get([
                     actor.profile_run_dag.remote(
                         loss_fn=loss_fn,
-                        record=False,
                         synchronize_before=False,
                         synchronize=False,
                         profile_mode=mode,
@@ -1839,6 +2786,10 @@ def piper_measure_profile_modes(
                 * 1_000_000.0
                 / int(block_iters)
             )
+    ray.get([
+        actor.restore_profile_training_state.remote()
+        for actor in actors.values()
+    ])
     return {mode: tuple(values) for mode, values in samples.items()}
 
 
@@ -1872,6 +2823,26 @@ def simulate_profiled_modes(
         plan = getattr(piper_metadata, "profiled_training_plan", None)
     if plan is None:
         raise RuntimeError("piper_profile_dags() must run before simulation")
+    from .profile_validation import ProfileAndSimulateValidationError
+
+    kineto_validation = plan.profile_metadata.get(
+        "automatic_validations", {}
+    ).get("kineto_activity_and_timing")
+    activity_equivalence = plan.profile_metadata.get(
+        "kineto_activity_equivalence"
+    )
+    if kineto_validation is not None and not kineto_validation.get(
+        "passed", False
+    ):
+        raise ProfileAndSimulateValidationError(
+            "saved Kineto activity/timing validation did not pass"
+        )
+    if activity_equivalence is not None and not activity_equivalence.get(
+        "accepted", activity_equivalence.get("exact_match", False)
+    ):
+        raise ProfileAndSimulateValidationError(
+            "saved normal/IF Kineto activity-equivalence validation did not pass"
+        )
     from .simulator import simulate_profile_modes
 
     actual_us = (
@@ -1879,11 +2850,112 @@ def simulate_profiled_modes(
         if actual_step_samples_s is None
         else tuple(float(sample) * 1_000_000.0 for sample in actual_step_samples_s)
     )
-    return simulate_profile_modes(
+    comparison = simulate_profile_modes(
         plan,
         actual_step_samples_us=actual_us,
         **simulation_kwargs,
     )
+    from .profile_validation import (
+        build_and_validate_attributed_trace,
+        validate_measured_normal_samples,
+        validate_simulation_endpoints,
+    )
+
+    endpoint_validation = validate_simulation_endpoints(comparison)
+    if endpoint_validation is not None:
+        from .attribution import attribute_profile_mode_savings
+
+        # One deterministic order is sufficient for the mandatory structural
+        # validation because it must telescope exactly to the replay endpoint.
+        # The report consumes only the order-invariant net checksum; higher-
+        # sample Shapley attribution remains available through the offline CLI.
+        attribution = attribute_profile_mode_savings(
+            plan,
+            permutations=1,
+            seed=0,
+            antithetic=False,
+            strict=bool(simulation_kwargs.get("strict", True)),
+        )
+        endpoint_validation.update({
+            "attribution_features": len(attribution.features),
+            "attribution_permutations": attribution.permutations,
+            "attribution_step_time_estimator": (
+                attribution.step_time_estimator
+            ),
+            "attribution_sample_iteration_ids": list(
+                attribution.sample_iteration_ids
+            ),
+            "normal_step_time_us": attribution.normal_step_time_us,
+            "interference_free_step_time_us": (
+                attribution.interference_free_step_time_us
+            ),
+            "attributed_step_savings_us": (
+                attribution.attributed_step_savings_us
+            ),
+            "additivity_residual_us": attribution.additivity_residual_us,
+            "positive_exposed_step_savings_us": (
+                attribution.positive_exposed_step_savings_us
+            ),
+            "negative_exposed_step_savings_us": (
+                attribution.negative_exposed_step_savings_us
+            ),
+            "net_exposed_step_savings_us": (
+                attribution.net_exposed_step_savings_us
+            ),
+            "net_exposed_step_savings_pct": (
+                attribution.net_exposed_step_savings_pct
+            ),
+            "exposed_savings_validation_residual_us": (
+                attribution.exposed_savings_validation_residual_us
+            ),
+        })
+        trace, trace_validation = build_and_validate_attributed_trace(
+            comparison.normal,
+            attribution,
+        )
+        measured_validation = validate_measured_normal_samples(
+            plan,
+            comparison,
+            warning_threshold_pct=2.0,
+        )
+        automatic = plan.profile_metadata.setdefault(
+            "automatic_validations", {}
+        )
+        automatic["simulation_endpoints"] = endpoint_validation
+        automatic["attributed_trace_losslessness"] = trace_validation
+        automatic["measured_vs_simulated_normal"] = measured_validation
+
+        warning = measured_validation.get("warning")
+        if warning:
+            logger.warning("profile-and-simulate validation: %s", warning)
+            warnings.warn(
+                f"profile-and-simulate validation: {warning}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        output_value = plan.profile_metadata.get("profile_output_path")
+        if output_value:
+            profile_path = Path(str(output_value))
+            output_dir = profile_path.parent
+            attribution_path = output_dir / "savings_attribution.json"
+            trace_path = output_dir / "savings_attribution_trace.json"
+            validation_path = output_dir / "profile_and_simulate_validation.json"
+            attribution_path.write_text(
+                json.dumps(attribution.to_dict(), indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            trace_path.write_text(
+                json.dumps(trace, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            validation_path.write_text(
+                json.dumps(automatic, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            plan.save_json(profile_path)
+    return comparison
 
 
 def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:

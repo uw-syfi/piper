@@ -2,9 +2,13 @@ import ray
 import torch
 import os
 import re
+import hashlib
+import json
+import tempfile
 import time
 from typing import Any
 import gc
+import statistics
 from datetime import timedelta
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
 import torch.distributed as dist
@@ -36,6 +40,7 @@ from .profiling import (
     ActorProfileResult,
     DEFAULT_NORMAL_SCOPE,
     DEFAULT_ISOLATION_SCOPE,
+    INTERFERENCE_FREE_PROFILE_MODE,
     NodeProfile,
     PROFILE_MODES,
     finalized_dag_fingerprint,
@@ -55,94 +60,595 @@ CLEANUP_MEMORY = False
 logger = create_logger("actor", LOG_LEVEL)
 
 
-class _CudaEventTimingRecorder:
-    """Collect one CUDA-event sample for every dispatched DAG node."""
+_KINETO_ITERATION_ANCHOR_PREFIX = "piper_profile_timeline_anchor:"
 
-    def __init__(
-        self,
-        *,
-        coordinator_clock_offset_ns: int = 0,
-        clock_sync_uncertainty_ns: int = 0,
-    ) -> None:
-        self._node_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
-        self._active_node_starts: dict[str, torch.cuda.Event] = {}
-        self._prologue_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
-        self._prologue_start: torch.cuda.Event | None = None
-        self.node_samples_us: dict[str, float] = {}
-        self.node_start_offsets_us: dict[str, float] = {}
-        self.prologue_sample_us: float | None = None
-        self.timeline_origin_us: float | None = None
-        self.timeline_origin_uncertainty_us: float | None = None
-        self._coordinator_clock_offset_ns = int(coordinator_clock_offset_ns)
-        self._clock_sync_uncertainty_ns = int(clock_sync_uncertainty_ns)
+def _kineto_node_attribution_audit(
+    profiler,
+    *,
+    trace_path: str | None = None,
+    timeline_anchor_origins: dict[str, tuple[float, float]] | None = None,
+    expected_timeline_anchors: int | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[float, ...]]]:
+    """Audit CUDA launch/activity correlation for every Piper node range."""
 
-    @staticmethod
-    def _event() -> torch.cuda.Event:
-        return torch.cuda.Event(enable_timing=True)
+    def merge_intervals(
+        intervals: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        merged: list[tuple[float, float]] = []
+        for start, end in sorted(intervals):
+            if end <= start:
+                continue
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        return merged
 
-    def before_prologue(self, stream: torch.cuda.Stream) -> None:
-        start = self._event()
-        host_before_ns = time.monotonic_ns()
-        start.record(stream)
-        # Profiling starts from an idle device.  Synchronizing this one anchor
-        # event maps the actor-local CUDA timeline to the coordinator's
-        # calibrated monotonic clock without synchronizing any timed node.
-        start.synchronize()
-        host_after_ns = time.monotonic_ns()
-        host_midpoint_ns = (host_before_ns + host_after_ns) // 2
-        self.timeline_origin_us = (
-            host_midpoint_ns + self._coordinator_clock_offset_ns
-        ) / 1000.0
-        self.timeline_origin_uncertainty_us = (
-            (host_after_ns - host_before_ns) / 2.0
-            + self._clock_sync_uncertainty_ns
-        ) / 1000.0
-        self._prologue_start = start
+    def interval_total(intervals: list[tuple[float, float]]) -> float:
+        return sum(end - start for start, end in intervals)
 
-    def after_prologue(self, stream: torch.cuda.Stream) -> None:
-        if self._prologue_start is None:
-            raise RuntimeError("profile recorder saw prologue end before start")
-        end = self._event()
-        end.record(stream)
-        self._prologue_events = (self._prologue_start, end)
-        self._prologue_start = None
+    def normalized_launch_operation(name: str) -> str | None:
+        lowered = name.lower()
+        if "memcpy" in lowered:
+            return "memcpy"
+        if "memset" in lowered:
+            return "memset"
+        if "launch" in lowered:
+            return "kernel"
+        return None
+    delete_trace = trace_path is None
+    if trace_path is None:
+        with tempfile.NamedTemporaryFile(suffix=".kineto.json", delete=False) as tmp:
+            trace_path = tmp.name
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(trace_path)), exist_ok=True)
+    try:
+        profiler.export_chrome_trace(trace_path)
+        with open(trace_path, "r", encoding="utf-8") as handle:
+            events = json.load(handle).get("traceEvents", [])
+    finally:
+        if delete_trace:
+            try:
+                os.unlink(trace_path)
+            except FileNotFoundError:
+                pass
 
-    def before_node(self, node: Any, stream: torch.cuda.Stream) -> None:
-        start = self._event()
-        start.record(stream)
-        self._active_node_starts[str(node.uid)] = start
-
-    def after_node(self, node: Any, stream: torch.cuda.Stream) -> None:
-        uid = str(node.uid)
-        try:
-            start = self._active_node_starts.pop(uid)
-        except KeyError as exc:
-            raise RuntimeError(f"profile recorder saw node end before start: {uid}") from exc
-        end = self._event()
-        end.record(stream)
-        self._node_events[uid] = (start, end)
-
-    def finish(self) -> None:
-        if self._active_node_starts:
+    supplied_timeline_anchors = dict(timeline_anchor_origins or {})
+    captured_timeline_anchors: list[
+        tuple[float, float, str, Any, Any]
+    ] = []
+    seen_timeline_labels: set[str] = set()
+    for event in events:
+        name = str(event.get("name", ""))
+        if (
+            event.get("ph") != "X"
+            or event.get("cat") != "user_annotation"
+            or not name.startswith(_KINETO_ITERATION_ANCHOR_PREFIX)
+        ):
+            continue
+        start = event.get("ts")
+        duration = event.get("dur")
+        if not isinstance(start, (int, float)) or not isinstance(
+            duration, (int, float)
+        ):
             raise RuntimeError(
-                "profile recorder has unfinished nodes: "
-                f"{sorted(self._active_node_starts)}"
+                f"Kineto timeline anchor {name!r} has no numeric interval"
             )
-        self.node_samples_us = {
-            uid: float(start.elapsed_time(end)) * 1000.0
-            for uid, (start, end) in self._node_events.items()
-        }
-        if self._prologue_events is not None:
-            start, end = self._prologue_events
-            self.prologue_sample_us = float(start.elapsed_time(end)) * 1000.0
-            # CUDA events carry a device-wide timestamp even when recorded on
-            # different streams.  Reuse the existing events to capture exact
-            # rank-local GPU start positions without adding callbacks, events,
-            # or per-node synchronization to the hot path.
-            self.node_start_offsets_us = {
-                uid: float(start.elapsed_time(node_start)) * 1000.0
-                for uid, (node_start, _node_end) in self._node_events.items()
+        if name in seen_timeline_labels:
+            raise RuntimeError(f"duplicate Kineto timeline anchor {name!r}")
+        if name not in supplied_timeline_anchors:
+            raise RuntimeError(
+                f"Kineto captured unknown timeline anchor {name!r}"
+            )
+        seen_timeline_labels.add(name)
+        captured_timeline_anchors.append(
+            (
+                float(start),
+                float(start) + float(duration),
+                name,
+                event.get("pid"),
+                event.get("tid"),
+            )
+        )
+    captured_timeline_anchors.sort(key=lambda item: (item[0], item[2]))
+    if supplied_timeline_anchors:
+        if not captured_timeline_anchors:
+            raise RuntimeError("Kineto capture contains no profiling timeline anchors")
+        if (
+            expected_timeline_anchors is not None
+            and len(captured_timeline_anchors) != int(expected_timeline_anchors)
+        ):
+            raise RuntimeError(
+                "Kineto timeline anchor count does not match active iterations: "
+                f"captured={len(captured_timeline_anchors)}, "
+                f"expected={int(expected_timeline_anchors)}"
+            )
+    timeline_index_by_label = {
+        label: index
+        for index, (_start, _end, label, _pid, _tid) in enumerate(
+            captured_timeline_anchors
+        )
+    }
+    timeline_anchors_by_thread: dict[
+        tuple[Any, Any], list[tuple[float, float, str]]
+    ] = defaultdict(list)
+    for start, end, label, pid, tid in captured_timeline_anchors:
+        timeline_anchors_by_thread[(pid, tid)].append((start, end, label))
+
+    ranges_by_thread: dict[
+        tuple[Any, Any], list[tuple[float, float, str, int]]
+    ] = {}
+    range_records: dict[int, tuple[float, float, str]] = {}
+    timeline_label_by_range: dict[int, str] = {}
+    for event in events:
+        name = str(event.get("name", ""))
+        if (
+            event.get("ph") != "X"
+            or event.get("cat") != "user_annotation"
+            or ":uid" not in name
+        ):
+            continue
+        start = event.get("ts")
+        duration = event.get("dur")
+        if not isinstance(start, (int, float)) or not isinstance(duration, (int, float)):
+            continue
+        range_key = len(range_records)
+        record = (float(start), float(start) + float(duration), name)
+        range_records[range_key] = record
+        thread = (event.get("pid"), event.get("tid"))
+        enclosing_anchors = [
+            label
+            for anchor_start, anchor_end, label in timeline_anchors_by_thread.get(
+                thread, ()
+            )
+            if anchor_start <= record[0] and record[1] <= anchor_end
+        ]
+        if supplied_timeline_anchors and len(enclosing_anchors) != 1:
+            raise RuntimeError(
+                f"Kineto node range {name!r} must belong to exactly one timeline "
+                f"anchor, found {enclosing_anchors!r}"
+            )
+        if enclosing_anchors:
+            timeline_label_by_range[range_key] = enclosing_anchors[0]
+        ranges_by_thread.setdefault(thread, []).append(
+            (*record, range_key)
+        )
+    for ranges in ranges_by_thread.values():
+        ranges.sort()
+
+    external_id_to_range: dict[Any, int] = {}
+    ranges_by_label: dict[str, int] = defaultdict(int)
+    for ranges in ranges_by_thread.values():
+        for _, _, label, _ in ranges:
+            ranges_by_label[label] += 1
+
+    # Node ranges are sequential on each actor dispatch thread. Associate each
+    # nested CPU/CUDA-runtime event's external correlation ID with that range.
+    for thread, ranges in ranges_by_thread.items():
+        thread_events = sorted(
+            (
+                event for event in events
+                if (event.get("pid"), event.get("tid")) == thread
+                and event.get("ph") == "X"
+            ),
+            key=lambda event: float(event.get("ts", -1.0) or -1.0),
+        )
+        range_index = 0
+        for event in thread_events:
+            timestamp = event.get("ts")
+            if not isinstance(timestamp, (int, float)):
+                continue
+            while range_index < len(ranges) and ranges[range_index][1] < float(timestamp):
+                range_index += 1
+            if range_index >= len(ranges):
+                break
+            start, end, _, range_key = ranges[range_index]
+            if start <= float(timestamp) <= end:
+                external_id = (event.get("args") or {}).get("External id")
+                if external_id is not None:
+                    external_id_to_range[external_id] = range_key
+
+    launch_records_by_correlation: dict[
+        Any, list[tuple[float, float, str, str, int | None]]
+    ] = defaultdict(list)
+    launch_records_by_range: dict[
+        int | None, list[tuple[float, float, str, str, Any | None]]
+    ] = defaultdict(list)
+    for event in events:
+        if event.get("ph") != "X" or event.get("cat") not in {"cuda_runtime", "cuda_driver"}:
+            continue
+        event_name = str(event.get("name", ""))
+        if normalized_launch_operation(event_name) is None:
+            continue
+        args = event.get("args") or {}
+        range_key = external_id_to_range.get(args.get("External id"))
+        correlation = args.get("correlation")
+        start = event.get("ts")
+        duration = event.get("dur")
+        if isinstance(start, (int, float)) and isinstance(duration, (int, float)):
+            record = (
+                float(start),
+                float(start) + float(duration),
+                event_name,
+                str(event.get("cat", "")),
+                range_key,
+            )
+            launch_records_by_range[range_key].append((*record[:4], correlation))
+            if correlation is not None:
+                launch_records_by_correlation[correlation].append(record)
+
+    activity_count_by_label: dict[str, int] = defaultdict(int)
+    activity_time_by_label: dict[str, float] = defaultdict(float)
+    activity_types_by_label: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    activity_signatures_by_range: dict[
+        int, dict[tuple[str, str], int]
+    ] = defaultdict(lambda: defaultdict(int))
+    gpu_activity_records: list[
+        tuple[float, float, int | None, str, str, Any | None]
+    ] = []
+    for event in events:
+        category = event.get("cat")
+        if event.get("ph") != "X" or category not in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            continue
+        args = event.get("args") or {}
+        range_key = external_id_to_range.get(args.get("External id"))
+        start = event.get("ts")
+        duration = event.get("dur")
+        if isinstance(start, (int, float)) and isinstance(duration, (int, float)):
+            gpu_activity_records.append((
+                float(start),
+                float(start) + float(duration),
+                range_key,
+                str(category),
+                str(event.get("name", "")),
+                args.get("correlation"),
+            ))
+        if range_key is None:
+            continue
+        label = range_records[range_key][2]
+        activity_count_by_label[label] += 1
+        activity_types_by_label[label][str(category)] += 1
+        activity_signatures_by_range[range_key][
+            (str(category), str(event.get("name", "")))
+        ] += 1
+        if isinstance(duration, (int, float)):
+            activity_time_by_label[label] += float(duration)
+    audit: dict[str, dict[str, Any]] = {}
+    gpu_activity_records_by_range: dict[
+        int | None, list[tuple[float, float, int | None, str, str, Any | None]]
+    ] = defaultdict(list)
+    for record in gpu_activity_records:
+        gpu_activity_records_by_range[record[2]].append(record)
+    for label, range_count in ranges_by_label.items():
+        range_activity_signatures = []
+        label_launch_count = 0
+        label_matched_launch_count = 0
+        label_range_keys = sorted(
+            (
+                range_key for range_key, (start, _, record_label) in range_records.items()
+                if record_label == label
+            ),
+            key=lambda range_key: (range_records[range_key][0], range_key),
+        )
+        for occurrence, range_key in enumerate(label_range_keys):
+            def activity_launch_order(
+                record: tuple[
+                    float, float, int | None, str, str, Any | None
+                ],
+            ) -> tuple[float, float, float, str, str, str]:
+                correlation = record[5]
+                launch_records = launch_records_by_correlation.get(
+                    correlation, ()
+                )
+                # Cross-stream GPU start order is scheduling-dependent.  CPU
+                # launch order is the stable invariant that validates the two
+                # profile modes issued the same activity sequence.
+                launch_start = min(
+                    (launch[0] for launch in launch_records),
+                    default=record[0],
+                )
+                return (
+                    launch_start,
+                    record[0],
+                    record[1],
+                    record[3],
+                    record[4],
+                    "" if correlation is None else str(correlation),
+                )
+
+            target_records = sorted(
+                gpu_activity_records_by_range.get(range_key, []),
+                key=activity_launch_order,
+            )
+
+            raw_launches = launch_records_by_range.get(range_key, ())
+            launches_by_correlation: dict[
+                Any, list[tuple[float, float, str, str, Any | None]]
+            ] = defaultdict(list)
+            uncorrelated_launches = []
+            for launch in raw_launches:
+                correlation = launch[4]
+                if correlation is None:
+                    uncorrelated_launches.append(launch)
+                else:
+                    launches_by_correlation[correlation].append(launch)
+
+            activities_by_correlation: dict[
+                Any, list[tuple[float, float, int | None, str, str, Any | None]]
+            ] = defaultdict(list)
+            unmapped_activities = []
+            for activity in target_records:
+                correlation = activity[5]
+                if correlation is None or correlation not in launches_by_correlation:
+                    unmapped_activities.append({
+                        "category": activity[3],
+                        "name": activity[4],
+                        "reason": (
+                            "missing_correlation"
+                            if correlation is None
+                            else "no_occurrence_local_launch"
+                        ),
+                    })
+                else:
+                    activities_by_correlation[correlation].append(activity)
+
+            canonical_launches = []
+            for correlation, candidates in launches_by_correlation.items():
+                runtime_candidates = [
+                    launch for launch in candidates
+                    if launch[3] == "cuda_runtime"
+                ]
+                selected_candidates = runtime_candidates or candidates
+                selected = min(
+                    selected_candidates,
+                    key=lambda launch: (launch[0], launch[1], launch[2]),
+                )
+                operations = {
+                    normalized_launch_operation(launch[2])
+                    for launch in candidates
+                }
+                ambiguous_reasons = []
+                if len(selected_candidates) != 1:
+                    ambiguous_reasons.append("duplicate_canonical_callbacks")
+                if len(operations) != 1 or None in operations:
+                    ambiguous_reasons.append("inconsistent_operation_class")
+                activities_for_launch = sorted(
+                    activities_by_correlation.get(correlation, ()),
+                    key=lambda activity: (
+                        activity[0], activity[1], activity[3], activity[4]
+                    ),
+                )
+                canonical_launches.append({
+                    "_start": selected[0],
+                    "operation": normalized_launch_operation(selected[2]),
+                    "api_name": selected[2],
+                    "mapping_status": (
+                        "ambiguous" if ambiguous_reasons else "unambiguous"
+                    ),
+                    "ambiguity_reasons": ambiguous_reasons,
+                    "activities": [
+                        {"category": activity[3], "name": activity[4]}
+                        for activity in activities_for_launch
+                    ],
+                })
+            for launch in uncorrelated_launches:
+                canonical_launches.append({
+                    "_start": launch[0],
+                    "operation": normalized_launch_operation(launch[2]),
+                    "api_name": launch[2],
+                    "mapping_status": "ambiguous",
+                    "ambiguity_reasons": ["missing_correlation"],
+                    "activities": [],
+                })
+            canonical_launches.sort(
+                key=lambda launch: (
+                    launch["_start"], launch["operation"] or "", launch["api_name"]
+                )
+            )
+            for launch_index, launch in enumerate(canonical_launches):
+                launch.pop("_start")
+                launch["launch_index"] = launch_index
+            cpu_launch_sequence = [
+                str(launch["operation"]) for launch in canonical_launches
+            ]
+            launch_sequence_encoded = json.dumps(
+                cpu_launch_sequence, separators=(",", ":")
+            ).encode("utf-8")
+            launch_mapping_unambiguous = (
+                not unmapped_activities
+                and all(
+                    launch["mapping_status"] == "unambiguous"
+                    for launch in canonical_launches
+                )
+            )
+            matched_launch_count = sum(
+                bool(launch["activities"]) for launch in canonical_launches
+            )
+            label_launch_count += len(canonical_launches)
+            label_matched_launch_count += matched_launch_count
+
+            target_intervals = [
+                (start, end) for start, end, _, _, _, _ in target_records
+            ]
+            target_union = merge_intervals(target_intervals)
+            target_sum_us = interval_total(target_intervals)
+            target_union_us = interval_total(target_union)
+            target_envelope_us = (
+                0.0 if not target_union
+                else target_union[-1][1] - target_union[0][0]
+            )
+            timeline_label = timeline_label_by_range.get(range_key)
+            timeline_occurrence = (
+                None
+                if timeline_label is None
+                else timeline_index_by_label[timeline_label]
+            )
+            if timeline_label is None:
+                activity_start_offset_us = None
+                activity_end_offset_us = None
+                activity_timestamp_source = None
+            else:
+                anchor_start = captured_timeline_anchors[
+                    timeline_occurrence
+                ][0]
+                activity_start = (
+                    range_records[range_key][0]
+                    if not target_union
+                    else target_union[0][0]
+                )
+                activity_end = (
+                    activity_start if not target_union else target_union[-1][1]
+                )
+                activity_start_offset_us = activity_start - anchor_start
+                activity_end_offset_us = activity_end - anchor_start
+                if activity_start_offset_us < 0.0:
+                    raise RuntimeError(
+                        f"Kineto activity for node range {label!r} starts before "
+                        f"its iteration anchor by {-activity_start_offset_us:.3f} us"
+                    )
+                activity_timestamp_source = (
+                    "cpu_range_zero_activity"
+                    if not target_union
+                    else "correlated_gpu_activity"
+                )
+            entries = [
+                {
+                    "category": category,
+                    "name": name,
+                    "count": int(count),
+                }
+                for (category, name), count in sorted(
+                    activity_signatures_by_range.get(range_key, {}).items()
+                )
+            ]
+            encoded = json.dumps(
+                entries, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            activity_sequence = [
+                {"category": category, "name": name}
+                for _, _, _, category, name, _ in target_records
+            ]
+            sequence_encoded = json.dumps(
+                activity_sequence, separators=(",", ":")
+            ).encode("utf-8")
+            compact_signature = {
+                "occurrence": int(occurrence),
+                "activity_count": sum(entry["count"] for entry in entries),
+                "signature_sha256": hashlib.sha256(encoded).hexdigest(),
+                "activity_sequence_sha256": hashlib.sha256(
+                    sequence_encoded
+                ).hexdigest(),
+                "activity_time_sum_us": target_sum_us,
+                "activity_union_time_us": target_union_us,
+                "activity_intra_node_overlap_us": max(
+                    0.0, target_sum_us - target_union_us
+                ),
+                "activity_envelope_time_us": target_envelope_us,
+                "activity_idle_gap_us": max(
+                    0.0, target_envelope_us - target_union_us
+                ),
+                "timeline_occurrence": timeline_occurrence,
+                "activity_start_offset_us": activity_start_offset_us,
+                "activity_end_offset_us": activity_end_offset_us,
+                "activity_timestamp_source": activity_timestamp_source,
+                "cpu_launch_count": len(canonical_launches),
+                "matched_cpu_launch_count": matched_launch_count,
+                "cpu_launch_sequence_sha256": hashlib.sha256(
+                    launch_sequence_encoded
+                ).hexdigest(),
+                "launch_mapping_unambiguous": launch_mapping_unambiguous,
+                # Consumed centrally for per-launch normal/IF validation, then
+                # removed from the durable profile artifact.
+                "cpu_launch_sequence": cpu_launch_sequence,
+                "cpu_launches": canonical_launches,
+                "unmapped_activities": unmapped_activities,
+                # Consumed centrally for the exact IF/normal activity audit,
+                # then removed from the durable profile artifact.
+                "activities": entries,
+                "activity_sequence": activity_sequence,
             }
+            range_activity_signatures.append(compact_signature)
+        audit[label] = {
+            "range_count": int(range_count),
+            "launch_count": label_launch_count,
+            "matched_launch_count": label_matched_launch_count,
+            "unmatched_launch_count": (
+                label_launch_count - label_matched_launch_count
+            ),
+            "launch_coverage_pct": (
+                100.0
+                if not label_launch_count
+                else 100.0 * label_matched_launch_count / label_launch_count
+            ),
+            "gpu_activity_count": int(activity_count_by_label.get(label, 0)),
+            "gpu_activity_time_total_us": float(activity_time_by_label.get(label, 0.0)),
+            "gpu_activity_time_mean_us": (
+                float(activity_time_by_label.get(label, 0.0)) / range_count
+            ),
+            "gpu_activity_types": dict(activity_types_by_label.get(label, {})),
+            "range_activity_signatures": range_activity_signatures,
+        }
+        if captured_timeline_anchors:
+            occurrences = [
+                item.get("timeline_occurrence")
+                for item in range_activity_signatures
+            ]
+            expected_occurrences = list(range(len(captured_timeline_anchors)))
+            if occurrences != expected_occurrences:
+                raise RuntimeError(
+                    f"Kineto node range {label!r} does not cover every captured "
+                    f"timeline occurrence: got={occurrences!r}, "
+                    f"expected={expected_occurrences!r}"
+                )
+
+    timeline_origins_us = tuple(
+        float(supplied_timeline_anchors[label][0])
+        for _start, _end, label, _pid, _tid in captured_timeline_anchors
+    )
+    timeline_uncertainties_us = tuple(
+        float(supplied_timeline_anchors[label][1])
+        for _start, _end, label, _pid, _tid in captured_timeline_anchors
+    )
+    return audit, {
+        "timeline_origin_samples_us": timeline_origins_us,
+        "timeline_origin_uncertainty_samples_us": timeline_uncertainties_us,
+    }
+
+
+def _kineto_correlated_activity_envelope_samples_us(
+    measured: dict[str, Any],
+    *,
+    node_uid: str,
+) -> tuple[float, ...]:
+    """Return one correlated-GPU-activity envelope per node range.
+
+    ``torch.profiler.key_averages()`` does not recursively include every GPU
+    activity launched by nested Inductor/NCCL CPU operators in an enclosing
+    Piper ``record_function`` range.  The attribution audit follows CUPTI
+    external/correlation IDs explicitly.  Its per-occurrence first-activity-
+    start to last-activity-end envelope captures both the kernels and the
+    GPU-side gaps between them, which together determine node completion.
+    P2P nodes are replaced separately by an isolated directional microprofile
+    so their rendezvous waiting is not folded into transfer latency.
+    """
+    occurrences = tuple(measured.get("range_activity_signatures", ()))
+    range_count = int(measured.get("range_count", len(occurrences)))
+    if range_count <= 0 or len(occurrences) != range_count:
+        raise RuntimeError(
+            f"Kineto attribution for node {node_uid} has inconsistent range "
+            f"counts: range_count={range_count}, occurrences={len(occurrences)}"
+        )
+    try:
+        return tuple(
+            float(occurrence["activity_envelope_time_us"])
+            for occurrence in occurrences
+        )
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Kineto attribution for node {node_uid} has no correlated "
+            "GPU-activity envelope"
+        ) from exc
+
 
 def _disable_functorch_donated_buffers() -> None:
     import importlib
@@ -221,6 +727,7 @@ def _create_actors(
                 "NCCL_NET",
                 "NCCL_SOCKET_IFNAME",
                 "GLOO_SOCKET_IFNAME",
+                "KINETO_LOG_LEVEL",
                 "PIPER_PROCESS_GROUP_TIMEOUT_MINUTES",
             )
             if os.environ.get(name)
@@ -328,22 +835,6 @@ class PiperActor:
         self.profile_prepared_dag_executions: dict[
             str, PreparedDagExecution
         ] = {}
-        # Interference-free and normal profiles must never be combined:
-        # they answer different simulation questions from the same DAG.
-        self._profile_node_samples: dict[
-            str, dict[str, list[float]]
-        ] = {}
-        self._profile_node_start_offsets: dict[
-            str, dict[str, list[float]]
-        ] = {}
-        self._profile_prologue_samples: dict[str, list[float]] = {}
-        self._profile_timeline_origins_us: dict[str, list[float]] = {}
-        self._profile_timeline_origin_uncertainties_us: dict[
-            str, list[float]
-        ] = {}
-        self._profile_coordinator_clock_offset_ns = 0
-        self._profile_clock_sync_uncertainty_ns = 0
-
         self.buffers = BufferStore()
         self.events = EventStore()
         self.communication = CommunicationExecutor(self.runtime, self.stages, self.logger)
@@ -380,44 +871,169 @@ class PiperActor:
     def _nvtx_pop(self) -> None:
         self.runtime.nvtx_pop()
 
-    def start_pytorch_profiler(self, warmup_iters: int = 0) -> None:
-        """Begin a torch.profiler session spanning warmup and one active iteration.
+    def start_pytorch_profiler(
+        self,
+        *,
+        warmup_iters: int = 2,
+        active_iters: int = 1,
+        activities: tuple[str, ...] | None = None,
+    ) -> None:
+        """Begin a scheduled torch.profiler session at DAG boundaries.
 
         Each node's execution in DagExecutor is wrapped in a record_function
         labelled the same as its NVTX range, so the resulting trace identifies
         per-node work.
         """
-        if warmup_iters < 0:
-            raise ValueError("PyTorch profiler warmup iterations cannot be negative")
         if self.runtime.torch_profiler is not None:
             raise RuntimeError("PyTorch profiler is already running")
-
-        profile_kwargs = {
-            "activities": [
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+        if int(warmup_iters) < 0 or int(active_iters) <= 0:
+            raise ValueError("profiler warmup must be non-negative and active iterations positive")
+        activity_names = activities or ("cpu", "cuda")
+        activity_by_name = {
+            "cpu": torch.profiler.ProfilerActivity.CPU,
+            "cuda": torch.profiler.ProfilerActivity.CUDA,
         }
-        if warmup_iters:
-            profile_kwargs["schedule"] = torch.profiler.schedule(
-                wait=0,
-                warmup=warmup_iters,
-                active=1,
-                repeat=1,
-            )
-        self.runtime.torch_profiler = torch.profiler.profile(**profile_kwargs)
+        unknown = sorted(set(activity_names) - set(activity_by_name))
+        if unknown:
+            raise ValueError(f"unknown PyTorch profiler activities: {unknown}")
+        selected_activities = [activity_by_name[name] for name in activity_names]
+        if not selected_activities:
+            raise ValueError("at least one PyTorch profiler activity is required")
+        self.runtime.torch_profiler = torch.profiler.profile(
+            activities=selected_activities,
+            schedule=torch.profiler.schedule(
+                wait=0, warmup=int(warmup_iters), active=int(active_iters), repeat=1
+            ),
+        )
         self.runtime.torch_profiler.__enter__()
+        # ``profile_run_dag`` records allocator deltas whenever a profiler is
+        # active.  Initialize the sink here as well as in the CUPTI convenience
+        # wrapper so CPU-only profiler experiments follow the same execution
+        # path without depending on which start method was used.
+        self._cupti_allocator_iteration_stats = []
         self.runtime.pytorch_profiler_enabled = True
         self.logger.debug(
             f"Actor {self.runtime.global_rank}: PyTorch profiler started with "
             f"{warmup_iters} warmup iterations"
         )
 
+    def stop_pytorch_profiler_experiment(
+        self, *, trace_path: str | None = None
+    ) -> str | None:
+        """Stop a profiler used by a timing experiment, optionally exporting it.
+
+        Unlike :meth:`stop_pytorch_profiler`, this does not require every actor
+        to export a trace.  That keeps repeated profiler-overhead measurements
+        from spending time and disk space serializing traces that are not part
+        of the experiment result.  Profiler teardown and export happen after
+        the synchronized step timer has stopped.
+        """
+
+        if not self.runtime.pytorch_profiler_enabled:
+            raise RuntimeError("PyTorch profiler is not active")
+        profiler = self.runtime.torch_profiler
+        self.runtime.pytorch_profiler_enabled = False
+        profiler.__exit__(None, None, None)
+        if trace_path is not None:
+            os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+            profiler.export_chrome_trace(trace_path)
+        self.runtime.torch_profiler = None
+        return trace_path
+
     def step_pytorch_profiler(self) -> None:
-        """Finish one profiler warmup iteration and advance its schedule."""
-        if self.runtime.torch_profiler is None:
-            raise RuntimeError("PyTorch profiler is not running")
+        """Advance an active profiler at a completed GPU iteration boundary."""
+
+        if not self.runtime.pytorch_profiler_enabled:
+            raise RuntimeError("PyTorch profiler is not active")
+        # ``torch.profiler.step()`` changes the Kineto collection phase
+        # immediately.  Drain work launched in the current phase first so CUDA
+        # activity from a discarded warmup iteration cannot leak into the
+        # active trace without its CPU-side record_function attribution.
+        torch.cuda.synchronize(self.runtime.device)
         self.runtime.torch_profiler.step()
+
+    def start_cupti_node_profiler(
+        self,
+        *,
+        warmup_iters: int = 2,
+        active_iters: int = 1,
+        coordinator_clock_offset_ns: int = 0,
+        clock_sync_uncertainty_ns: int = 0,
+    ) -> None:
+        """Start CUPTI/Kineto capture for node ``record_function`` ranges.
+
+        This adds no per-node timing events to the DAG streams. Kineto
+        attributes CUDA activity to the existing node ranges through CUPTI
+        correlation IDs.
+        """
+        self._cupti_allocator_iteration_stats = []
+        self._cupti_timeline_anchor_origins: dict[
+            str, tuple[float, float]
+        ] = {}
+        self._cupti_timeline_anchor_counter = 0
+        self._cupti_expected_active_iters = int(active_iters)
+        self._cupti_coordinator_clock_offset_ns = int(
+            coordinator_clock_offset_ns
+        )
+        self._cupti_clock_sync_uncertainty_ns = int(
+            clock_sync_uncertainty_ns
+        )
+        self.start_pytorch_profiler(
+            warmup_iters=warmup_iters, active_iters=active_iters
+        )
+
+    def profile_clock_sample(self) -> int:
+        """Return this actor's monotonic clock for driver midpoint calibration."""
+
+        return time.monotonic_ns()
+
+    @staticmethod
+    def _cuda_allocator_stats_snapshot() -> dict[str, int]:
+        stats = torch.cuda.memory_stats()
+        keys = (
+            "num_alloc_retries",
+            "num_ooms",
+            "num_sync_all_streams",
+            "num_device_alloc",
+            "num_device_free",
+            "allocated_bytes.all.current",
+            "active_bytes.all.current",
+            "reserved_bytes.all.current",
+            "inactive_split_bytes.all.current",
+            "segment.all.current",
+        )
+        return {key: int(stats[key]) for key in keys if key in stats}
+
+    @staticmethod
+    def _cuda_allocator_stream_snapshot() -> dict[str, dict[str, int]]:
+        """Summarize caching-allocator segments by their owning CUDA stream."""
+
+        summary: dict[str, dict[str, int]] = {}
+        for segment in torch.cuda.memory_snapshot():
+            stream = str(int(segment.get("stream", 0)))
+            values = summary.setdefault(
+                stream,
+                {
+                    "segments": 0,
+                    "reserved_bytes": 0,
+                    "allocated_bytes": 0,
+                    "active_bytes": 0,
+                    "inactive_bytes": 0,
+                    "active_awaiting_free_bytes": 0,
+                },
+            )
+            values["segments"] += 1
+            values["reserved_bytes"] += int(segment.get("total_size", 0))
+            values["allocated_bytes"] += int(segment.get("allocated_size", 0))
+            values["active_bytes"] += int(segment.get("active_size", 0))
+            for block in segment.get("blocks", ()):
+                state = block.get("state")
+                size = int(block.get("size", 0))
+                if state == "inactive":
+                    values["inactive_bytes"] += size
+                elif state == "active_awaiting_free":
+                    values["active_awaiting_free_bytes"] += size
+        return summary
 
     def stop_pytorch_profiler(self, profile_dir: str) -> str:
         """End the profiler session and export a chrome trace.
@@ -434,6 +1050,227 @@ class PiperActor:
             f"Actor {self.runtime.global_rank}: PyTorch profiler trace written to {filepath}"
         )
         return filepath
+
+    def stop_cupti_node_profiler(
+        self, *, trace_path: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Return CUPTI-attributed CUDA totals keyed by Piper node range."""
+        if not self.runtime.pytorch_profiler_enabled:
+            raise RuntimeError("CUPTI node profiler is not active")
+        profiler = self.runtime.torch_profiler
+        self.runtime.pytorch_profiler_enabled = False
+        profiler.__exit__(None, None, None)
+        attribution_audit, timeline = _kineto_node_attribution_audit(
+            profiler,
+            trace_path=trace_path,
+            timeline_anchor_origins=getattr(
+                self, "_cupti_timeline_anchor_origins", {}
+            ),
+            expected_timeline_anchors=getattr(
+                self, "_cupti_expected_active_iters", None
+            ),
+        )
+        results: dict[str, dict[str, Any]] = {}
+        for event in profiler.key_averages():
+            key = str(event.key)
+            if ":uid" not in key:
+                continue
+            count = max(1, int(event.count))
+            results[key] = {
+                "count": count,
+                "device_time_total_us": float(event.device_time_total),
+                "device_time_mean_us": float(event.device_time_total) / count,
+                "self_device_time_total_us": float(event.self_device_time_total),
+                "self_device_time_mean_us": (
+                    float(event.self_device_time_total) / count
+                ),
+            }
+            results[key].update(attribution_audit.get(key, {}))
+        self._last_cupti_attribution_audit = attribution_audit
+        self._last_cupti_timeline = timeline
+        self._last_cupti_trace_path = trace_path
+        self.runtime.torch_profiler = None
+        return results
+
+    def stop_cupti_profile_result(
+        self,
+        *,
+        estimator: str = "median",
+        profile_mode: str = "interference_free",
+        p2p_baselines_by_comm_id: dict[str, float] | None = None,
+        trace_output_dir: str | None = None,
+        trace_ranks: tuple[int, ...] | None = None,
+    ) -> ActorProfileResult:
+        """Convert a Kineto/CUPTI capture into one actor's profile result.
+
+        Kineto's CUDA activity durations are associated with the ``record_function``
+        range that dispatches each Piper node.  No timing events are inserted on
+        the workload streams, and replay derives all starts from the DAG.
+        """
+        mode = normalize_profile_mode(profile_mode)
+        if self.dag is None:
+            raise RuntimeError("load_training_dag() must precede profiling")
+        capture_trace = (
+            trace_output_dir is not None
+            and (
+                trace_ranks is None
+                or int(self.runtime.global_rank) in set(trace_ranks)
+            )
+        )
+        trace_path = (
+            os.path.join(
+                str(trace_output_dir),
+                f"{mode}_rank{self.runtime.global_rank}"
+                f"_group{self.runtime.actor_group_id}.json",
+            )
+            if capture_trace
+            else None
+        )
+        captured = self.stop_cupti_node_profiler(trace_path=trace_path)
+        allocator_iteration_stats = list(
+            getattr(self, "_cupti_allocator_iteration_stats", ())
+        )
+        node_profiles: dict[str, NodeProfile] = {}
+        node_attribution_audit: dict[str, dict[str, Any]] = {}
+        for uid, node in self.dag.nodes.items():
+            if getattr(node, "node_kind", None) == "ORDER_DUMMY":
+                node_profiles[uid] = NodeProfile.skipped(
+                    "order_dummy",
+                    timing_source="kineto_cupti",
+                    isolation_scope=(
+                        DEFAULT_ISOLATION_SCOPE
+                        if mode == "interference_free"
+                        else DEFAULT_NORMAL_SCOPE
+                    ),
+                )
+                continue
+            baseline_us = (p2p_baselines_by_comm_id or {}).get(
+                str(node.node_meta.get("comm_id", ""))
+            )
+            matching = [
+                value for key, value in captured.items()
+                if key.endswith(f":uid{uid}")
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    f"expected one Kineto range for node {uid}, found {len(matching)}"
+                )
+            measured = dict(matching[0])
+            duration_samples_us = _kineto_correlated_activity_envelope_samples_us(
+                measured, node_uid=uid
+            )
+            occurrence_records = tuple(
+                measured.get("range_activity_signatures", ())
+            )
+            try:
+                start_offset_samples_us = tuple(
+                    float(record["activity_start_offset_us"])
+                    for record in occurrence_records
+                )
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError(
+                    f"Kineto attribution for node {uid} has no aligned activity "
+                    "start offsets"
+                ) from exc
+            if len(start_offset_samples_us) != len(duration_samples_us):
+                raise RuntimeError(
+                    f"Kineto attribution for node {uid} has mismatched duration "
+                    f"and start samples: durations={len(duration_samples_us)}, "
+                    f"starts={len(start_offset_samples_us)}"
+                )
+            duration_source = "correlated_gpu_activity_envelope"
+            if (
+                baseline_us is not None
+                and getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}
+            ):
+                # Scheduled P2P ranges include rendezvous waiting.  Preserve
+                # the separately measured transfer latency while keeping its
+                # samples aligned with the captured profile iterations.
+                duration_samples_us = tuple(
+                    float(baseline_us) for _ in duration_samples_us
+                )
+                duration_source = "isolated_directional_p2p_microprofile"
+            node_attribution_audit[uid] = {
+                key: value for key, value in matching[0].items()
+                if key in {
+                    "range_count", "launch_count", "matched_launch_count",
+                    "unmatched_launch_count", "launch_coverage_pct",
+                    "gpu_activity_count", "gpu_activity_time_total_us",
+                    "gpu_activity_time_mean_us", "gpu_activity_types",
+                    "range_activity_signatures",
+                    "device_time_total_us", "device_time_mean_us",
+                }
+            }
+            node_attribution_audit[uid]["node_kind"] = str(
+                getattr(node, "node_kind", "")
+            )
+            node_attribution_audit[uid]["comm_id"] = node.node_meta.get(
+                "comm_id"
+            )
+            node_attribution_audit[uid]["simulator_duration_source"] = (
+                duration_source
+            )
+            node_attribution_audit[uid]["simulator_duration_samples_us"] = list(
+                duration_samples_us
+            )
+            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
+                isolation_scope = "normal_directional_p2p"
+            elif mode == "interference_free":
+                isolation_scope = DEFAULT_ISOLATION_SCOPE
+            else:
+                isolation_scope = DEFAULT_NORMAL_SCOPE
+            node_profiles[uid] = NodeProfile.from_samples(
+                duration_samples_us,
+                estimator=estimator,
+                timing_source="kineto_cupti",
+                isolation_scope=isolation_scope,
+                start_offset_samples_us=start_offset_samples_us,
+            )
+        props = torch.cuda.get_device_properties(self.runtime.device)
+        return ActorProfileResult(
+            profile_mode=mode,
+            graph_fingerprint=finalized_dag_fingerprint(self.dag),
+            global_rank=self.runtime.global_rank,
+            pp_rank=self.runtime.pp_rank,
+            device_metadata={
+                "name": props.name,
+                "compute_capability": f"{props.major}.{props.minor}",
+                "total_memory": int(props.total_memory),
+                "torch_version": str(torch.__version__),
+                "cuda_version": str(torch.version.cuda),
+                "timing_source": "kineto_cupti",
+                "kineto_trace_path": trace_path,
+                "cuda_stream_ids": {
+                    **{
+                        f"logical:{name}": int(stream.cuda_stream)
+                        for name, stream in self.runtime.streams.items()
+                    },
+                    **{
+                        f"p2p:{name}": int(stream.cuda_stream)
+                        for name, stream in self.runtime.directional_p2p_streams.items()
+                    },
+                    **{
+                        f"routed:{name}": int(stream.cuda_stream)
+                        for name, stream in self.runtime.directional_routed_streams.items()
+                    },
+                },
+                "actor_group_id": int(self.runtime.actor_group_id),
+                "actor_group_devices": list(self.runtime.actor_group_devices),
+                "allocator_iteration_stats": allocator_iteration_stats,
+                "kineto_attribution_audit": node_attribution_audit,
+            },
+            node_profiles=node_profiles,
+            timeline_origin_samples_us=tuple(
+                getattr(self, "_last_cupti_timeline", {}).get(
+                    "timeline_origin_samples_us", ()
+                )
+            ),
+            timeline_origin_uncertainty_samples_us=tuple(
+                getattr(self, "_last_cupti_timeline", {}).get(
+                    "timeline_origin_uncertainty_samples_us", ()
+                )
+            ),
+        )
 
     def load_input(self, inputs):
         self.inputs = [inp.to(self.runtime.device) for inp in inputs]
@@ -1319,6 +2156,7 @@ class PiperActor:
         *,
         prepared_execution: PreparedDagExecution | None = None,
         timing_recorder=None,
+        serialize_nodes: bool = False,
         iteration_label: str = "iter",
     ):
         if prepared_execution is None:
@@ -1341,57 +2179,20 @@ class PiperActor:
                 self.loss,
                 loss_fn=loss_fn,
                 timing_recorder=timing_recorder,
+                serialize_nodes=serialize_nodes,
             )
         finally:
             self._nvtx_pop()
 
-    def run_dag(self, loss_fn=None):
-        return self._execute_dag(loss_fn=loss_fn)
-
-    def reset_profile_samples(
-        self, *, profile_mode: str = "interference_free"
-    ) -> None:
-        """Discard samples from an earlier session for one profiling policy."""
-
-        mode = normalize_profile_mode(profile_mode)
-        self._profile_node_samples[mode] = defaultdict(list)
-        self._profile_node_start_offsets[mode] = defaultdict(list)
-        self._profile_prologue_samples[mode] = []
-        self._profile_timeline_origins_us[mode] = []
-        self._profile_timeline_origin_uncertainties_us[mode] = []
-
-    def calibrate_profile_clock(self, clock_actor: Any, samples: int = 9) -> dict:
-        """Calibrate this actor's monotonic clock to one Ray coordinator.
-
-        This is the standard midpoint/round-trip estimator used by NTP.  The
-        minimum-RTT exchange minimizes queueing asymmetry; half its RTT is
-        retained as a conservative alignment uncertainty.
-        """
-
-        if int(samples) <= 0:
-            raise ValueError("clock calibration requires at least one sample")
-        candidates: list[tuple[int, int]] = []
-        for _ in range(int(samples)):
-            local_before_ns = time.monotonic_ns()
-            coordinator_ns = int(ray.get(clock_actor.monotonic_time_ns.remote()))
-            local_after_ns = time.monotonic_ns()
-            round_trip_ns = local_after_ns - local_before_ns
-            local_midpoint_ns = (local_before_ns + local_after_ns) // 2
-            candidates.append(
-                (round_trip_ns, coordinator_ns - local_midpoint_ns)
-            )
-        best_round_trip_ns, best_offset_ns = min(candidates)
-        self._profile_coordinator_clock_offset_ns = best_offset_ns
-        self._profile_clock_sync_uncertainty_ns = (
-            best_round_trip_ns + 1
-        ) // 2
-        return {
-            "method": "ray_ntp_midpoint_min_rtt",
-            "samples": int(samples),
-            "coordinator_clock_offset_ns": int(best_offset_ns),
-            "round_trip_ns": int(best_round_trip_ns),
-            "uncertainty_ns": int(self._profile_clock_sync_uncertainty_ns),
-        }
+    def run_dag(self, loss_fn=None, return_losses: bool = True):
+        try:
+            result = self._execute_dag(loss_fn=loss_fn)
+        finally:
+            if getattr(self.runtime, "pytorch_profiler_enabled", False):
+                self.step_pytorch_profiler()
+        # Timing/profiling callers do not consume losses. Avoid serializing CUDA
+        # tensors back to the CPU-only program driver in that common path.
+        return result if return_losses else None
 
     def _profile_stream_override(
         self,
@@ -1410,91 +2211,348 @@ class PiperActor:
         self,
         loss_fn=None,
         *,
-        record: bool = True,
         synchronize_before: bool = True,
         synchronize: bool = False,
         profile_mode: str = "interference_free",
+        advance_profiler: bool = True,
+        capture_allocator_stats: bool = True,
     ) -> None:
         """Run one timed iteration using interference-free or normal streams.
 
-        ``interference_free`` collapses non-P2P payloads onto the default
-        stream, while ``normal`` preserves their normal logical streams. Both policies
-        retain independent lo->hi and hi->lo P2P streams so a profiling-only
-        receive/send cycle cannot prevent NCCL progress.
+        Both modes preserve each node's normal logical stream (including the
+        directional P2P streams). ``interference_free`` additionally chains
+        nodes with CUDA events outside their CUPTI ranges so their work is
+        serialized without changing its stream affinity.
         """
         mode = normalize_profile_mode(profile_mode)
-        if self.runtime.pytorch_profiler_enabled:
-            raise RuntimeError(
-                f"{mode} profiling cannot run while torch.profiler is active"
-            )
         if synchronize_before:
             torch.cuda.synchronize(self.runtime.device)
-        recorder = (
-            _CudaEventTimingRecorder(
-                coordinator_clock_offset_ns=getattr(
-                    self, "_profile_coordinator_clock_offset_ns", 0
-                ),
-                clock_sync_uncertainty_ns=getattr(
-                    self, "_profile_clock_sync_uncertainty_ns", 0
-                ),
-            )
-            if record
+        collect_allocator_stats = (
+            self.runtime.pytorch_profiler_enabled
+            and bool(capture_allocator_stats)
+        )
+        allocator_before = (
+            self._cuda_allocator_stats_snapshot()
+            if collect_allocator_stats
             else None
         )
-        self._execute_dag(
-            loss_fn=loss_fn,
-            prepared_execution=self.profile_prepared_dag_executions[mode],
-            timing_recorder=recorder,
-            iteration_label=f"profile_{mode}_iter",
+        allocator_streams_before = (
+            self._cuda_allocator_stream_snapshot()
+            if collect_allocator_stats
+            else None
         )
-        if recorder is None:
-            if synchronize:
-                torch.cuda.synchronize(self.runtime.device)
-            return
-        missing = set(self.dag.nodes) - set(recorder.node_samples_us)
-        if missing:
-            raise RuntimeError(
-                f"profile iteration did not record nodes: {sorted(missing)}"
+        timeline_anchor = None
+        if (
+            self.runtime.pytorch_profiler_enabled
+            and hasattr(self, "_cupti_timeline_anchor_origins")
+        ):
+            anchor_index = int(self._cupti_timeline_anchor_counter)
+            self._cupti_timeline_anchor_counter = anchor_index + 1
+            anchor_label = (
+                f"{_KINETO_ITERATION_ANCHOR_PREFIX}{mode}:{anchor_index}:"
+                f"rank{self.runtime.global_rank}"
             )
-        node_samples = self._profile_node_samples.setdefault(mode, defaultdict(list))
-        for uid, sample_us in recorder.node_samples_us.items():
-            node_samples[uid].append(sample_us)
-        node_start_offsets = self._profile_node_start_offsets.setdefault(
-            mode, defaultdict(list)
-        )
-        for uid, offset_us in recorder.node_start_offsets_us.items():
-            node_start_offsets[uid].append(offset_us)
-        timeline_origins = getattr(
-            self, "_profile_timeline_origins_us", None
-        )
-        if timeline_origins is None:
-            timeline_origins = {}
-            self._profile_timeline_origins_us = timeline_origins
-        timeline_uncertainties = getattr(
-            self, "_profile_timeline_origin_uncertainties_us", None
-        )
-        if timeline_uncertainties is None:
-            timeline_uncertainties = {}
-            self._profile_timeline_origin_uncertainties_us = timeline_uncertainties
-        if getattr(recorder, "timeline_origin_us", None) is not None:
-            timeline_origins.setdefault(mode, []).append(
-                recorder.timeline_origin_us
+            local_before_ns = time.monotonic_ns()
+            timeline_anchor = torch.profiler.record_function(anchor_label)
+            timeline_anchor.__enter__()
+            local_after_ns = time.monotonic_ns()
+            local_midpoint_ns = (local_before_ns + local_after_ns) // 2
+            coordinator_origin_us = (
+                local_midpoint_ns
+                + int(self._cupti_coordinator_clock_offset_ns)
+            ) / 1000.0
+            uncertainty_us = (
+                (local_after_ns - local_before_ns) / 2.0
+                + int(self._cupti_clock_sync_uncertainty_ns)
+            ) / 1000.0
+            self._cupti_timeline_anchor_origins[anchor_label] = (
+                coordinator_origin_us,
+                uncertainty_us,
             )
-            timeline_uncertainties.setdefault(mode, []).append(
-                float(
-                    getattr(recorder, "timeline_origin_uncertainty_us", 0.0)
-                    or 0.0
-                )
+        try:
+            self._execute_dag(
+                loss_fn=loss_fn,
+                prepared_execution=self.profile_prepared_dag_executions[mode],
+                serialize_nodes=(mode == INTERFERENCE_FREE_PROFILE_MODE),
+                iteration_label=f"profile_{mode}_iter",
             )
-        if recorder.prologue_sample_us is not None:
-            self._profile_prologue_samples.setdefault(mode, []).append(
-                recorder.prologue_sample_us
-            )
+        finally:
+            if timeline_anchor is not None:
+                timeline_anchor.__exit__(None, None, None)
+            if self.runtime.pytorch_profiler_enabled:
+                if collect_allocator_stats:
+                    allocator_after = self._cuda_allocator_stats_snapshot()
+                    allocator_streams_after = self._cuda_allocator_stream_snapshot()
+                    before = allocator_before or {}
+                    self._cupti_allocator_iteration_stats.append({
+                        "before": before,
+                        "after": allocator_after,
+                        "delta": {
+                            key: int(value) - int(before.get(key, 0))
+                            for key, value in allocator_after.items()
+                        },
+                        "stream_pools_before": allocator_streams_before or {},
+                        "stream_pools_after": allocator_streams_after,
+                    })
+                if advance_profiler:
+                    self.step_pytorch_profiler()
+        if synchronize:
+            torch.cuda.synchronize(self.runtime.device)
 
     def synchronize_device(self) -> None:
         """Wait for all work on this actor's CUDA device."""
 
         torch.cuda.synchronize(self.runtime.device)
+
+    @staticmethod
+    def _clone_profile_state_value(value: Any) -> Any:
+        """Clone optimizer state into host memory for paired restoration."""
+
+        if torch.is_tensor(value):
+            # Snapshot storage is profiler control state, not part of the
+            # represented training workload.  Keeping it on the device can
+            # consume several GiB and make otherwise valid schedules OOM.
+            return value.detach().to(device="cpu", copy=True)
+        if isinstance(value, dict):
+            return {
+                key: PiperActor._clone_profile_state_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [PiperActor._clone_profile_state_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(
+                PiperActor._clone_profile_state_value(item) for item in value
+            )
+        return value
+
+    @staticmethod
+    def _restore_profile_state_value(current: Any, saved: Any) -> Any:
+        """Restore a cloned state value, preserving existing tensor storage."""
+
+        if torch.is_tensor(saved):
+            if (
+                torch.is_tensor(current)
+                and current.shape == saved.shape
+                and current.dtype == saved.dtype
+            ):
+                # Preserve the optimizer tensor's device and storage.  copy_
+                # handles the host-to-device transfer when the snapshot was
+                # offloaded to CPU.
+                current.copy_(saved)
+                return current
+            return saved.detach().clone()
+        if isinstance(saved, dict):
+            target = current if isinstance(current, dict) else {}
+            for key in tuple(target):
+                if key not in saved:
+                    del target[key]
+            for key, item in saved.items():
+                target[key] = PiperActor._restore_profile_state_value(
+                    target.get(key), item
+                )
+            return target
+        if isinstance(saved, list):
+            current_items = current if isinstance(current, list) else []
+            return [
+                PiperActor._restore_profile_state_value(
+                    current_items[index] if index < len(current_items) else None,
+                    item,
+                )
+                for index, item in enumerate(saved)
+            ]
+        if isinstance(saved, tuple):
+            current_items = current if isinstance(current, tuple) else ()
+            return tuple(
+                PiperActor._restore_profile_state_value(
+                    current_items[index] if index < len(current_items) else None,
+                    item,
+                )
+                for index, item in enumerate(saved)
+            )
+        return saved
+
+    def capture_profile_training_state(self) -> dict[str, int]:
+        """Snapshot mutable training and RNG state for paired policy profiles.
+
+        Normal and interference-free profiles must start from identical model
+        and optimizer state.  This matters especially for MoE models: allowing
+        the first policy to update router weights before profiling the second
+        policy can change expert token counts and therefore the GPU kernels
+        selected by grouped GEMM.
+        """
+
+        self.params.drain_pending_frees()
+        torch.cuda.synchronize(self.runtime.device)
+
+        parameters: list[tuple[torch.Tensor, torch.Tensor]] = []
+        seen_parameters: set[int] = set()
+        optimizers: list[tuple[Any, dict[Any, Any]]] = []
+        seen_optimizers: set[int] = set()
+        for bucket in self.stages.buckets.values():
+            candidate_parameters = (
+                [bucket.shard_param]
+                if bucket.shard_param is not None
+                else bucket.trainable_params()
+            )
+            for parameter in candidate_parameters:
+                if parameter is None or id(parameter) in seen_parameters:
+                    continue
+                seen_parameters.add(id(parameter))
+                parameters.append(
+                    (
+                        parameter,
+                        parameter.detach().to(device="cpu", copy=True),
+                    )
+                )
+
+            for optimizer in (bucket.shard_optimizer, bucket.optimizer):
+                if optimizer is None or id(optimizer) in seen_optimizers:
+                    continue
+                seen_optimizers.add(id(optimizer))
+                optimizers.append(
+                    (
+                        optimizer,
+                        {
+                            parameter: self._clone_profile_state_value(state)
+                            for parameter, state in optimizer.state.items()
+                        },
+                    )
+                )
+
+        self._profile_training_state = {
+            "parameters": parameters,
+            "optimizers": optimizers,
+            "cpu_rng_state": torch.get_rng_state().clone(),
+            "cuda_rng_state": torch.cuda.get_rng_state(self.runtime.device).clone(),
+        }
+        return {
+            "parameters": len(parameters),
+            "optimizers": len(optimizers),
+        }
+
+    def restore_profile_training_state(self) -> None:
+        """Restore the state captured by :meth:`capture_profile_training_state`."""
+
+        saved = getattr(self, "_profile_training_state", None)
+        if saved is None:
+            raise RuntimeError("profile training state has not been captured")
+        self.params.drain_pending_frees()
+        torch.cuda.synchronize(self.runtime.device)
+        with torch.no_grad():
+            for parameter, value in saved["parameters"]:
+                parameter.copy_(value)
+            for optimizer, optimizer_state in saved["optimizers"]:
+                for parameter in tuple(optimizer.state):
+                    if parameter not in optimizer_state:
+                        del optimizer.state[parameter]
+                for parameter, state in optimizer_state.items():
+                    optimizer.state[parameter] = self._restore_profile_state_value(
+                        optimizer.state.get(parameter), state
+                    )
+        torch.set_rng_state(saved["cpu_rng_state"])
+        torch.cuda.set_rng_state(saved["cuda_rng_state"], self.runtime.device)
+        self.clear_profile_transient_state()
+        torch.cuda.synchronize(self.runtime.device)
+
+    def clear_profile_transient_state(self) -> None:
+        """Clear gradients and per-step buffers after restoring training state."""
+
+        self.params.clear_param_grads()
+        self.buffers.reset()
+        self.events.reset()
+        for bucket in self.stages.buckets.values():
+            if bucket.flat_grads is not None:
+                bucket.flat_grads.zero_()
+            if bucket.reduce_scatter_grads is not None:
+                bucket.reduce_scatter_grads.zero_()
+            if bucket.shard_param is not None:
+                bucket.shard_param.grad = None
+
+    def p2p_receive_specs(self) -> dict[str, list[tuple[tuple[int, ...], str]]]:
+        """Return the receiver-owned payload metadata keyed by P2P transaction."""
+        if self.dag is None:
+            raise RuntimeError("load_training_dag() must precede P2P profiling")
+        specs: dict[str, list[tuple[tuple[int, ...], str]]] = {}
+        for node in self.dag.nodes.values():
+            if (
+                getattr(node, "node_kind", None) != "RECV_COMM"
+                or node.tag.get("PASS") != "F"
+            ):
+                continue
+            comm_id = str(node.node_meta["comm_id"])
+            bucket = self.stages.bucket(node.node_meta["bucket_key"])
+            specs[comm_id] = [
+                (tuple(shape), str(dtype))
+                for shape, dtype, _ in bucket.forward_input_meta
+            ]
+        return specs
+
+    def profile_p2p_transfer_baselines(
+        self,
+        specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]],
+        *,
+        repeats: int = 5,
+    ) -> dict[str, float]:
+        """Measure matched P2P transfers with both endpoints already posted.
+
+        Every actor takes the same barriers, while only the two endpoints of
+        a transaction issue its directional NCCL operation.  This removes DAG
+        predecessor and pipeline-rendezvous delay from the timed transfer.
+        """
+        if self.dag is None:
+            raise RuntimeError("load_training_dag() must precede P2P profiling")
+        if repeats <= 0:
+            raise ValueError("P2P profiling repeats must be positive")
+        local_nodes = {
+            str(node.node_meta["comm_id"]): node
+            for node in self.dag.nodes.values()
+            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}
+        }
+        results: dict[str, float] = {}
+        # Every actor enters the world barriers in the same comm-id order;
+        # only the exact ActorGroup-aligned endpoints issue the P2P operation.
+        for comm_id in sorted(specs_by_comm_id):
+            node = local_nodes.get(comm_id)
+            payload_specs = specs_by_comm_id[comm_id]
+            dist.barrier()
+            samples: list[float] = []
+            if node is not None:
+                stream = self.runtime.directional_p2p_stream_for_task(node)
+                tensors = [
+                    torch.empty(shape, dtype=getattr(torch, dtype.split(".")[-1]), device=self.runtime.device)
+                    for shape, dtype in payload_specs
+                ]
+                peer = int(node.peer_pp_rank)
+            for _ in range(int(repeats)):
+                # Every actor must enter every barrier even though only the
+                # two endpoints of this transaction issue P2P work.
+                torch.cuda.synchronize(self.runtime.device)
+                dist.barrier()
+                if node is not None:
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record(stream)
+                    if node.node_kind == "SEND_COMM":
+                        self.communication.send(
+                            tensors, peer, stream, task=node
+                        )
+                    else:
+                        # Allocate the exact receive buffers here instead of
+                        # reusing payload tensors, matching normal recv setup.
+                        recv = [torch.empty_like(tensor) for tensor in tensors]
+                        with torch.cuda.stream(stream):
+                            source = self.runtime.pipeline_peer_global_rank(peer)
+                            group = self.runtime.p2p_process_group_for_task(node)
+                            for tensor in recv:
+                                dist.recv(tensor, src=source, group=group)
+                    end.record(stream)
+                    end.synchronize()
+                    samples.append(float(start.elapsed_time(end)) * 1000.0)
+            if samples:
+                results[comm_id] = float(statistics.median(samples))
+            dist.barrier()
+        return results
 
     def clear_profile_allocator_cache(self) -> None:
         """Release unused cached blocks before a recorded profile series."""
@@ -1502,91 +2560,3 @@ class PiperActor:
         torch.cuda.synchronize(self.runtime.device)
         gc.collect()
         torch.cuda.empty_cache()
-
-    def get_profile_result(
-        self,
-        *,
-        estimator: str = "median",
-        profile_mode: str = "interference_free",
-    ) -> ActorProfileResult:
-        """Aggregate samples into the detached, rank-keyed profile interface."""
-        mode = normalize_profile_mode(profile_mode)
-        if self.dag is None:
-            raise RuntimeError("load_training_dag() must precede profiling")
-        mode_node_samples = self._profile_node_samples.get(mode, {})
-        mode_node_start_offsets = self._profile_node_start_offsets.get(mode, {})
-        node_profiles: dict[str, NodeProfile] = {}
-        for uid, node in self.dag.nodes.items():
-            if getattr(node, "node_kind", None) == "ORDER_DUMMY":
-                node_profiles[uid] = NodeProfile.skipped(
-                    "order_dummy",
-                    isolation_scope=(
-                        DEFAULT_ISOLATION_SCOPE
-                        if mode == "interference_free"
-                        else DEFAULT_NORMAL_SCOPE
-                    ),
-                )
-                continue
-            samples = mode_node_samples.get(uid, [])
-            if not samples:
-                raise RuntimeError(
-                    f"no {mode} profile samples collected for node {uid}"
-                )
-            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
-                isolation_scope = "normal_directional_p2p"
-            elif getattr(node, "node_kind", None) in {
-                "M_TO_N_COMM",
-                "N_TO_M_COMM",
-            }:
-                isolation_scope = "normal_directional_routed"
-            elif mode == "interference_free":
-                isolation_scope = DEFAULT_ISOLATION_SCOPE
-            else:
-                isolation_scope = DEFAULT_NORMAL_SCOPE
-            node_profiles[uid] = NodeProfile.from_samples(
-                samples,
-                estimator=estimator,
-                isolation_scope=isolation_scope,
-                start_offset_samples_us=mode_node_start_offsets.get(uid, ()),
-            )
-
-        prologue_samples = self._profile_prologue_samples.get(mode, [])
-        prologue_profile = (
-            NodeProfile.from_samples(
-                prologue_samples,
-                estimator=estimator,
-                isolation_scope=(
-                    DEFAULT_ISOLATION_SCOPE
-                    if mode == "interference_free"
-                    else DEFAULT_NORMAL_SCOPE
-                ),
-            )
-            if prologue_samples
-            else None
-        )
-        props = torch.cuda.get_device_properties(self.runtime.device)
-        return ActorProfileResult(
-            profile_mode=mode,
-            graph_fingerprint=finalized_dag_fingerprint(self.dag),
-            global_rank=self.runtime.global_rank,
-            pp_rank=self.runtime.pp_rank,
-            device_metadata={
-                "name": props.name,
-                "compute_capability": f"{props.major}.{props.minor}",
-                "total_memory": int(props.total_memory),
-                "torch_version": str(torch.__version__),
-                "cuda_version": str(torch.version.cuda),
-            },
-            node_profiles=node_profiles,
-            prologue_profile=prologue_profile,
-            timeline_origin_samples_us=tuple(
-                getattr(self, "_profile_timeline_origins_us", {}).get(mode, ())
-            ),
-            timeline_origin_uncertainty_samples_us=tuple(
-                getattr(
-                    self,
-                    "_profile_timeline_origin_uncertainties_us",
-                    {},
-                ).get(mode, ())
-            ),
-        )

@@ -1,4 +1,6 @@
 """End-to-end Qwen test for the JSON-driven TrainingDAG backend."""
+import hashlib
+
 import ray
 import torch
 import argparse
@@ -6,6 +8,7 @@ import time
 import os
 
 from src.compile import piper_setup
+from src.model_state import DEFAULT_MODEL_SEED
 from src.piper import (
     piper_exec_dag,
     piper_measure_dags,
@@ -26,10 +29,15 @@ from models.qwen3 import (
 )
 from torchtitan.models.qwen3.model.model import precompute_rope_cache
 
+try:
+    from .test_harness import _add_profile_comparison_metrics
+except ImportError:
+    from test_harness import _add_profile_comparison_metrics
+
 logger = create_logger("test_qwen", LOG_LEVEL)
 
 
-def _raw_metrics(args, iter_times, peak_memory_stats):
+def _raw_metrics(args, iter_times, peak_memory_stats, input_data_sha256):
     """Assemble the single program driver's measurements for the harness.
 
     No derived statistics are computed here; the harness summarizes the metrics
@@ -51,6 +59,9 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
         "batch_size": args.batch_size,
         "num_microbatches": int(info.get("num_microbatches", 1)),
         "seq_len": args.seq_len,
+        "model_seed": args.model_seed,
+        "input_seed": args.input_seed,
+        "input_data_sha256": input_data_sha256,
         "iter_times_s": [float(t) for t in iter_times],
         "peak_memory_by_rank": {
             int(rank): int(max_alloc) for rank, max_alloc in peak_memory_stats
@@ -67,8 +78,23 @@ def main(args, pg):
         or _derive_num_stages(args.schedule_directives_file)
     )
 
-    x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
-    y = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
+    input_generator = torch.Generator(device="cpu")
+    input_generator.manual_seed(args.input_seed)
+    x = torch.randint(
+        0,
+        config.vocab_size,
+        (batch_size, args.seq_len),
+        generator=input_generator,
+    )
+    y = torch.randint(
+        0,
+        config.vocab_size,
+        (batch_size, args.seq_len),
+        generator=input_generator,
+    )
+    input_data_sha256 = hashlib.sha256(
+        x.contiguous().numpy().tobytes() + y.contiguous().numpy().tobytes()
+    ).hexdigest()
 
     _ce = torch.nn.CrossEntropyLoss()
     loss_fn = lambda output, labels: _ce(output.view(-1, output.size(-1)), labels.view(-1))
@@ -100,6 +126,7 @@ def main(args, pg):
         pp_outer=args.pp_outer,
         schedule_directives_file=args.schedule_directives_file,
         dynamic_input_dims={0: (1,)},
+        model_seed=args.model_seed,
     )
 
     del x, y
@@ -112,26 +139,40 @@ def main(args, pg):
         if args.iteration_sleep > 0:
             time.sleep(args.iteration_sleep)
 
-    logger.info("Running %d timed iterations", args.iters)
-    timing = piper_measure_dags(
-        loss_fn,
-        iterations=args.iters,
-        iteration_sleep=args.iteration_sleep,
-        log_stats=True,
-        collect_peak_memory=True,
-    )
-    iter_times = list(timing.step_samples_s)
-    peak_memory_samples_by_rank = {
-        rank: list(samples)
-        for rank, samples in timing.peak_memory_samples_by_rank.items()
-    }
+    if args.iters < 0:
+        raise ValueError("--iters must be non-negative")
+    if args.iters == 0 and not args.pytorch_profiler:
+        raise ValueError("--iters 0 is only valid for a PyTorch-profiler-only run")
+    if args.iters:
+        logger.info("Running %d timed iterations", args.iters)
+        timing = piper_measure_dags(
+            loss_fn,
+            iterations=args.iters,
+            iteration_sleep=args.iteration_sleep,
+            log_stats=True,
+            collect_peak_memory=True,
+        )
+        iter_times = list(timing.step_samples_s)
+        peak_memory_samples_by_rank = {
+            rank: list(samples)
+            for rank, samples in timing.peak_memory_samples_by_rank.items()
+        }
+    else:
+        logger.info("Skipping normal timed iterations for profiler-only run")
+        iter_times = []
+        peak_memory_samples_by_rank = {}
 
     peak_memory_stats = [
         (rank, max(samples))
         for rank, samples in sorted(peak_memory_samples_by_rank.items())
     ]
 
-    metrics = _raw_metrics(args, iter_times, peak_memory_stats)
+    metrics = _raw_metrics(
+        args,
+        iter_times,
+        peak_memory_stats,
+        input_data_sha256,
+    )
     metrics["peak_memory_samples_by_rank"] = peak_memory_samples_by_rank
 
     if args.measure_profile_modes_only:
@@ -173,26 +214,23 @@ def main(args, pg):
             "out", "pytorch_profiles"
         )
         logger.info(
-            "Running %d iterations with the PyTorch profiler active; warming "
-            "up for %d and collecting only iteration %d",
-            args.pytorch_profiler_iters,
-            args.pytorch_profiler_iters - 1,
+            "Running %d PyTorch-profiler warmup iteration(s) and %d active iteration(s)",
+            args.pytorch_profiler_warmup_iters,
             args.pytorch_profiler_iters,
         )
-        profiler_warmup_iters = args.pytorch_profiler_iters - 1
         ray.get([
-            actor.start_pytorch_profiler.remote(profiler_warmup_iters)
+            actor.start_pytorch_profiler.remote(
+                warmup_iters=args.pytorch_profiler_warmup_iters,
+                active_iters=args.pytorch_profiler_iters,
+            )
             for actor in actors.values()
         ])
-        for _ in range(profiler_warmup_iters):
+        for _ in range(
+            args.pytorch_profiler_warmup_iters + args.pytorch_profiler_iters
+        ):
             piper_exec_dag(loss_fn)
             if args.iteration_sleep > 0:
                 time.sleep(args.iteration_sleep)
-            ray.get([
-                actor.step_pytorch_profiler.remote()
-                for actor in actors.values()
-            ])
-        piper_exec_dag(loss_fn)
         ray.get([
             actor.stop_pytorch_profiler.remote(profile_dir)
             for actor in actors.values()
@@ -261,6 +299,8 @@ def parse_args(argv=None):
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--model-seed", type=int, default=DEFAULT_MODEL_SEED)
+    parser.add_argument("--input-seed", type=int, default=DEFAULT_MODEL_SEED + 1)
     parser.add_argument("--iteration-sleep", type=float, default=0.0)
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--nsight", action="store_true", default=False,
@@ -295,13 +335,19 @@ def parse_args(argv=None):
         action="store_true",
         default=False,
         help="Run extra iterations under torch.profiler on every actor and write "
-             "per-actor chrome traces (combined per dp-rank by test_harness).",
+             "one chrome trace per global actor rank.",
+    )
+    parser.add_argument(
+        "--pytorch-profiler-warmup-iters",
+        type=int,
+        default=2,
+        help="Number of profiler-instrumented warmup iterations discarded before capture.",
     )
     parser.add_argument(
         "--pytorch-profiler-iters",
         type=int,
-        default=3,
-        help="Profiler-phase iterations; only the final iteration is collected.",
+        default=1,
+        help="Number of active iterations retained in the PyTorch trace.",
     )
     parser.add_argument(
         "--profile-and-simulate",
@@ -323,81 +369,3 @@ def parse_args(argv=None):
     parser.add_argument("--profile-mode-block-iters", type=int, default=1)
     parser.add_argument("--step-time-profile-output", default="")
     return parser.parse_args(argv)
-
-
-def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
-    metrics["interference_free_step_time_us"] = (
-        comparison.interference_free_statistics.estimate
-    )
-    metrics["interference_free_step_time_s"] = (
-        comparison.interference_free_statistics.estimate / 1_000_000.0
-    )
-    metrics["simulated_interference_free_step_time_samples_s"] = [
-        sample / 1_000_000.0
-        for sample in comparison.interference_free_samples_us
-    ]
-    metrics["simulated_normal_step_time_us"] = comparison.normal_statistics.estimate
-    metrics["simulated_normal_step_time_s"] = (
-        comparison.normal_statistics.estimate / 1_000_000.0
-    )
-    metrics["simulated_normal_step_time_samples_s"] = [
-        sample / 1_000_000.0 for sample in comparison.normal_samples_us
-    ]
-    if comparison.normal_prediction_error is not None:
-        metrics["simulated_normal_prediction_error_pct"] = (
-            comparison.normal_prediction_error.signed_pct
-        )
-        metrics["simulated_normal_absolute_error_pct"] = (
-            comparison.normal_prediction_error.absolute_pct
-        )
-    metrics["predicted_interference_reduction_pct"] = (
-        comparison.predicted_interference_reduction_pct
-    )
-    metrics["dependency_replay_interference_reduction_pct"] = (
-        comparison.dependency_replay_interference_reduction_pct
-    )
-    metrics["instrumented_policy_reduction_pct"] = (
-        comparison.instrumented_policy_reduction_pct
-    )
-    metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
-    metrics["mode_profile_event_overhead_pct"] = (
-        comparison.mode_profile_event_overhead_pct
-    )
-    metrics["observed_interference_reduction_pct"] = (
-        comparison.observed_interference_reduction_pct
-    )
-    metrics["envelope_modeled_interference_reduction_pct"] = (
-        comparison.envelope_modeled_interference_reduction_pct
-    )
-    metrics["normal_dependency_replay_excess_pct"] = (
-        comparison.normal_dependency_replay_excess_pct
-    )
-    metrics["observed_normal_envelope_step_time_samples_s"] = [
-        sample / 1_000_000.0
-        for sample in comparison.observed_normal_envelope_samples_us
-    ]
-    if comparison.instrumented_normal_replay_error is not None:
-        metrics["instrumented_normal_replay_error_pct"] = (
-            comparison.instrumented_normal_replay_error.signed_pct
-        )
-    if comparison.instrumented_interference_free_replay_error is not None:
-        metrics["instrumented_interference_free_replay_error_pct"] = (
-            comparison.instrumented_interference_free_replay_error.signed_pct
-        )
-    instrumented = plan.profile_metadata.get(
-        "instrumented_global_step_samples_us_by_mode", {}
-    ).get("normal", ())
-    metrics["instrumented_normal_profile_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0 for sample in instrumented
-    ]
-    uninstrumented = plan.profile_metadata.get(
-        "uninstrumented_global_step_samples_us_by_mode", {}
-    )
-    metrics["uninstrumented_normal_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("normal", ())
-    ]
-    metrics["uninstrumented_interference_free_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("interference_free", ())
-    ]

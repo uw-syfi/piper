@@ -44,7 +44,6 @@ class PiperMetadata:
     artifact_dir: str = "out"  # Directory for debug artifacts emitted during runs
     training_dag = None  # DAG of annotated model segments and transform-inserted nodes
     per_pp_training_dags = None  # One local DAG per schedule ActorGroup
-    compiled_data_store = None  # Ray actor providing profile clock calibration
     schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
     schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
     schedule_info: dict = {}  # Derived ActorGroup and microbatch schedule facts

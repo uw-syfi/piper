@@ -25,7 +25,7 @@ PROFILE_PLAN_SCHEMA_VERSION = 4
 INTERFERENCE_FREE_PROFILE_MODE = "interference_free"
 NORMAL_PROFILE_MODE = "normal"
 PROFILE_MODES = frozenset({INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE})
-DEFAULT_ISOLATION_SCOPE = "serialized_non_p2p_with_directional_p2p"
+DEFAULT_ISOLATION_SCOPE = "event_serialized_logical_streams"
 DEFAULT_NORMAL_SCOPE = "logical_streams_with_directional_p2p"
 
 
@@ -272,8 +272,13 @@ def estimate_profile_time(samples_us: Sequence[float], estimator: str = "median"
 @dataclass(frozen=True)
 class ProfileConfig:
     warmup_iters: int = 5
-    # Exact number of measured iterations for this profile mode.
+    # Minimum number of measured iterations for this profile mode.  When no
+    # CI target is requested this remains the exact number of iterations.
     repeat_iters: int = 30
+    # Optionally keep sampling until the bootstrap 95% CI of the chosen step
+    # estimator is this tight (percent), subject to ``max_repeat_iters``.
+    target_ci95_error_pct: float | None = None
+    max_repeat_iters: int | None = None
     estimator: str = "median"
     network_policy: str = "directional_p2p"
     isolation_scope: str = DEFAULT_ISOLATION_SCOPE
@@ -283,6 +288,10 @@ class ProfileConfig:
             raise ValueError("warmup_iters must be non-negative")
         if int(self.repeat_iters) <= 0:
             raise ValueError("repeat_iters must be positive")
+        if self.target_ci95_error_pct is not None and float(self.target_ci95_error_pct) <= 0.0:
+            raise ValueError("target_ci95_error_pct must be positive when set")
+        if self.max_repeat_iters is not None and int(self.max_repeat_iters) < int(self.repeat_iters):
+            raise ValueError("max_repeat_iters must be at least repeat_iters")
         # Validate the name without requiring measurements yet.
         estimate_profile_time((0.0,), self.estimator)
 
@@ -291,6 +300,16 @@ class ProfileConfig:
         return cls(
             warmup_iters=int(value.get("warmup_iters", 5)),
             repeat_iters=int(value.get("repeat_iters", 30)),
+            target_ci95_error_pct=(
+                None
+                if value.get("target_ci95_error_pct") is None
+                else float(value["target_ci95_error_pct"])
+            ),
+            max_repeat_iters=(
+                None
+                if value.get("max_repeat_iters") is None
+                else int(value["max_repeat_iters"])
+            ),
             estimator=str(value.get("estimator", "median")),
             network_policy=str(value.get("network_policy", "directional_p2p")),
             isolation_scope=str(value.get("isolation_scope", DEFAULT_ISOLATION_SCOPE)),
@@ -853,14 +872,29 @@ def merge_actor_profiles(
     dags = list(per_pp_dags)
     results = list(results)
 
-    # Normalize every actor's CUDA-event offsets to the earliest calibrated
-    # CUDA origin in the same mode/iteration.  The epoch itself is irrelevant;
+    # Normalize every actor's timestamp offsets to the earliest calibrated
+    # origin in the same mode/iteration.  The epoch itself is irrelevant;
     # only cross-actor differences survive in the durable profile.
     results_by_mode: dict[str, list[ActorProfileResult]] = {}
     for result in results:
         results_by_mode.setdefault(
             normalize_profile_mode(result.profile_mode), []
         ).append(result)
+    raw_actor_groups = (topology or {}).get("actor_groups", ())
+    if raw_actor_groups:
+        expected_ranks = {
+            int(rank)
+            for group in raw_actor_groups
+            for rank in group.get("devices", ())
+        }
+        for mode, mode_results in sorted(results_by_mode.items()):
+            actual_ranks = {int(result.global_rank) for result in mode_results}
+            if actual_ranks != expected_ranks:
+                raise ValueError(
+                    f"profile mode {mode!r} does not cover the ActorGroup "
+                    f"topology: missing={sorted(expected_ranks - actual_ranks)}, "
+                    f"unknown={sorted(actual_ranks - expected_ranks)}"
+                )
     aligned_bases_by_mode: dict[str, tuple[float, ...]] = {}
     alignment_metadata: dict[str, Any] = {}
     for mode, mode_results in sorted(results_by_mode.items()):
@@ -882,12 +916,52 @@ def merge_actor_profiles(
         sample_count = next(iter(sample_counts))
         if sample_count <= 0:
             continue
+        mode_sample_ids: tuple[int, ...] | None = None
         for result in mode_results:
+            origins = result.timeline_origin_samples_us
+            if any(not math.isfinite(float(value)) for value in origins):
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "invalid timeline-origin samples"
+                )
             uncertainties = result.timeline_origin_uncertainty_samples_us
-            if uncertainties and len(uncertainties) != sample_count:
+            if len(uncertainties) != sample_count:
                 raise ValueError(
                     f"profile mode {mode!r} rank {result.global_rank} has "
                     "mismatched origin and uncertainty sample counts"
+                )
+            if any(
+                not math.isfinite(float(value)) or float(value) < 0.0
+                for value in uncertainties
+            ):
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "invalid timeline-origin uncertainty samples"
+                )
+            result_sample_ids = {
+                tuple(int(value) for value in profile.sample_iteration_ids)
+                for profile in result.node_profiles.values()
+                if profile.executed
+            }
+            if len(result_sample_ids) != 1:
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "inconsistent node sample iteration IDs"
+                )
+            sample_ids = next(iter(result_sample_ids))
+            if len(sample_ids) != sample_count:
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    f"sample IDs={len(sample_ids)} and calibrated origins="
+                    f"{sample_count}"
+                )
+            if mode_sample_ids is None:
+                mode_sample_ids = sample_ids
+            elif sample_ids != mode_sample_ids:
+                raise ValueError(
+                    f"profile mode {mode!r} has mismatched actor sample "
+                    f"iteration IDs: expected={mode_sample_ids!r}, "
+                    f"rank {result.global_rank}={sample_ids!r}"
                 )
         bases = tuple(
             min(
@@ -902,11 +976,26 @@ def merge_actor_profiles(
             for result in mode_results
             for value in result.timeline_origin_uncertainty_samples_us
         ]
+        pairwise_uncertainties = []
+        for index in range(sample_count):
+            per_actor = sorted(
+                (
+                    float(result.timeline_origin_uncertainty_samples_us[index])
+                    for result in mode_results
+                ),
+                reverse=True,
+            )
+            pairwise_uncertainties.append(sum(per_actor[:2]))
         alignment_metadata[mode] = {
             "actors": len(mode_results),
             "samples": sample_count,
             "max_origin_uncertainty_us": (
                 max(uncertainty_values) if uncertainty_values else None
+            ),
+            "max_pairwise_uncertainty_us": (
+                max(pairwise_uncertainties)
+                if pairwise_uncertainties
+                else None
             ),
         }
 
@@ -1001,8 +1090,8 @@ def merge_actor_profiles(
     profile_metadata: dict[str, Any] = {"actors": device_metadata}
     if alignment_metadata:
         profile_metadata["timeline_alignment"] = {
-            "method": "ray_ntp_midpoint_plus_cuda_anchor",
-            "origin": "earliest_actor_cuda_prologue_per_mode_iteration",
+            "method": "driver_actor_midpoint_plus_kineto_iteration_anchor",
+            "origin": "earliest_actor_kineto_anchor_per_mode_iteration",
             "modes": alignment_metadata,
         }
 

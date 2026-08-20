@@ -222,36 +222,52 @@ def test_replicated_gradient_reduce_scatter_averages_before_accumulation(
     monkeypatch,
 ) -> None:
     parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    reduced = Mock()
     bucket = SimpleNamespace(
         trainable_param_idxs=[0],
         forward_args=[parameter],
         param_shard_info=(0, 2, 4),
         flat_grads=torch.tensor([1.0, 2.0, 3.0, 4.0]),
-        reduce_scatter_grads=torch.tensor([10.0, 20.0]),
+        reduce_scatter_grads=reduced,
     )
     stages = SimpleNamespace(
         get_bucket=lambda _ubid: bucket,
         bucket=lambda _ubid: bucket,
         grad_sharded_ubids={"bucket"},
     )
+    allocation_stream = object()
+    default_stream = Mock(return_value=allocation_stream)
     runtime = SimpleNamespace(
         actor_group_size=2,
         actor_group_sync_group="replicas",
+        default_stream=default_stream,
     )
     communication = CommunicationExecutor(runtime, stages, logger=None)
 
+    scratch = Mock()
+
     def fake_reduce_scatter(output, _input, *, group):
         assert group == "replicas"
-        output.copy_(torch.tensor([6.0, 10.0]))
+        assert output is scratch
 
     monkeypatch.setattr(
         executors.dist, "reduce_scatter_tensor", fake_reduce_scatter
     )
-    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    stream_context = Mock(side_effect=lambda _stream: nullcontext())
+    monkeypatch.setattr(executors.torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(executors.torch, "empty_like", Mock(return_value=scratch))
 
-    transferred = communication.reduce_scatter("bucket", object())
+    collective_stream = object()
+    transferred = communication.reduce_scatter("bucket", collective_stream)
 
-    assert torch.equal(bucket.reduce_scatter_grads, torch.tensor([13.0, 25.0]))
+    default_stream.assert_called_once_with()
+    assert stream_context.call_args_list == [
+        call(allocation_stream),
+        call(collective_stream),
+    ]
+    scratch.record_stream.assert_called_once_with(collective_stream)
+    scratch.div_.assert_called_once_with(2)
+    reduced.add_.assert_called_once_with(scratch)
     assert transferred == bucket.flat_grads.numel() * bucket.flat_grads.element_size()
 
 
@@ -266,6 +282,94 @@ def test_grad_with_param_layout_honors_declared_grad_dtype() -> None:
 
     assert grad.dtype == torch.float32
     weight.grad = grad
+
+
+def test_split_backward_uses_captured_groups_without_output_replay() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(4, 5))
+    output = x @ weight
+    output_grad = torch.randn_like(output)
+    expected_x_grad, expected_weight_grad = torch.autograd.grad(
+        output,
+        (x, weight),
+        output_grad,
+    )
+
+    x = x.detach().requires_grad_(True)
+    weight = torch.nn.Parameter(weight.detach())
+    outputs = [x @ weight]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    _, param_groups = compute.bucket_backward_input(
+        outputs,
+        [output_grad],
+        [x],
+        [weight],
+    )
+
+    assert outputs[0].grad_fn is None
+    assert torch.allclose(x.grad, expected_x_grad)
+    assert weight.grad is None
+
+    compute.bucket_backward_weight([weight], param_groups)
+
+    assert torch.allclose(weight.grad, expected_weight_grad)
+
+
+def test_split_backward_supports_new_style_custom_autograd_boundary() -> None:
+    class Scale(torch.autograd.Function):
+        @staticmethod
+        def forward(x, weight):
+            return x * weight
+
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            del output
+            ctx.save_for_backward(*inputs)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, weight = ctx.saved_tensors
+            return grad_output * weight, grad_output * x
+
+    x = torch.randn(5, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(5))
+    output_grad = torch.randn(5)
+    expected_x_grad = output_grad * weight.detach()
+    expected_weight_grad = output_grad * x.detach()
+    outputs = [Scale.apply(x, weight)]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    _, param_groups = compute.bucket_backward_input(
+        outputs,
+        [output_grad],
+        [x],
+        [weight],
+    )
+    compute.bucket_backward_weight([weight], param_groups)
+
+    assert outputs[0].grad_fn is None
+    assert torch.allclose(x.grad, expected_x_grad)
+    assert torch.allclose(weight.grad, expected_weight_grad)
+
+
+def test_split_backward_rejects_missing_runtime_boundary_gradient() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, requires_grad=True)
+    captured_weight = torch.nn.Parameter(torch.randn(4, 5))
+    fallback_weight = torch.nn.Parameter(torch.randn(5))
+    outputs = [x @ captured_weight, fallback_weight.square()]
+    output_grads = [torch.randn_like(output) for output in outputs]
+    compute = ComputeExecutor(runtime=None, stages=None, logger=None)
+
+    with pytest.raises(RuntimeError, match="split backward invariant failed"):
+        compute.bucket_backward_input(
+            outputs,
+            output_grads,
+            [x],
+            [captured_weight, fallback_weight],
+        )
 
 
 def test_a2a_boundary_reuses_dispatch_state_for_combine(monkeypatch) -> None:

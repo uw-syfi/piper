@@ -9,8 +9,12 @@ timings can include time spent waiting for other ranks to arrive.  The
 simulator therefore separates rank-local endpoint arrival and completion with
 a shared zero-duration rendezvous.  For calibrated profiles it derives each
 endpoint's post-rendezvous tail once from the observed, cross-actor-aligned
-timeline and reuses that tail in both replays.  Legacy rank-local profiles
-retain the best-effort simulated-arrival-skew subtraction.
+timeline and reuses that tail in both replays.  Symmetric collectives use an
+all-participant rendezvous.  Routed A2A, M-to-N, and N-to-M nodes use one
+logical rendezvous per DAG node followed by rank-local aggregate envelope
+tails; internal metadata/payload phases are not modeled separately.
+Collective replay fails closed when aligned endpoint timestamps are
+unavailable.
 
 P2P SEND/RECV endpoints retain distinct completion vertices.  Both arrivals
 gate their shared rendezvous, but send-side successors wait only for send
@@ -44,39 +48,39 @@ from .execution_plan import (
 from .profiling import (
     NORMAL_PROFILE_MODE,
     INTERFERENCE_FREE_PROFILE_MODE,
+    estimate_profile_time,
     get_node_profile_times,
     get_prologue_profile_times,
     normalize_profile_mode,
 )
 from .profile_statistics import (
+    MeanStatistics,
+    PairedSavingsStatistics,
     PredictionError,
     TimingStatistics,
     predicted_reduction,
     prediction_error,
+    summarize_mean_samples,
+    summarize_paired_savings,
     summarize_timing_samples,
 )
 
 
 _PROLOGUE_UID = "__step_prologue__"
 _P2P_KINDS = frozenset({"SEND_COMM", "RECV_COMM"})
-_COLLECTIVE_KINDS = frozenset(
+_ROUTED_COLLECTIVE_KINDS = frozenset(
+    {"A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"}
+)
+_SYMMETRIC_COLLECTIVE_KINDS = frozenset(
     {
         "REDUCE_COMM",
         "ALL_REDUCE_COMM",
         "ALL_GATHER_COMM",
         "REDUCE_SCATTER_COMM",
-        # Cross-ActorGroup routed transfers are implemented as one collective
-        # rendezvous over the union of unequal source/destination groups.
-        "M_TO_N_COMM",
-        "N_TO_M_COMM",
     }
-)
-# Piper's ragged A2A node is implemented as independently tagged peer sends
-# and receives.  It is communication, but it is not an all-rank rendezvous:
-# zero-payload ranks and completed peer pairs may finish before other ranks
-# enter the same logical A2A node.
-_RAGGED_A2A_KINDS = frozenset({"A2A_COMM"})
-_COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS | _RAGGED_A2A_KINDS
+) | _ROUTED_COLLECTIVE_KINDS
+_COLLECTIVE_KINDS = _SYMMETRIC_COLLECTIVE_KINDS
+_COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS
 
 
 class SimulationValidationError(ValueError):
@@ -93,7 +97,13 @@ class NodeInstance:
 
 @dataclass(frozen=True)
 class TimelineEvent:
-    """The simulated interval for one rank-local node occurrence."""
+    """The simulated interval for one rank-local node occurrence.
+
+    ``start_us`` is the earliest legal start implied by the DAG and physical
+    stream FIFO constraints.  Observed CUDA start offsets are retained only
+    for validation; they are not replay release constraints in either timing
+    mode, so normal and isolated replays differ solely by service times.
+    """
 
     operation: NodeInstance
     node_kind: str
@@ -103,6 +113,8 @@ class TimelineEvent:
     profile_duration_us: float
     effective_duration_us: float
     profile_start_offset_us: float = 0.0
+    observed_profile_start_offset_us: float = 0.0
+    arrival_start_us: float | None = None
     communication_id: str | None = None
     critical_predecessor: NodeInstance | None = None
 
@@ -155,8 +167,9 @@ class SimulationComparisonResult:
     interference_free_samples_us: tuple[float, ...]
     normal_samples_us: tuple[float, ...]
     observed_normal_envelope_samples_us: tuple[float, ...]
-    interference_free_statistics: TimingStatistics
-    normal_statistics: TimingStatistics
+    interference_free_statistics: MeanStatistics
+    normal_statistics: MeanStatistics
+    dependency_replay_savings_statistics: PairedSavingsStatistics
     observed_normal_envelope_statistics: TimingStatistics | None = None
     actual_statistics: TimingStatistics | None = None
     instrumented_normal_statistics: TimingStatistics | None = None
@@ -167,6 +180,7 @@ class SimulationComparisonResult:
     instrumented_normal_replay_error: PredictionError | None = None
     instrumented_interference_free_replay_error: PredictionError | None = None
     predicted_interference_reduction_pct: float | None = None
+    dependency_replay_absolute_savings_us: float | None = None
     dependency_replay_interference_reduction_pct: float | None = None
     instrumented_policy_reduction_pct: float | None = None
     observed_interference_reduction_pct: float | None = None
@@ -174,6 +188,66 @@ class SimulationComparisonResult:
     normal_dependency_replay_excess_pct: float | None = None
     profile_event_overhead_pct: float | None = None
     mode_profile_event_overhead_pct: float | None = None
+    kineto_cupti_instrumentation_error: PredictionError | None = None
+
+
+@dataclass(frozen=True)
+class EarliestLegalStartComparison:
+    """Validation of DAG/stream readiness against observed CUDA starts."""
+
+    samples: int
+    mean_signed_error_us: float
+    median_signed_error_us: float
+    median_absolute_error_us: float
+    p95_absolute_error_us: float
+
+
+def compare_earliest_legal_starts(
+    plan_or_dags: Any,
+    *,
+    profile_mode: str = NORMAL_PROFILE_MODE,
+    strict: bool = True,
+) -> EarliestLegalStartComparison:
+    """Compare simulated earliest legal starts with recorded CUDA starts.
+
+    The comparison is per node instance and raw profile iteration.  A positive
+    error means the observed CUDA start was later than its DAG/stream-ready
+    time, i.e. residual launch or resource-queue delay not explained by the
+    modeled ordering constraints.
+    """
+    mode = normalize_profile_mode(profile_mode)
+    errors: list[float] = []
+    for iteration_id in profile_iteration_ids(plan_or_dags, profile_mode=mode):
+        result = simulate_training_step(
+            plan_or_dags,
+            profile_mode=mode,
+            sample_iteration_id=iteration_id,
+            strict=strict,
+        )
+        for event in result.timeline:
+            observed = event.observed_profile_start_offset_us
+            earliest_start = (
+                event.start_us
+                if event.arrival_start_us is None
+                else event.arrival_start_us
+            )
+            errors.append(float(observed) - float(earliest_start))
+    if not errors:
+        raise SimulationValidationError(
+            f"profile mode {mode!r} has no events to compare"
+        )
+    absolute_errors = sorted(abs(error) for error in errors)
+    p95_index = min(
+        len(absolute_errors) - 1,
+        max(0, math.ceil(0.95 * len(absolute_errors)) - 1),
+    )
+    return EarliestLegalStartComparison(
+        samples=len(errors),
+        mean_signed_error_us=statistics.fmean(errors),
+        median_signed_error_us=statistics.median(errors),
+        median_absolute_error_us=statistics.median(absolute_errors),
+        p95_absolute_error_us=absolute_errors[p95_index],
+    )
 
 @dataclass(frozen=True)
 class _RankLayout:
@@ -190,8 +264,9 @@ class _RankLayout:
 class _InstanceRecord:
     key: NodeInstance
     pp_index: int
-    dp_lane: int
+    actor_group_local_rank: int
     node: TrainingDAGNode
+    profile: Any | None
     profile_duration_us: float
     profile_start_offset_us: float = 0.0
     observed_profile_start_offset_us: float = 0.0
@@ -207,12 +282,8 @@ class _Vertex:
     emit_timeline: bool = True
     endpoint_arrival_vertex_id: str | None = None
     endpoint_rendezvous_vertex_id: str | None = None
-    endpoint_profile_interval_us: float | None = None
     endpoint_observed_service_us: float | None = None
-    rendezvous_endpoint_intervals: tuple[tuple[str, float], ...] = ()
-    rendezvous_fallback_service_us: float = 0.0
     rendezvous_wait_us: float = 0.0
-    interval_underflow_us: float = 0.0
     preds: set[str] = field(default_factory=set)
     succs: set[str] = field(default_factory=set)
     start_us: float = 0.0
@@ -354,6 +425,131 @@ def _profile_for_rank(
         f"missing profile for node {node.uid!r} on global rank {rank} "
         f"in mode {profile_mode!r}"
     )
+
+
+def _profile_iteration_ids_for_collective(
+    profile: Any, *, context: str
+) -> tuple[int, ...]:
+    if isinstance(profile, Mapping):
+        samples = tuple(profile.get("samples_us", ()))
+        raw_ids = tuple(profile.get("sample_iteration_ids", ()))
+    else:
+        samples = tuple(getattr(profile, "samples_us", ()))
+        raw_ids = tuple(getattr(profile, "sample_iteration_ids", ()))
+    if not samples:
+        raise SimulationValidationError(
+            f"{context}: aligned collective profile has no raw samples"
+        )
+    return tuple(int(value) for value in (raw_ids or range(len(samples))))
+
+
+def _profile_estimator(profile: Any) -> str:
+    if isinstance(profile, Mapping):
+        return str(profile.get("estimator", "median"))
+    return str(getattr(profile, "estimator", "median"))
+
+
+def _symmetric_collective_observed_services(
+    members: Sequence[_InstanceRecord],
+    *,
+    communication_id: str,
+    sample_iteration_id: int | None,
+    pairwise_alignment_uncertainty_us: float,
+) -> dict[NodeInstance, float]:
+    """Derive endpoint service from paired aligned activity occurrences."""
+
+    if sample_iteration_id is None:
+        if any(member.profile is None for member in members):
+            raise SimulationValidationError(
+                f"collective {communication_id!r} has no endpoint profile"
+            )
+        endpoint_ids = {
+            _profile_iteration_ids_for_collective(
+                member.profile,
+                context=(
+                    f"collective {communication_id!r} rank "
+                    f"{member.key.global_rank} uid={member.key.uid!r}"
+                ),
+            )
+            for member in members
+        }
+        if len(endpoint_ids) != 1:
+            raise SimulationValidationError(
+                f"collective {communication_id!r} endpoint iteration IDs are "
+                f"not aligned: {sorted(endpoint_ids)!r}"
+            )
+        iteration_ids = next(iter(endpoint_ids))
+    else:
+        iteration_ids = (int(sample_iteration_id),)
+
+    service_samples: dict[NodeInstance, list[float]] = {
+        member.key: [] for member in members
+    }
+    for iteration_id in iteration_ids:
+        durations = {
+            member.key: _profile_duration_us(
+                member.profile,
+                context=(
+                    f"collective {communication_id!r} rank "
+                    f"{member.key.global_rank} uid={member.key.uid!r}"
+                ),
+                sample_iteration_id=iteration_id,
+            )
+            for member in members
+        }
+        zero_activity_states = {duration == 0.0 for duration in durations.values()}
+        routed_collective = all(
+            member.node.node_kind in _ROUTED_COLLECTIVE_KINDS
+            for member in members
+        )
+        if len(zero_activity_states) > 1 and not routed_collective:
+            raise SimulationValidationError(
+                f"collective {communication_id!r} iteration {iteration_id} "
+                "mixes zero-activity and nonzero-activity endpoint profiles"
+            )
+        if zero_activity_states == {True}:
+            for member in members:
+                service_samples[member.key].append(0.0)
+            continue
+
+        starts = {
+            member.key: _profile_start_offset_us(
+                member.profile,
+                context=(
+                    f"collective {communication_id!r} rank "
+                    f"{member.key.global_rank} uid={member.key.uid!r}"
+                ),
+                sample_iteration_id=iteration_id,
+            )
+            for member in members
+        }
+        observed_rendezvous_us = max(starts.values())
+        for member in members:
+            if durations[member.key] == 0.0:
+                service_samples[member.key].append(0.0)
+                continue
+            observed_end_us = starts[member.key] + durations[member.key]
+            raw_service_us = observed_end_us - observed_rendezvous_us
+            if raw_service_us < -pairwise_alignment_uncertainty_us:
+                raise SimulationValidationError(
+                    f"collective {communication_id!r} iteration {iteration_id} "
+                    "has an inconsistent aligned endpoint at rank "
+                    f"{member.key.global_rank}, uid={member.key.uid!r}: "
+                    f"start={starts[member.key]:.3f} us, "
+                    f"end={observed_end_us:.3f} us, rendezvous="
+                    f"{observed_rendezvous_us:.3f} us, pairwise_uncertainty="
+                    f"{pairwise_alignment_uncertainty_us:.3f} us"
+                )
+            service_samples[member.key].append(max(0.0, raw_service_us))
+
+    if sample_iteration_id is not None:
+        return {key: values[0] for key, values in service_samples.items()}
+    return {
+        member.key: estimate_profile_time(
+            service_samples[member.key], _profile_estimator(member.profile)
+        )
+        for member in members
+    }
 
 
 def _mapping_int(mapping: Mapping[str, Any] | None, *names: str) -> int | None:
@@ -615,19 +811,21 @@ def _validate_p2p_vertex(
             f"one RECV endpoint; got {descriptions!r}"
         )
     send, recv = sends[0], recvs[0]
-    if send.dp_lane != recv.dp_lane:
+    if send.actor_group_local_rank != recv.actor_group_local_rank:
         raise SimulationValidationError(
-            f"P2P transaction {vertex.communication_id!r} crosses DP lanes: "
-            f"{send.dp_lane} vs {recv.dp_lane}"
+            f"P2P transaction {vertex.communication_id!r} crosses ActorGroup-local "
+            f"ranks: {send.actor_group_local_rank} vs "
+            f"{recv.actor_group_local_rank}"
         )
     transaction_ranks = {
         send.key.global_rank,
         recv.key.global_rank,
     }
-    # Piper inserts one SEND/RECV node per pair of PP device groups, then the
-    # simulator expands that node once per DP lane.  Consequently P2P
+    # Piper inserts one SEND/RECV node per pair of ActorGroups, then the
+    # simulator expands that node once per same-position ActorGroup member.
+    # Consequently P2P
     # ``participants`` describes the full pair of device groups (for example
-    # ranks 0,1,2,3), while this vertex is one lane-local transaction (for
+    # ranks 0,1,2,3), while this vertex is one ActorGroup-local transaction (for
     # example ranks 0,1).  Hand-built/legacy DAGs may instead store only the
     # two transaction ranks, so accept both precise representations while
     # still rejecting unrelated or incomplete participant sets.
@@ -733,64 +931,17 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
             # determines this start.  Do not claim a shorter dependency-only
             # chain is critical through the release gap.
             vertex.critical_pred = None
-        if vertex.rendezvous_endpoint_intervals:
-            latest_arrival_us = max(
-                vertices[arrival_id].end_us
-                for arrival_id, _interval_us
-                in vertex.rendezvous_endpoint_intervals
-            )
-            latest_intervals = [
-                interval_us
-                for arrival_id, interval_us
-                in vertex.rendezvous_endpoint_intervals
-                if math.isclose(
-                    vertices[arrival_id].end_us,
-                    latest_arrival_us,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-            ]
-            # At least one endpoint has zero modeled rendezvous wait.  Its
-            # measured interval is therefore the safest available fallback
-            # when another endpoint's interval is inconsistent with the
-            # modeled arrival skew.  Median tied latest arrivals instead of
-            # selecting the minimum rank duration.
-            vertex.rendezvous_fallback_service_us = statistics.median(
-                latest_intervals
-            )
         if vertex.endpoint_arrival_vertex_id is not None:
             arrival = vertices[vertex.endpoint_arrival_vertex_id]
-            profile_interval_us = vertex.endpoint_profile_interval_us
             observed_service_us = vertex.endpoint_observed_service_us
-            if profile_interval_us is None and observed_service_us is None:
+            if observed_service_us is None:
                 raise SimulationValidationError(
                     f"endpoint completion {vertex_id!r} has no communication timing"
                 )
             vertex.rendezvous_wait_us = max(
                 0.0, vertex.start_us - arrival.end_us
             )
-            if observed_service_us is not None:
-                # Calibrated profiles decompose service once on the observed
-                # cross-rank timeline.  Reuse that fixed endpoint-local tail
-                # in every replay instead of subtracting counterfactual wait.
-                residual_us = observed_service_us
-            else:
-                # Legacy profiles have only rank-local clock origins.  Retain
-                # the old best-effort decomposition for compatibility, while
-                # flagging inconsistent intervals below.
-                assert profile_interval_us is not None
-                residual_us = profile_interval_us - vertex.rendezvous_wait_us
-            vertex.interval_underflow_us = max(0.0, -residual_us)
-            if residual_us < 0.0:
-                rendezvous_id = vertex.endpoint_rendezvous_vertex_id
-                if rendezvous_id is None:
-                    raise SimulationValidationError(
-                        f"endpoint completion {vertex_id!r} has no rendezvous"
-                    )
-                residual_us = vertices[
-                    rendezvous_id
-                ].rendezvous_fallback_service_us
-            vertex.duration_us = residual_us
+            vertex.duration_us = observed_service_us
         vertex.end_us = vertex.start_us + vertex.duration_us
         for succ in sorted(vertex.succs):
             indegree[succ] -= 1
@@ -841,6 +992,38 @@ def simulate_training_step(
     )
     aligned_modes = alignment.get("modes", {}) if isinstance(alignment, Mapping) else {}
     cross_actor_offsets_aligned = profile_mode in aligned_modes
+    has_rendezvous_collectives = any(
+        node.node_kind in _COLLECTIVE_KINDS
+        for dag in dags
+        for node in dag.nodes.values()
+    )
+    if has_rendezvous_collectives and not cross_actor_offsets_aligned:
+        raise SimulationValidationError(
+            f"profile mode {profile_mode!r} contains rendezvous collectives but "
+            "has no cross-actor timeline alignment; re-profile this plan with "
+            "aligned CUPTI iteration anchors"
+        )
+    mode_alignment = (
+        aligned_modes.get(profile_mode, {})
+        if isinstance(aligned_modes, Mapping)
+        else {}
+    )
+    raw_pairwise_uncertainty = (
+        mode_alignment.get("max_pairwise_uncertainty_us", 0.0)
+        if isinstance(mode_alignment, Mapping)
+        else 0.0
+    )
+    pairwise_alignment_uncertainty_us = float(
+        0.0 if raw_pairwise_uncertainty is None else raw_pairwise_uncertainty
+    )
+    if (
+        not math.isfinite(pairwise_alignment_uncertainty_us)
+        or pairwise_alignment_uncertainty_us < 0.0
+    ):
+        raise SimulationValidationError(
+            f"profile mode {profile_mode!r} has invalid pairwise timeline "
+            f"uncertainty {raw_pairwise_uncertainty!r}"
+        )
     empty_dags = [index for index, dag in enumerate(dags) if not dag.nodes]
     if empty_dags:
         raise SimulationValidationError(
@@ -925,6 +1108,7 @@ def simulate_training_step(
                 if key in instances:
                     raise SimulationValidationError(f"duplicate node instance {key}")
                 if node.node_kind == "ORDER_DUMMY":
+                    profile = None
                     profile_duration = 0.0
                     profile_start_offset = 0.0
                 else:
@@ -939,11 +1123,12 @@ def simulate_training_step(
                         context=f"node {uid!r} rank {rank}",
                         sample_iteration_id=sample_iteration_id,
                     )
-                    profile_start_offset = (
-                        observed_profile_start_offset
-                        if profile_mode == NORMAL_PROFILE_MODE
-                        else 0.0
-                    )
+                    # Both modes replay the same dependency and physical
+                    # stream ordering.  Observed starts are diagnostics: they
+                    # may include host latency or resource queueing, which
+                    # must not make normal and isolated counterfactuals use
+                    # different release policies.
+                    profile_start_offset = 0.0
                     if cross_actor_offsets_aligned and not tuple(
                         getattr(profile, "start_offset_samples_us", ())
                     ):
@@ -956,8 +1141,9 @@ def simulate_training_step(
                 instances[key] = _InstanceRecord(
                     key=key,
                     pp_index=pp_index,
-                    dp_lane=layout.lane_by_rank[rank],
+                    actor_group_local_rank=layout.lane_by_rank[rank],
                     node=node,
+                    profile=profile,
                     profile_duration_us=profile_duration,
                     profile_start_offset_us=profile_start_offset,
                     observed_profile_start_offset_us=(
@@ -969,7 +1155,13 @@ def simulate_training_step(
     for record in instances.values():
         kind = record.node.node_kind
         if kind in _P2P_KINDS:
-            comm_groups[("p2p", _comm_id(record.node), record.dp_lane)].append(record)
+            comm_groups[
+                (
+                    "p2p",
+                    _comm_id(record.node),
+                    record.actor_group_local_rank,
+                )
+            ].append(record)
         elif kind in _COLLECTIVE_KINDS:
             comm_groups[("collective", kind, _comm_id(record.node))].append(record)
 
@@ -988,39 +1180,21 @@ def simulate_training_step(
         members = comm_groups[group_key]
         communication_id = ":".join(_identity_text(part) for part in group_key[1:])
         rendezvous_id = f"comm:{group_key[0]}:{communication_id}:rendezvous"
-        if rendezvous_id in vertices:
-            raise SimulationValidationError(
-                f"duplicate communication identity {rendezvous_id!r}"
-            )
-        rendezvous = _Vertex(
+        transaction = _Vertex(
             vertex_id=rendezvous_id,
             members=list(members),
             duration_us=0.0,
             communication_id=communication_id,
             emit_timeline=False,
         )
-        vertices[rendezvous_id] = rendezvous
+        if rendezvous_id in vertices:
+            raise SimulationValidationError(
+                f"duplicate communication identity {rendezvous_id!r}"
+            )
+        vertices[rendezvous_id] = transaction
 
-        observed_rendezvous_us: float | None = None
-        if cross_actor_offsets_aligned:
-            observed_rendezvous_us = max(
-                member.observed_profile_start_offset_us for member in members
-            )
-            latest_observed_intervals = [
-                member.profile_duration_us
-                for member in members
-                if math.isclose(
-                    member.observed_profile_start_offset_us,
-                    observed_rendezvous_us,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-            ]
-            rendezvous.rendezvous_fallback_service_us = statistics.median(
-                latest_observed_intervals
-            )
         if group_key[0] == "p2p":
-            _validate_p2p_vertex(rendezvous)
+            _validate_p2p_vertex(transaction)
         else:
             actual = {member.key.global_rank for member in members}
             expected_sets = {
@@ -1034,13 +1208,35 @@ def simulate_training_step(
                     f"collective {communication_id!r} endpoints disagree on participants: "
                     f"{sorted(expected_sets)!r}"
                 )
+            if group_key[1] in _ROUTED_COLLECTIVE_KINDS and not expected_sets:
+                raise SimulationValidationError(
+                    f"routed collective {communication_id!r} has no declared participants"
+                )
             if expected_sets and actual != set(next(iter(expected_sets))):
                 raise SimulationValidationError(
                     f"collective {communication_id!r} has ranks {sorted(actual)!r}, expected "
                     f"{sorted(next(iter(expected_sets)))!r}"
                 )
 
-        rendezvous_endpoint_intervals: list[tuple[str, float]] = []
+        observed_service_by_endpoint: dict[NodeInstance, float]
+        if group_key[0] == "collective":
+            observed_service_by_endpoint = _symmetric_collective_observed_services(
+                members,
+                communication_id=communication_id,
+                sample_iteration_id=sample_iteration_id,
+                pairwise_alignment_uncertainty_us=(
+                    pairwise_alignment_uncertainty_us
+                ),
+            )
+        else:
+            # Directional P2P durations are isolated transfer-service
+            # microprofiles, so no observed-wait decomposition is needed.
+            observed_service_by_endpoint = {
+                member.key: member.profile_duration_us for member in members
+            }
+
+        arrival_ids: dict[NodeInstance, str] = {}
+        completion_ids: dict[NodeInstance, str] = {}
         for member in members:
             endpoint_suffix = (
                 f"{member.key.global_rank}:{member.key.uid}"
@@ -1076,42 +1272,31 @@ def simulate_training_step(
                     vertex_id=completion_id,
                     members=[member],
                     # Calibrated profiles provide a fixed tail derived from the
-                    # observed rendezvous. Legacy profiles resolve the tail from
-                    # the measured interval minus graph-predicted peer wait.
+                    # observed rendezvous.
                     duration_us=0.0,
                     communication_id=communication_id,
                     endpoint_arrival_vertex_id=arrival_id,
-                    endpoint_rendezvous_vertex_id=rendezvous_id,
-                    endpoint_profile_interval_us=(
-                        None
-                        if observed_rendezvous_us is not None
-                        else member.profile_duration_us
-                    ),
-                    endpoint_observed_service_us=(
-                        None
-                        if observed_rendezvous_us is None
-                        else (
-                            member.observed_profile_start_offset_us
-                            + member.profile_duration_us
-                            - observed_rendezvous_us
-                        )
-                    ),
+                    endpoint_observed_service_us=observed_service_by_endpoint[
+                        member.key
+                    ],
                 )
-            if observed_rendezvous_us is None and not nonblocking_send:
-                rendezvous_endpoint_intervals.append(
-                    (arrival_id, member.profile_duration_us)
-                )
-            _add_vertex_edge(vertices, arrival_id, rendezvous_id)
-            _add_vertex_edge(
-                vertices,
-                arrival_id if nonblocking_send else rendezvous_id,
-                completion_id,
-            )
+            arrival_ids[member.key] = arrival_id
+            completion_ids[member.key] = completion_id
             instance_start_vertex[member.key] = arrival_id
             instance_vertex[member.key] = completion_id
-        rendezvous.rendezvous_endpoint_intervals = tuple(
-            rendezvous_endpoint_intervals
-        )
+
+        for member in members:
+            _add_vertex_edge(vertices, arrival_ids[member.key], rendezvous_id)
+            nonblocking_send = _is_nonblocking_p2p_send(member)
+            _add_vertex_edge(
+                vertices,
+                arrival_ids[member.key] if nonblocking_send else rendezvous_id,
+                completion_ids[member.key],
+            )
+            if not nonblocking_send:
+                vertices[
+                    completion_ids[member.key]
+                ].endpoint_rendezvous_vertex_id = rendezvous_id
 
     for record in instances.values():
         if record.key in instance_vertex:
@@ -1122,11 +1307,6 @@ def simulate_training_step(
             members=[record],
             duration_us=record.profile_duration_us,
             release_us=record.profile_start_offset_us,
-            communication_id=(
-                _comm_id(record.node)
-                if record.node.node_kind in _RAGGED_A2A_KINDS
-                else None
-            ),
         )
         instance_vertex[record.key] = vertex_id
         instance_start_vertex[record.key] = vertex_id
@@ -1138,16 +1318,17 @@ def simulate_training_step(
         record = _InstanceRecord(
             key=key,
             pp_index=layout.pp_by_rank[rank],
-            dp_lane=layout.lane_by_rank[rank],
-            node=TrainingDAGNode(
+            actor_group_local_rank=layout.lane_by_rank[rank],
+                node=TrainingDAGNode(
                 uid=_PROLOGUE_UID,
                 node_kind="STEP_PROLOGUE",
                 compute_subkind=None,
                 tag={},
                 device=[rank],
-                stream="__prologue__",
-            ),
-            profile_duration_us=_profile_duration_us(
+                    stream="__prologue__",
+                ),
+                profile=merged_prologue[rank],
+                profile_duration_us=_profile_duration_us(
                 merged_prologue[rank],
                 context=f"prologue rank {rank}",
                 sample_iteration_id=sample_iteration_id,
@@ -1165,8 +1346,8 @@ def simulate_training_step(
 
     # Lower the same completion dependencies used by DagExecutor.  The shared
     # plan includes stream FIFO order, DAG edges, RECV consumer-stream guards,
-    # and update synchronization.  Profiling maps the two directional P2P
-    # communicators onto dedicated physical streams.  Opposite-direction P2P
+    # and update synchronization. Profiling maps the two directional P2P
+    # communicators onto dedicated physical streams. Opposite-direction P2P
     # issue-order edges are relaxed by the same shared predicate as the CUDA
     # executor; data dependencies are never relaxed.
     for pp_index, dag in enumerate(dags):
@@ -1199,34 +1380,6 @@ def simulate_training_step(
                 )
 
     simulation_order = _simulate_vertices(vertices)
-    interval_underflows = [
-        vertex
-        for vertex in vertices.values()
-        if vertex.interval_underflow_us > 0.0
-    ]
-    if interval_underflows:
-        worst = max(
-            interval_underflows,
-            key=lambda vertex: vertex.interval_underflow_us,
-        )
-        underflow_counts: dict[str, int] = defaultdict(int)
-        for vertex in interval_underflows:
-            for member in vertex.members:
-                underflow_counts[member.node.node_kind] += 1
-        counts_text = ", ".join(
-            f"{kind}={count}"
-            for kind, count in sorted(underflow_counts.items())
-        )
-        warnings.append(
-            "communication timing decomposition produced negative residual "
-            f"service for {len(interval_underflows)} endpoints; "
-            "their residual service used the median interval of the "
-            "latest-arriving endpoint(s) "
-            f"(by kind: {counts_text}; "
-            f"worst underflow={worst.interval_underflow_us:.3f} us at "
-            f"{worst.vertex_id}). This indicates inconsistent endpoint "
-            "clocks or replay arrivals and reduces prediction reliability."
-        )
 
     timeline: list[TimelineEvent] = []
     per_rank: dict[int, float] = {rank: 0.0 for rank in layout.ranks}
@@ -1249,6 +1402,12 @@ def simulate_training_step(
                 profile_duration_us=member.profile_duration_us,
                 effective_duration_us=vertex.duration_us,
                 profile_start_offset_us=member.profile_start_offset_us,
+                observed_profile_start_offset_us=(
+                    member.observed_profile_start_offset_us
+                ),
+                arrival_start_us=vertices[
+                    instance_start_vertex[member.key]
+                ].start_us,
                 communication_id=vertex.communication_id,
                 critical_predecessor=critical_predecessor,
             )
@@ -1379,10 +1538,9 @@ def observed_profile_step_time_samples(
     Normal profiling records every node's duration and its start offset from
     that actor's iteration origin.  New profile plans translate those offsets
     to a shared origin, so the maximum ``offset + duration`` reconstructs the
-    global observed GPU envelope.  For legacy plans the same calculation is
-    only an approximate rank-local diagnostic.  It is not a counterfactual
-    scheduler: it deliberately does not collapse collective endpoints or move
-    downstream work.
+    global observed GPU envelope.  It is not a counterfactual scheduler: it
+    deliberately does not collapse collective endpoints or move downstream
+    work.
     """
 
     mode = normalize_profile_mode(profile_mode)
@@ -1444,6 +1602,19 @@ def simulate_profile_modes(
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
+    interference_free_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=INTERFERENCE_FREE_PROFILE_MODE
+    )
+    normal_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=NORMAL_PROFILE_MODE
+    )
+    if interference_free_iteration_ids != normal_iteration_ids:
+        raise SimulationValidationError(
+            "normal and interference-free profile iterations must align for "
+            "paired IF-savings estimation: "
+            f"normal={normal_iteration_ids!r}, "
+            f"interference_free={interference_free_iteration_ids!r}"
+        )
     interference_free_samples = simulate_training_step_samples(
         plan_or_dags,
         profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
@@ -1454,13 +1625,12 @@ def simulate_profile_modes(
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
-    interference_free_statistics = summarize_timing_samples(
-        interference_free_samples,
-        estimator="median",
+    interference_free_statistics = summarize_mean_samples(
+        interference_free_samples
     )
-    normal_statistics = summarize_timing_samples(
-        normal_samples,
-        estimator="median",
+    normal_statistics = summarize_mean_samples(normal_samples)
+    dependency_replay_savings_statistics = summarize_paired_savings(
+        normal_samples, interference_free_samples
     )
     observed_normal_envelope_samples: tuple[float, ...] = ()
     observed_normal_envelope_statistics = None
@@ -1490,9 +1660,8 @@ def simulate_profile_modes(
     instrumented_normal_replay_error = None
     instrumented_interference_free_replay_error = None
     observed_reduction_pct = None
-    dependency_replay_reduction_pct = predicted_reduction(
-        interference_free_statistics.estimate,
-        normal_statistics.estimate,
+    dependency_replay_reduction_pct = (
+        dependency_replay_savings_statistics.percent
     )
     instrumented_policy_reduction_pct = None
     envelope_modeled_reduction_pct = None
@@ -1606,6 +1775,9 @@ def simulate_profile_modes(
         ),
         interference_free_statistics=interference_free_statistics,
         normal_statistics=normal_statistics,
+        dependency_replay_savings_statistics=(
+            dependency_replay_savings_statistics
+        ),
         observed_normal_envelope_statistics=(
             observed_normal_envelope_statistics
         ),
@@ -1624,6 +1796,9 @@ def simulate_profile_modes(
             instrumented_interference_free_replay_error
         ),
         predicted_interference_reduction_pct=reduction_pct,
+        dependency_replay_absolute_savings_us=(
+            dependency_replay_savings_statistics.absolute_mean
+        ),
         dependency_replay_interference_reduction_pct=(
             dependency_replay_reduction_pct
         ),
@@ -1637,6 +1812,14 @@ def simulate_profile_modes(
         ),
         profile_event_overhead_pct=event_overhead_pct,
         mode_profile_event_overhead_pct=mode_profile_event_overhead_pct,
+        kineto_cupti_instrumentation_error=(
+            None
+            if instrumented_statistics is None or actual_statistics is None
+            else prediction_error(
+                instrumented_statistics.estimate,
+                actual_statistics.estimate,
+            )
+        ),
     )
 
 

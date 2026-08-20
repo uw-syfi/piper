@@ -530,25 +530,21 @@ class RuntimeState:
     ) -> torch.cuda.Stream:
         """Resolve the physical stream for one profiling policy.
 
-        Isolated profiling collapses non-P2P work onto the default stream so
-        CUDA-event durations are free from actor-local kernel contention.
-        Concurrent profiling retains the normal logical stream assignment so
-        its durations capture the contention present in an ordinary step.
+        Both profiling policies preserve the ordinary logical stream
+        assignment.  Interference-free execution is serialized separately by
+        :class:`DagExecutor`, using a CUDA-event handoff between nodes.
 
         Directional communication is deliberately identical to ordinary
         execution in both modes: P2P sends/receives use dedicated lo->hi and
         hi->lo streams, while routed collectives use dedicated M-to-N and
-        N-to-M streams. Serializing opposite directions can create an NCCL
-        rendezvous deadlock.
+        N-to-M streams.
         """
 
-        mode = normalize_profile_mode(profile_mode)
+        normalize_profile_mode(profile_mode)
         if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
             return self.directional_p2p_stream_for_task(task)
         if getattr(task, "node_kind", None) in {"M_TO_N_COMM", "N_TO_M_COMM"}:
             return self.directional_routed_stream_for_task(task)
-        if mode == "interference_free":
-            return self.default_stream()
         return logical_stream
 
     def nvtx_push(self, label: str) -> None:

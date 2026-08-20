@@ -234,7 +234,9 @@ def test_plan_rejects_missing_or_duplicate_dispatch_nodes() -> None:
         build_execution_plan(dag, ["a", "a"])
 
 
-def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> None:
+def test_executor_applies_plan_and_serialization_waits_outside_ranges(
+    monkeypatch,
+) -> None:
     trace: list[tuple] = []
 
     class FakeStream:
@@ -266,8 +268,8 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         ),
         stream_id=lambda node: node.stream,
         pytorch_profiler_enabled=False,
-        nvtx_push=lambda _label: None,
-        nvtx_pop=lambda: None,
+        nvtx_push=lambda label: trace.append(("push", label)),
+        nvtx_pop=lambda: trace.append(("pop",)),
     )
 
     first = _node("first", kind="ORDER_DUMMY", subkind=None)
@@ -318,6 +320,10 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         compute=Mock(),
         logger=logger,
     )
+    executor._rf_enter = lambda label: (
+        trace.append(("rf_push", label)) or label
+    )
+    executor._rf_exit = lambda label: trace.append(("rf_pop", label))
 
     override_calls: list[str] = []
 
@@ -345,6 +351,7 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         labels=None,
         loss_buffer=[],
         timing_recorder=Recorder(),
+        serialize_nodes=True,
     )
 
     assert override_calls == []
@@ -363,4 +370,40 @@ def test_executor_applies_plan_waits_before_timing_callbacks(monkeypatch) -> Non
         ("before_node", "second", "profile-comm")
     )
     assert dependency_wait_index < second_timing_index
+
+    first_push_index = next(
+        index
+        for index, entry in enumerate(trace)
+        if entry[0] == "push" and "uidfirst" in entry[1]
+    )
+    first_pop_index = trace.index(("pop",), first_push_index)
+    first_rf_pop_index = next(
+        index
+        for index, entry in enumerate(trace)
+        if entry[0] == "rf_pop" and "uidfirst" in entry[1]
+    )
+    serialization_record = next(
+        entry
+        for entry in trace[first_pop_index + 1 :]
+        if entry[0] == "record" and entry[2] == "profile-compute"
+    )
+    serialization_record_index = trace.index(serialization_record)
+    serialization_wait_index = trace.index(
+        ("wait", "profile-comm", serialization_record[1])
+    )
+    second_push_index = next(
+        index
+        for index, entry in enumerate(trace)
+        if entry[0] == "push" and "uidsecond" in entry[1]
+    )
+    second_rf_push_index = next(
+        index
+        for index, entry in enumerate(trace)
+        if entry[0] == "rf_push" and "uidsecond" in entry[1]
+    )
+    assert first_rf_pop_index < serialization_record_index
+    assert first_pop_index < serialization_record_index
+    assert serialization_record_index < serialization_wait_index
+    assert serialization_wait_index < second_push_index
+    assert serialization_wait_index < second_rf_push_index
     assert trace[-2:] == [("synchronize",), ("finish",)]
