@@ -6,7 +6,7 @@ import hashlib
 import json
 import tempfile
 import time
-from typing import Any
+from typing import Any, Sequence
 import gc
 import statistics
 from datetime import timedelta
@@ -35,7 +35,7 @@ from .executors import (
     DagExecutor,
     PreparedDagExecution,
 )
-from .ordering import _serial_topological_order
+from .ordering import _dispatch_order
 from .profiling import (
     ActorProfileResult,
     DEFAULT_NORMAL_SCOPE,
@@ -59,8 +59,8 @@ CLEANUP_MEMORY = False
 
 logger = create_logger("actor", LOG_LEVEL)
 
-
 _KINETO_ITERATION_ANCHOR_PREFIX = "piper_profile_timeline_anchor:"
+
 
 def _kineto_node_attribution_audit(
     profiler,
@@ -1249,10 +1249,6 @@ class PiperActor:
                         f"p2p:{name}": int(stream.cuda_stream)
                         for name, stream in self.runtime.directional_p2p_streams.items()
                     },
-                    **{
-                        f"routed:{name}": int(stream.cuda_stream)
-                        for name, stream in self.runtime.directional_routed_streams.items()
-                    },
                 },
                 "actor_group_id": int(self.runtime.actor_group_id),
                 "actor_group_devices": list(self.runtime.actor_group_devices),
@@ -1509,10 +1505,9 @@ class PiperActor:
             tuple(sorted(int(rank) for rank in group))
             for group in self.runtime.actor_groups
         )
-        # Metadata exchange and opposite AF directions may execute concurrently.
-        # Give layout, M-to-N, and N-to-M independent NCCL communicators so their
-        # collective sequence numbers cannot conflict even though the participant
-        # set is equal.
+        # Keep layout, M-to-N, and N-to-M on independent NCCL communicator
+        # channels even when their participant set is equal. Their CUDA issue
+        # order is finalized separately from the schedule-declared stream.
         for participants, channel in self.runtime.process_group_creation_specs():
             process_group = dist.new_group(
                 ranks=list(participants),
@@ -1976,7 +1971,11 @@ class PiperActor:
         # Keep first GraphModule for compatibility with external inspection tools.
         self.stages.graph_modules[stage_id] = first_gm
 
-    def load_training_dag(self, training_dag: Any) -> None:
+    def load_training_dag(
+        self,
+        training_dag: Any,
+        interference_free_order: Sequence[str],
+    ) -> None:
         """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
 
         This is an adapter for the new TrainingDAG representation where each
@@ -1988,6 +1987,25 @@ class PiperActor:
             raise ValueError("load_training_dag requires non-None training_dag")
         if not hasattr(training_dag, "nodes"):
             raise TypeError("load_training_dag expected object with 'nodes' field")
+
+        if_order = tuple(interference_free_order)
+        if (
+            len(if_order) != len(training_dag.nodes)
+            or len(set(if_order)) != len(if_order)
+            or set(if_order) != set(training_dag.nodes)
+        ):
+            raise ValueError(
+                "interference-free order must contain every TrainingDAG UID "
+                f"exactly once: order={if_order!r}, "
+                f"nodes={sorted(training_dag.nodes)!r}"
+            )
+        if_index = {uid: index for index, uid in enumerate(if_order)}
+        for edge in training_dag.edges:
+            if if_index[edge.src_uid] >= if_index[edge.dst_uid]:
+                raise ValueError(
+                    "interference-free order violates TrainingDAG edge "
+                    f"{edge.src_uid}->{edge.dst_uid} ({edge.dep_kind})"
+                )
 
         self._derive_dag_bucket_modes(training_dag)
         self.runtime.initialize_streams_for_training_dag(training_dag)
@@ -2110,9 +2128,14 @@ class PiperActor:
             if e.dep_kind == "temporal":
                 src.temporal_succs.append(dst)
                 dst.temporal_preds.append(src)
-            else:
+            elif e.dep_kind == "data":
                 src.data_succs.append(dst)
                 dst.data_preds.append(src)
+            elif e.dep_kind != "issue":
+                raise ValueError(
+                    f"unsupported dependency kind {e.dep_kind!r} on "
+                    f"{e.src_uid} -> {e.dst_uid}"
+                )
 
         for n in training_dag.nodes.values():
             n.task_type = _training_dag_task_type(n)
@@ -2122,22 +2145,25 @@ class PiperActor:
 
         self.dag = training_dag
         self.sorted_dag_nodes = [
-            training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
+            training_dag.nodes[uid]
+            for uid in _dispatch_order(training_dag)
         ]
         self.prepared_dag_execution = self.dag_executor.prepare(
             training_dag,
             self.sorted_dag_nodes,
             stream_override=self.runtime.execution_stream_for_task,
         )
-        # Normal profiling uses the ordinary physical-stream policy exactly;
-        # only interference-free profiling needs a remapped stream table.
+        # Normal profiling uses the ordinary issue order exactly. The
+        # interference-free policy uses the transaction-consistent projection
+        # computed once from all ActorGroup DAGs.
         self.profile_prepared_dag_executions = {
             "normal": self.prepared_dag_execution,
         }
         for profile_mode in sorted(PROFILE_MODES - {"normal"}):
             self.profile_prepared_dag_executions[profile_mode] = (
-                self.dag_executor.remap_streams(
-                    self.prepared_dag_execution,
+                self.dag_executor.prepare(
+                    training_dag,
+                    [training_dag.nodes[uid] for uid in if_order],
                     stream_override=(
                         lambda node, logical_stream, mode=profile_mode: (
                             self._profile_stream_override(
@@ -2534,7 +2560,7 @@ class PiperActor:
                     end = torch.cuda.Event(enable_timing=True)
                     start.record(stream)
                     if node.node_kind == "SEND_COMM":
-                        self.communication.send(
+                        p2p_launch = self.communication.send(
                             tensors, peer, stream, task=node
                         )
                     else:
@@ -2548,6 +2574,8 @@ class PiperActor:
                                 dist.recv(tensor, src=source, group=group)
                     end.record(stream)
                     end.synchronize()
+                    if node.node_kind == "SEND_COMM":
+                        del p2p_launch
                     samples.append(float(start.elapsed_time(end)) * 1000.0)
             if samples:
                 results[comm_id] = float(statistics.median(samples))

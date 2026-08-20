@@ -21,10 +21,6 @@ def _runtime(global_pp_rank: int = 1) -> RuntimeState:
         "dense_state_lo_hi": object(),
         "dense_state_hi_lo": object(),
     }
-    runtime.directional_routed_streams = {
-        "m_to_n": object(),
-        "n_to_m": object(),
-    }
     runtime.streams = {
         "default_stream": object(),
         "compute_stream": object(),
@@ -115,57 +111,6 @@ def test_directional_p2p_stream_rejects_non_p2p_task() -> None:
         raise AssertionError("expected non-P2P profile stream lookup to fail")
 
 
-def test_directional_streams_match_routed_collective_channels() -> None:
-    runtime = _runtime()
-    dispatch = SimpleNamespace(uid="dispatch", node_kind="M_TO_N_COMM")
-    combine = SimpleNamespace(uid="combine", node_kind="N_TO_M_COMM")
-
-    assert (
-        runtime.directional_routed_stream_for_task(dispatch)
-        is runtime.directional_routed_streams["m_to_n"]
-    )
-    assert (
-        runtime.directional_routed_stream_for_task(combine)
-        is runtime.directional_routed_streams["n_to_m"]
-    )
-    assert (
-        runtime.directional_routed_stream_for_task(dispatch)
-        is not runtime.directional_routed_stream_for_task(combine)
-    )
-
-
-def test_directional_routed_stream_rejects_non_routed_task() -> None:
-    runtime = _runtime()
-    task = SimpleNamespace(uid="compute", node_kind="COMPUTE")
-
-    try:
-        runtime.directional_routed_stream_for_task(task)
-    except ValueError as exc:
-        assert "M_TO_N_COMM or N_TO_M_COMM" in str(exc)
-    else:
-        raise AssertionError("expected non-routed stream lookup to fail")
-
-
-def test_directional_routed_streams_initialize_once_with_cpu_mock(monkeypatch) -> None:
-    runtime = _runtime()
-    runtime.directional_routed_streams = {}
-    created = []
-
-    def _fake_stream(*, device):
-        stream = ("stream", device, len(created))
-        created.append(stream)
-        return stream
-
-    monkeypatch.setattr("src.runtime.torch.cuda.Stream", _fake_stream)
-    dispatch = SimpleNamespace(uid="dispatch", node_kind="M_TO_N_COMM")
-    combine = SimpleNamespace(uid="combine", node_kind="N_TO_M_COMM")
-
-    assert runtime.directional_routed_stream_for_task(dispatch) is created[0]
-    assert runtime.directional_routed_stream_for_task(combine) is created[1]
-    assert runtime.directional_routed_stream_for_task(dispatch) is created[0]
-    assert len(created) == 2
-
-
 def test_execution_stream_policy_uses_directional_p2p_streams() -> None:
     runtime = _runtime(global_pp_rank=1)
     p2p = SimpleNamespace(
@@ -184,19 +129,13 @@ def test_execution_stream_policy_uses_directional_p2p_streams() -> None:
     )
 
 
-def test_execution_stream_policy_uses_directional_routed_streams() -> None:
+def test_execution_stream_policy_preserves_declared_routed_stream() -> None:
     runtime = _runtime()
     logical_stream = runtime.streams["compute_stream"]
 
-    for node_kind, channel in (
-        ("M_TO_N_COMM", "m_to_n"),
-        ("N_TO_M_COMM", "n_to_m"),
-    ):
-        task = SimpleNamespace(uid=channel, node_kind=node_kind)
-        assert (
-            runtime.execution_stream_for_task(task, logical_stream)
-            is runtime.directional_routed_streams[channel]
-        )
+    for node_kind in ("A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"):
+        task = SimpleNamespace(uid=node_kind, node_kind=node_kind)
+        assert runtime.execution_stream_for_task(task, logical_stream) is logical_stream
 
 
 def test_interference_free_profile_preserves_non_p2p_logical_stream() -> None:
@@ -241,23 +180,20 @@ def test_both_profile_modes_keep_directional_p2p_streams() -> None:
         )
 
 
-def test_both_profile_modes_keep_directional_routed_streams() -> None:
+def test_both_profile_modes_preserve_declared_routed_stream() -> None:
     runtime = _runtime()
     logical_stream = runtime.streams["compute_stream"]
 
     for profile_mode in ("interference_free", "normal"):
-        for node_kind, channel in (
-            ("M_TO_N_COMM", "m_to_n"),
-            ("N_TO_M_COMM", "n_to_m"),
-        ):
-            task = SimpleNamespace(uid=channel, node_kind=node_kind)
+        for node_kind in ("A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"):
+            task = SimpleNamespace(uid=node_kind, node_kind=node_kind)
             assert (
                 runtime.profile_stream_for_task(
                     task,
                     logical_stream,
                     profile_mode=profile_mode,
                 )
-                is runtime.directional_routed_streams[channel]
+                is logical_stream
             )
 
 

@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from unittest.mock import Mock, call
 
 import pytest
@@ -143,9 +143,6 @@ def test_update_steps_sharded_and_regular_optimizers(monkeypatch) -> None:
         logger=None,
     )
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
-    synchronize = Mock()
-    monkeypatch.setattr(executors.torch.cuda, "synchronize", synchronize)
-
     executor._update(stream, [])
 
     params.drain_pending_frees.assert_called_once_with()
@@ -157,7 +154,6 @@ def test_update_steps_sharded_and_regular_optimizers(monkeypatch) -> None:
         stream, events.reduce_scatter
     )
     regular_optimizer.step.assert_called_once_with()
-    synchronize.assert_called_once_with()
 
 
 def test_actor_group_p2p_uses_the_task_specific_pair_communicator(
@@ -176,14 +172,125 @@ def test_actor_group_p2p_uses_the_task_specific_pair_communicator(
         logger=None,
     )
     tensor = torch.randn(2, 3)
-    send = Mock()
-    monkeypatch.setattr(executors.dist, "send", send)
+    work = Mock()
+    isend = Mock(return_value=work)
+    monkeypatch.setattr(executors.dist, "isend", isend)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
-    communication.send(tensor, 1, object(), task=task)
+    launch = communication.send(tensor, 1, object(), task=task)
 
     runtime.p2p_process_group_for_task.assert_called_once_with(task)
-    send.assert_called_once_with(tensor, dst=1, group="pair-group")
+    isend.assert_called_once_with(tensor, dst=1, group="pair-group")
+    work.wait.assert_called_once_with()
+    assert launch.result is None
+    assert launch.works == (work,)
+    assert launch.tensors == (tensor,)
+
+
+def test_p2p_work_wait_is_enqueued_on_declared_stream(monkeypatch) -> None:
+    stream = object()
+    active_streams = []
+
+    @contextmanager
+    def stream_context(selected):
+        active_streams.append(selected)
+        try:
+            yield
+        finally:
+            active_streams.pop()
+
+    class Work:
+        def wait(self):
+            assert active_streams == [stream]
+
+    tensor = Mock(is_cuda=True)
+    runtime = SimpleNamespace(
+        pipeline_peer_global_rank=lambda _peer_group: 3,
+        p2p_process_group_for_task=lambda _task: "pair-group",
+    )
+    communication = CommunicationExecutor(runtime, stages=None, logger=None)
+    monkeypatch.setattr(executors.torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(executors.dist, "isend", Mock(return_value=Work()))
+
+    launch = communication.send(
+        tensor,
+        1,
+        stream,
+        task=SimpleNamespace(uid="send", node_kind="SEND_COMM"),
+    )
+
+    tensor.record_stream.assert_called_once_with(stream)
+    assert len(launch.works) == 1
+
+
+def test_fixed_shape_receive_retains_all_work_and_tensors(monkeypatch) -> None:
+    task = SimpleNamespace(uid="recv", node_kind="RECV_COMM")
+    bucket = SimpleNamespace(
+        forward_input_meta=[
+            ((2, 3), torch.float32, True),
+            ((2,), torch.int64, False),
+        ]
+    )
+    runtime = SimpleNamespace(
+        device="cpu",
+        pipeline_peer_global_rank=lambda _peer_group: 5,
+        p2p_process_group_for_task=Mock(return_value="pair-group"),
+    )
+    communication = CommunicationExecutor(
+        runtime,
+        stages=SimpleNamespace(bucket=lambda _ubid: bucket),
+        logger=None,
+    )
+    works = [Mock(), Mock()]
+    irecv = Mock(side_effect=works)
+    monkeypatch.setattr(executors.dist, "irecv", irecv)
+    monkeypatch.setattr(
+        executors.torch.cuda,
+        "stream",
+        lambda _stream: nullcontext(),
+    )
+
+    launch = communication.recv_fwd("bucket", 1, object(), task=task)
+
+    assert [tuple(tensor.shape) for tensor in launch.result] == [(2, 3), (2,)]
+    assert launch.tensors == tuple(launch.result)
+    assert launch.works == tuple(works)
+    assert irecv.call_count == 2
+    assert all(call.kwargs == {"src": 5, "group": "pair-group"} for call in irecv.call_args_list)
+    for work in works:
+        work.wait.assert_called_once_with()
+
+
+def test_pending_p2p_lifetime_is_reaped_only_after_event_completion() -> None:
+    communication = CommunicationExecutor(
+        SimpleNamespace(),
+        stages=None,
+        logger=None,
+    )
+    work = Mock()
+    tensor = Mock()
+    launch = executors._P2PLaunch(None, (work,), (tensor,))
+    event = Mock()
+    event.query.return_value = False
+
+    communication.retain_p2p_launch(launch, event)
+    communication.reap_completed_p2p()
+
+    assert communication.pending_p2p == [(event, launch)]
+    work.wait.assert_not_called()
+
+    event.query.return_value = True
+    communication.reap_completed_p2p()
+
+    assert communication.pending_p2p == []
+    work.wait.assert_not_called()
+
+
+def test_blocking_nccl_wait_configuration_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("TORCH_NCCL_BLOCKING_WAIT", "1")
+
+    with pytest.raises(RuntimeError, match="TORCH_NCCL_BLOCKING_WAIT"):
+        CommunicationExecutor(SimpleNamespace(), stages=None, logger=None)
 
 
 def test_replicated_gradient_all_reduce_averages_over_actor_group(
@@ -476,11 +583,11 @@ def test_a2a_dispatch_preserves_source_major_counts_and_opaque_rank_blocks(
     count_collective_inputs = []
     payload_collective_inputs = []
 
-    def fake_count_a2a(tensor, *_args, **_kwargs):
+    def fake_count_a2a(output, tensor, *_args, **_kwargs):
         count_collective_inputs.append(tensor.clone())
-        return torch.tensor([5, 6, 7, 8])
+        output.copy_(torch.tensor([5, 6, 7, 8]))
 
-    monkeypatch.setattr(executors, "all_to_all_single", fake_count_a2a)
+    monkeypatch.setattr(executors.dist, "all_to_all_single", fake_count_a2a)
 
     def fake_payload_a2a(tensor, *_args, **_kwargs):
         payload_collective_inputs.append(tensor.clone())
@@ -488,7 +595,7 @@ def test_a2a_dispatch_preserves_source_major_counts_and_opaque_rank_blocks(
 
     monkeypatch.setattr(
         executors,
-        "all_to_all_single_autograd",
+        "_stream_ordered_all_to_all",
         fake_payload_a2a,
     )
     monkeypatch.setattr(
@@ -548,7 +655,7 @@ def test_a2a_combine_and_backward_use_canonical_rank_block_order(
             return torch.cat((torch.zeros(3, 2), torch.ones(7, 2)))
         return torch.cat((torch.zeros(11, 2), torch.ones(15, 2)))
 
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     model_source_major = torch.cat(
         (torch.full((11, 2), 0.0), torch.full((15, 2), 1.0))
     )
@@ -774,7 +881,7 @@ def test_dense_n_to_m_destination_needs_splits_but_not_expert_permutation(
         calls.append((tensor, output_splits, input_splits, group))
         return received
 
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     result = executor._routed_cross_group_boundary(node, None, object())
@@ -827,15 +934,14 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
         ),
     )
     source_major = torch.cat((torch.zeros(5, 2), torch.full((5, 2), 2.0)))
-    completed = []
-    communicator_output = SimpleNamespace(wait=lambda: completed.append(True))
+    communicator_output = torch.empty(0, 2)
     calls = []
 
     def fake_a2a(tensor, output_splits, input_splits, group):
         calls.append((tensor.clone(), output_splits, input_splits, group))
         return communicator_output
 
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     result = executor._routed_cross_group_boundary(node, source_major, object())
@@ -847,13 +953,7 @@ def test_cross_group_n_to_m_uses_canonical_rank_block_order(monkeypatch) -> None
         [0, 0, 5, 5],
         "combine-n-to-m",
     )
-    assert executor.pending_routed_source_results == [communicator_output]
-    assert completed == []
-
-    executor._drain_routed_source_results()
-
-    assert completed == [True]
-    assert executor.pending_routed_source_results == []
+    assert communicator_output.numel() == 0
 
 
 def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
@@ -922,15 +1022,14 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
 
     layout_calls = []
 
-    def fake_all_gather(output, _counts, *, group, async_op):
+    def fake_all_gather(output, _counts, *, group, **kwargs):
         if tuple(output.shape) == tuple(gathered_counts.shape):
             output.copy_(gathered_counts)
         else:
             output.copy_(
                 torch.tensor([[10, 3], [0, 0], [20, 3], [0, 0]])
             )
-        layout_calls.append((group, async_op))
-        return SimpleNamespace(wait=lambda: None)
+        layout_calls.append((group, kwargs))
 
     monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
 
@@ -938,7 +1037,7 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
         calls.append((tensor, output_splits, input_splits, group))
         return received
 
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     routed, local_counts = executor._routed_cross_group_boundary(
@@ -949,7 +1048,7 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     assert torch.equal(local_counts, torch.tensor([[1, 2], [5, 6]]))
     assert state.dispatch_input_splits == [0, 0, 0, 0]
     assert state.routed_dispatch_output_splits == [3, 0, 11, 0]
-    assert layout_calls == [("layout", True), ("layout", True)]
+    assert layout_calls == [("layout", {}), ("layout", {})]
     assert calls[0][0].shape == (0, 3)
     assert calls[0][1:] == (
         [3, 0, 11, 0],
@@ -958,7 +1057,9 @@ def test_m_to_n_destination_derives_source_major_splits_and_local_counts(
     )
 
 
-def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
+def test_m_to_n_source_orders_layout_collectives_without_escaped_work(
+    monkeypatch,
+) -> None:
     state = executors._RoutedCrossGroupState(
         dispatch_devices=(0, 2),
         routed_devices=(1, 3),
@@ -991,17 +1092,12 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
         node_meta={"role": "source", "routing_counts_idx": 1},
     )
     local_counts = torch.tensor([[4, 1, 2, 3]])
-    waited = []
-    works = [
-        SimpleNamespace(wait=lambda: waited.append("counts")),
-        SimpleNamespace(wait=lambda: waited.append("shape")),
-    ]
+    calls = []
 
-    def fake_all_gather(output, _counts, *, group, async_op):
+    def fake_all_gather(output, _counts, *, group, **kwargs):
         assert group == "layout"
-        assert async_op
+        calls.append(kwargs)
         output.zero_()
-        return works.pop(0)
 
     monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
 
@@ -1017,11 +1113,7 @@ def test_m_to_n_source_retains_layout_work_without_waiting(monkeypatch) -> None:
     assert returned_counts is local_counts
     assert grouped_counts is None
     assert state.dispatch_input_splits == [0, 5, 0, 5]
-    assert state.layout_work is not None
-    assert state.layout_output is not None
-    assert state.layout_shape_work is not None
-    assert state.layout_shape_output is not None
-    assert waited == []
+    assert calls == [{}, {}]
 
 
 def test_m_to_n_source_uses_canonical_shard_and_collective_order(
@@ -1071,19 +1163,17 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
     counts = torch.tensor([[1, 2, 3, 4]])
     payload = torch.arange(30, dtype=torch.float32).view(10, 3)
     calls = []
-    completed = []
-    communicator_output = SimpleNamespace(wait=lambda: completed.append(True))
+    communicator_output = torch.empty(0, 3)
 
-    def fake_all_gather(output, _counts, *, group, async_op):
+    def fake_all_gather(output, _counts, *, group, **_kwargs):
         output.zero_()
-        return SimpleNamespace(wait=lambda: None)
 
     def fake_a2a(tensor, output_splits, input_splits, group):
         calls.append((tensor.clone(), output_splits, input_splits, group))
         return communicator_output
 
     monkeypatch.setattr(executors.dist, "all_gather_into_tensor", fake_all_gather)
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     result = executor._routed_cross_group_boundary(
@@ -1098,13 +1188,7 @@ def test_m_to_n_source_uses_canonical_shard_and_collective_order(
         [0, 3, 7],
         "dispatch-m-to-n",
     )
-    assert executor.pending_routed_source_results == [communicator_output]
-    assert completed == []
-
-    executor._drain_routed_source_results()
-
-    assert completed == [True]
-    assert executor.pending_routed_source_results == []
+    assert communicator_output.numel() == 0
 
 
 def _dense_state_meta(direction: str) -> dict:
@@ -1151,6 +1235,8 @@ def test_direct_dense_state_forward_envelope_transfers_counts_and_bypasses() -> 
         release=Mock(),
     )
     communication = Mock()
+    launch = executors._P2PLaunch(None, (), ())
+    communication.send_sized_tensors.return_value = launch
     state = _routed_state()
     executor = DagExecutor(
         runtime=None,
@@ -1171,7 +1257,7 @@ def test_direct_dense_state_forward_envelope_transfers_counts_and_bypasses() -> 
         node_meta=_dense_state_meta("forward"),
     )
 
-    executor._send_dense_state(send, object())
+    assert executor._send_dense_state(send, object()) is launch
 
     sent, peer, stream = communication.send_sized_tensors.call_args.args[:3]
     assert sent[0] is counts
@@ -1184,21 +1270,24 @@ def test_direct_dense_state_forward_envelope_transfers_counts_and_bypasses() -> 
     buffers.release.assert_called_once_with(producer.uid)
 
     communication.recv_sized_tensors.reset_mock()
-    communication.recv_sized_tensors.return_value = [
-        counts,
-        torch.tensor([4, 3]),
-        bypass,
-        indices,
-    ]
+    recv_transport_launch = executors._P2PLaunch(
+        [counts, torch.tensor([4, 3]), bypass, indices],
+        (Mock(),),
+        (counts, bypass, indices),
+    )
+    communication.recv_sized_tensors.return_value = recv_transport_launch
     recv = SimpleNamespace(
         uid="dense-state-recv",
         task_type=TaskType.RECV,
         peer_pp_rank=0,
         node_meta=_dense_state_meta("forward"),
     )
-    result = executor._recv_dense_state(recv, object())
+    recv_launch = executor._recv_dense_state(recv, object())
+    result = recv_launch.result
 
     assert state.combine_counts is counts
+    assert recv_launch.works == recv_transport_launch.works
+    assert recv_launch.tensors == recv_transport_launch.tensors
     assert result["routing_counts"] is counts
     assert result["runtime_inputs"] == {0: bypass, 1: indices}
 
@@ -1211,6 +1300,8 @@ def test_direct_dense_state_backward_envelope_reconstructs_dispatch_slots() -> N
         release=Mock(),
     )
     communication = Mock()
+    launch = executors._P2PLaunch(None, (), ())
+    communication.send_sized_tensors.return_value = launch
     executor = DagExecutor(
         runtime=None,
         stages=None,
@@ -1230,20 +1321,28 @@ def test_direct_dense_state_backward_envelope_reconstructs_dispatch_slots() -> N
         node_meta=_dense_state_meta("backward"),
     )
 
-    executor._send_dense_state(send, object())
+    assert executor._send_dense_state(send, object()) is launch
 
     assert communication.send_sized_tensors.call_args.args[0] == [bypass_grad]
     buffers.release.assert_called_once_with(consumer.uid)
 
-    communication.recv_sized_tensors.return_value = [bypass_grad]
+    recv_transport_launch = executors._P2PLaunch(
+        [bypass_grad],
+        (Mock(),),
+        (bypass_grad,),
+    )
+    communication.recv_sized_tensors.return_value = recv_transport_launch
     recv = SimpleNamespace(
         uid="dense-state-bwd-recv",
         task_type=TaskType.RECV,
         peer_pp_rank=1,
         node_meta=_dense_state_meta("backward"),
     )
-    result = executor._recv_dense_state(recv, object())
+    recv_launch = executor._recv_dense_state(recv, object())
+    result = recv_launch.result
 
+    assert recv_launch.works == recv_transport_launch.works
+    assert recv_launch.tensors == recv_transport_launch.tensors
     assert result["inp_grads"] == [bypass_grad, None, None, None]
 
 
@@ -1258,58 +1357,96 @@ def test_sized_tensor_transport_carries_dynamic_shapes_and_dtypes(
     communication = CommunicationExecutor(runtime, stages=None, logger=None)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
     sent = []
-    completed = []
+    works = []
+    batches = []
 
-    class _Work:
-        def wait(self):
-            completed.append(True)
+    def fake_isend(tensor, *, dst, group):
+        work = Mock()
+        sent.append((tensor.clone(), dst, group))
+        works.append(work)
+        return work
 
+    def fake_p2p_op(op, tensor, peer, group):
+        return SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group)
+
+    def fake_batch_isend_irecv(ops):
+        batches.append(tuple(ops))
+        return [
+            op.op(op.tensor, dst=op.peer, group=op.group)
+            for op in ops
+        ]
+
+    monkeypatch.setattr(executors.dist, "isend", fake_isend)
+    monkeypatch.setattr(executors.dist, "P2POp", fake_p2p_op)
     monkeypatch.setattr(
         executors.dist,
-        "isend",
-        lambda tensor, *, dst, group: (
-            sent.append((tensor.clone(), dst, group)) or _Work()
-        ),
+        "batch_isend_irecv",
+        fake_batch_isend_irecv,
     )
+    blocking_send = Mock(side_effect=AssertionError("blocking send used"))
+    monkeypatch.setattr(executors.dist, "send", blocking_send)
     payload = torch.randn(3, 5, requires_grad=True)
     indices = torch.tensor([4, 1, 0], dtype=torch.int64)
-    task = object()
+    task = SimpleNamespace(uid="dense-state-transport")
 
-    communication.send_sized_tensors(
+    launch = communication.send_sized_tensors(
         [payload, indices], 1, object(), task=task
     )
 
     assert [tuple(entry[0].shape) for entry in sent] == [
-        (2,),
+        (3,),
         (3, 5),
-        (1,),
         (3,),
     ]
-    assert torch.equal(sent[0][0], torch.tensor([3, 5]))
+    assert torch.equal(sent[0][0], torch.tensor([3, 5, 3]))
     assert torch.equal(sent[1][0], payload)
-    assert torch.equal(sent[2][0], torch.tensor([3]))
-    assert torch.equal(sent[3][0], indices)
+    assert torch.equal(sent[2][0], indices)
     assert all((dst, group) == (7, "p2p") for _tensor, dst, group in sent)
-    assert len(communication.pending_sized_sends) == 4
-    communication.wait_for_pending_sized_sends()
-    assert completed == [True] * 4
-    assert communication.pending_sized_sends == []
+    assert launch.works == tuple(works)
+    assert len(launch.tensors) == 4
+    assert torch.equal(launch.tensors[0], torch.tensor([3, 5, 3]))
+    assert torch.equal(launch.tensors[1], torch.tensor([3, 5, 3]))
+    assert launch.tensors[2] is payload
+    assert launch.tensors[3] is indices
+    assert len(batches) == 1
+    assert batches[0][0].tensor is payload
+    assert batches[0][1].tensor is indices
+    assert all(work.wait.call_count == 1 for work in works)
+    blocking_send.assert_not_called()
 
     incoming = iter(
         (
-            torch.tensor([4, 5]),
+            torch.tensor([4, 5, 2]),
             torch.arange(20, dtype=torch.float32).view(4, 5),
-            torch.tensor([2]),
             torch.tensor([8, 9], dtype=torch.int64),
         )
     )
 
-    def fake_recv(tensor, *, src, group):
+    recv_works = []
+
+    def fake_irecv(tensor, *, src, group):
         assert (src, group) == (7, "p2p")
         tensor.copy_(next(incoming))
+        work = Mock()
+        recv_works.append(work)
+        return work
 
-    monkeypatch.setattr(executors.dist, "recv", fake_recv)
-    received = communication.recv_sized_tensors(
+    def fake_recv_batch_isend_irecv(ops):
+        batches.append(tuple(ops))
+        return [
+            op.op(op.tensor, src=op.peer, group=op.group)
+            for op in ops
+        ]
+
+    monkeypatch.setattr(executors.dist, "irecv", fake_irecv)
+    monkeypatch.setattr(
+        executors.dist,
+        "batch_isend_irecv",
+        fake_recv_batch_isend_irecv,
+    )
+    blocking_recv = Mock(side_effect=AssertionError("blocking recv used"))
+    monkeypatch.setattr(executors.dist, "recv", blocking_recv)
+    recv_launch = communication.recv_sized_tensors(
         [
             {
                 "rank": 2,
@@ -1328,11 +1465,19 @@ def test_sized_tensor_transport_carries_dynamic_shapes_and_dtypes(
         object(),
         task=task,
     )
+    received = recv_launch.result
 
     assert tuple(received[0].shape) == (4, 5)
     assert received[0].dtype == torch.float32
     assert received[0].requires_grad
     assert torch.equal(received[1], torch.tensor([8, 9]))
+    assert recv_launch.works == tuple(recv_works)
+    assert len(recv_launch.tensors) == 3
+    assert len(batches) == 2
+    assert batches[1][0].tensor is received[0]
+    assert batches[1][1].tensor is received[1]
+    assert all(work.wait.call_count == 1 for work in recv_works)
+    blocking_recv.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1383,7 +1528,7 @@ def test_cross_group_backward_reverses_the_matching_forward_boundary(
         calls.append((value, recv_splits, send_splits, process_group))
         return value.new_empty((0, 3))
 
-    monkeypatch.setattr(executors, "all_to_all_single_autograd", fake_a2a)
+    monkeypatch.setattr(executors, "_stream_ordered_all_to_all", fake_a2a)
     monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
 
     assert executor._routed_cross_group_boundary(node, tensor, object()) is None

@@ -19,7 +19,12 @@ from src.piper import (
 )
 import src.directives as directives
 from src.dag import _remove_edge, _remove_nodes_and_incident_edges
-from src.zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
+from src.ordering import _dispatch_order, assign_dispatch_levels
+from src.zero import (
+    _ZeroLifetimeChains,
+    _add_inter_chain_temporal_edges,
+    _prune_zero_lifetime_metadata,
+)
 
 
 def _compute(uid: str, tag: dict) -> TrainingDAGNode:
@@ -67,6 +72,37 @@ def _routed_output_gm() -> fx.GraphModule:
         4, device="meta", dtype=torch.int64
     )
     graph.output((passthrough, aux, counts, payload))
+    return fx.GraphModule({}, graph)
+
+
+def _backward_split_gm(
+    *,
+    parameter_only_output: bool,
+    unknown_tail_after_boundary: bool = False,
+) -> fx.GraphModule:
+    graph = fx.Graph()
+    activation = graph.placeholder("activation")
+    parameter = graph.placeholder("parameter")
+    activation.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    parameter.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    coupled = graph.call_function(torch.mul, (activation, parameter))
+    coupled.meta["example_value"] = torch.empty(
+        2, 2, device="meta", requires_grad=True
+    )
+    if unknown_tail_after_boundary:
+        coupled = graph.call_function(torch.sin, (coupled,))
+    if parameter_only_output:
+        independent = graph.call_function(torch.square, (parameter,))
+        independent.meta["example_value"] = torch.empty(
+            2, 2, device="meta", requires_grad=True
+        )
+        graph.output((coupled, independent))
+    else:
+        graph.output(coupled)
     return fx.GraphModule({}, graph)
 
 
@@ -224,6 +260,47 @@ def test_generic_p2p_rejects_invalid_actor_group_pair(
 
     with pytest.raises(ValueError, match=error):
         directives._insert_send_recv_comm_nodes(dag)
+
+
+def test_backward_p2p_receive_explicitly_depends_on_local_forward_shape() -> None:
+    dag = TrainingDAG()
+    local_forward = _compute("local_forward", {"PP": 0, "PASS": "F"})
+    remote_backward = _compute("remote_backward", {"PP": 1, "PASS": "B"})
+    local_backward = _compute("local_backward", {"PP": 0, "PASS": "B"})
+    local_forward.compute_subkind = "FWD"
+    remote_backward.compute_subkind = "BWD"
+    local_backward.compute_subkind = "BWD"
+    local_backward.node_meta.update(
+        fwd_uid=local_forward.uid,
+        bucket_key=local_forward.uid,
+    )
+    local_forward.device = [0, 2]
+    local_backward.device = [0, 2]
+    remote_backward.device = [1, 3]
+    for node in (local_forward, remote_backward, local_backward):
+        dag.add_node(node)
+    dag.add_edge(
+        TrainingDAGEdge(
+            remote_backward.uid,
+            local_backward.uid,
+            "data",
+            "activation_grad",
+        )
+    )
+
+    directives._insert_send_recv_comm_nodes(dag)
+
+    recv = next(
+        node for node in dag.nodes.values() if node.node_kind == "RECV_COMM"
+    )
+    assert recv.node_meta["receive_kind"] == "backward"
+    assert recv.node_meta["shape_reference_fwd_uid"] == local_forward.uid
+    assert any(
+        edge.src_uid == local_forward.uid
+        and edge.dst_uid == recv.uid
+        and edge.dep_kind == "temporal"
+        for edge in dag.edges
+    )
 
 
 def test_tag_index_matches_legacy_filter_semantics_and_node_order() -> None:
@@ -407,8 +484,8 @@ def test_sharded_gradients_accumulate_before_one_reduce_scatter_per_bucket(
         assert not reduction.node_meta.get("zero_free_full_params_after")
 
     zero_chains = _prune_zero_lifetime_metadata(dag)
-    resolve_total_order_per_stream(dag)
     _add_inter_chain_temporal_edges(dag, zero_chains)
+    resolve_total_order_per_stream(dag)
 
     assert len(
         [
@@ -469,6 +546,200 @@ def test_sharded_gradient_lifetime_pruning_still_coalesces_within_microbatch() -
     )
     assert first.node_meta["zero_alloc_full_grads_before"] is True
     assert "zero_alloc_full_grads_before" not in second.node_meta
+
+
+def _two_parameter_lifetime_chains(
+    boundary_order: str,
+) -> tuple[TrainingDAG, _ZeroLifetimeChains]:
+    dag = TrainingDAG()
+    first = _compute("first", {"PP": 0, "MB": 0, "PASS": "F"})
+    second = _compute("second", {"PP": 0, "MB": 1, "PASS": "F"})
+    for node in (first, second):
+        node.node_meta["bucket_key"] = "bucket0"
+        node.node_meta["zero_free_full_params_after"] = True
+
+    def _gather(uid: str, compute_uid: str) -> TrainingDAGNode:
+        return TrainingDAGNode(
+            uid=uid,
+            node_kind="ALL_GATHER_COMM",
+            compute_subkind=None,
+            tag={"PP": 0},
+            device=[0],
+            stream="dp_stream",
+            node_meta={"bucket_key": "bucket0", "compute_uid": compute_uid},
+        )
+
+    def _dummy(uid: str) -> TrainingDAGNode:
+        return TrainingDAGNode(
+            uid=uid,
+            node_kind="ORDER_DUMMY",
+            compute_subkind=None,
+            tag={"PP": 0},
+            device=[0],
+            stream="delay_stream",
+            node_meta={},
+        )
+
+    first_gather = _gather("all_gather.0", first.uid)
+    second_gather = _gather("all_gather.1", second.uid)
+    delay0 = _dummy("delay.0")
+    delay1 = _dummy("delay.1")
+    nodes = [first, second, first_gather, second_gather, delay0, delay1]
+    if boundary_order == "reverse":
+        nodes.append(_dummy("delay.2"))
+    for node in nodes:
+        dag.add_node(node)
+
+    dag.add_edge(TrainingDAGEdge(first_gather.uid, first.uid, "data"))
+    dag.add_edge(TrainingDAGEdge(delay0.uid, delay1.uid, "temporal"))
+    dag.add_edge(TrainingDAGEdge(delay1.uid, second_gather.uid, "temporal"))
+    dag.add_edge(TrainingDAGEdge(second_gather.uid, second.uid, "data"))
+    if boundary_order == "forward":
+        dag.add_edge(TrainingDAGEdge(first.uid, second_gather.uid, "temporal"))
+    elif boundary_order == "reverse":
+        dag.add_edge(TrainingDAGEdge(second_gather.uid, first.uid, "temporal"))
+        dag.add_edge(TrainingDAGEdge(second_gather.uid, "delay.2", "temporal"))
+        dag.add_edge(TrainingDAGEdge("delay.2", second.uid, "temporal"))
+    elif boundary_order != "unordered":
+        raise ValueError(boundary_order)
+    return dag, _ZeroLifetimeChains(
+        gradient=[],
+        parameter=[[first.uid], [second.uid]],
+    )
+
+
+def test_zero_parameter_lifetimes_add_missing_reachability_edge() -> None:
+    dag, chains = _two_parameter_lifetime_chains("unordered")
+
+    _add_inter_chain_temporal_edges(dag, chains)
+
+    assert any(
+        edge.src_uid == "first"
+        and edge.dst_uid == "all_gather.1"
+        and edge.dep_kind == "temporal"
+        for edge in dag.edges
+    )
+    assign_dispatch_levels(dag)
+    dispatch_order = _dispatch_order(dag)
+    assert dispatch_order.index("first") < dispatch_order.index("all_gather.1")
+
+
+def test_zero_parameter_lifetimes_retain_existing_reachability() -> None:
+    dag, chains = _two_parameter_lifetime_chains("forward")
+    existing_edges = list(dag.edges)
+
+    _add_inter_chain_temporal_edges(dag, chains)
+
+    assert dag.edges == existing_edges
+
+
+def test_zero_parameter_lifetimes_select_feasible_reverse_order() -> None:
+    dag, chains = _two_parameter_lifetime_chains("reverse")
+
+    _add_inter_chain_temporal_edges(dag, chains)
+
+    assert any(
+        edge.src_uid == "second"
+        and edge.dst_uid == "all_gather.0"
+        and edge.dep_kind == "temporal"
+        for edge in dag.edges
+    )
+
+
+def test_zero_parameter_lifetimes_reject_cyclic_interval_order() -> None:
+    dag, chains = _two_parameter_lifetime_chains("unordered")
+    dag.add_edge(TrainingDAGEdge("all_gather.1", "first", "temporal"))
+    dag.add_edge(TrainingDAGEdge("all_gather.0", "second", "temporal"))
+
+    with pytest.raises(
+        ValueError,
+        match="cyclic parameter lifetime order.*bucket='bucket0'",
+    ):
+        _add_inter_chain_temporal_edges(dag, chains)
+
+
+def _alternating_bucket_lifetime_dag(
+    *,
+    same_bucket: bool,
+) -> TrainingDAG:
+    dag = TrainingDAG()
+    uids = ("a0", "b0", "a1", "b1")
+    for index, uid in enumerate(uids):
+        node = _compute(uid, {"PP": 0, "INDEX": index, "PASS": "F"})
+        node.node_meta["bucket_key"] = (
+            "shared" if same_bucket else uid[0]
+        )
+        dag.add_node(node)
+    for src_uid, dst_uid in zip(uids, uids[1:]):
+        dag.add_edge(TrainingDAGEdge(src_uid, dst_uid, "temporal"))
+    directives._insert_all_gather_comm_nodes(dag, [{}], [0])
+    return dag
+
+
+def test_zero_parameter_lifetimes_do_not_connect_through_other_buckets() -> None:
+    dag = _alternating_bucket_lifetime_dag(same_bucket=False)
+
+    chains = _prune_zero_lifetime_metadata(dag)
+
+    assert chains.gradient == []
+    assert sorted(chains.parameter) == [["a0"], ["a1"], ["b0"], ["b1"]]
+    assert sum(
+        node.node_kind == "ALL_GATHER_COMM" for node in dag.nodes.values()
+    ) == 4
+    assert all(
+        dag.nodes[uid].node_meta.get("zero_free_full_params_after") is True
+        for uid in ("a0", "b0", "a1", "b1")
+    )
+
+
+def test_zero_parameter_lifetimes_coalesce_direct_same_bucket_chain() -> None:
+    dag = _alternating_bucket_lifetime_dag(same_bucket=True)
+
+    chains = _prune_zero_lifetime_metadata(dag)
+
+    assert chains.gradient == []
+    assert chains.parameter == [["a0", "b0", "a1", "b1"]]
+    assert sum(
+        node.node_kind == "ALL_GATHER_COMM" for node in dag.nodes.values()
+    ) == 1
+    assert dag.nodes["b1"].node_meta["zero_free_full_params_after"] is True
+    assert all(
+        "zero_free_full_params_after" not in dag.nodes[uid].node_meta
+        for uid in ("a0", "b0", "a1")
+    )
+
+
+def test_zero_parameter_lifetimes_split_branched_component_into_direct_chains() -> None:
+    dag = TrainingDAG()
+    for uid in ("first", "second", "third", "fourth"):
+        node = _compute(uid, {"PP": 0, "PASS": "F"})
+        node.node_meta["bucket_key"] = "shared"
+        dag.add_node(node)
+    for src_uid, dst_uid in (
+        ("first", "third"),
+        ("second", "fourth"),
+        ("third", "fourth"),
+    ):
+        dag.add_edge(TrainingDAGEdge(src_uid, dst_uid, "temporal"))
+    directives._insert_all_gather_comm_nodes(dag, [{}], [0])
+
+    chains = _prune_zero_lifetime_metadata(dag)
+
+    assert {uid for chain in chains.parameter for uid in chain} == {
+        "first", "second", "third", "fourth",
+    }
+    assert len(chains.parameter) > 1
+    assert sum(
+        node.node_kind == "ALL_GATHER_COMM" for node in dag.nodes.values()
+    ) == len(chains.parameter)
+    for chain in chains.parameter:
+        for src_uid, dst_uid in zip(chain, chain[1:]):
+            assert any(
+                edge.src_uid == src_uid
+                and edge.dst_uid == dst_uid
+                and edge.dep_kind in ("data", "temporal")
+                for edge in dag.edges
+            )
 
 
 def test_expert_shard_retains_accumulated_grad_sync_for_replicated_weights() -> None:
@@ -618,7 +889,11 @@ def test_split_backward_stencil_allows_mixed_fused_and_split_microbatches() -> N
         ],
     }
     dag = TrainingDAG()
-    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+    fwd = _compute("fwd", {"PP": 0, "PASS": "F"})
+    fwd.node_meta.update(
+        {"gm": _dummy_gm(), "graphargs": [], "input_idxs": [], "param_idxs": []}
+    )
+    dag.add_node(fwd)
     dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
     dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
 
@@ -734,6 +1009,141 @@ def test_bucket_rewrite_preserves_final_output_schema_and_routed_boundary(
         "tensor_idx": 3,
         "routing_counts_idx": 2,
     }
+
+
+def test_bucketed_split_backward_weight_phase_stays_bucket_local(monkeypatch) -> None:
+    dag = _single_bucket_training_dag()
+    fwd = dag.nodes["fwd"]
+    fwd.node_meta.update(
+        {
+            "stage_id": 0,
+            "segment_id": 0,
+            "gm": _dummy_gm(),
+            "graphargs": [],
+            "input_idxs": [],
+            "param_idxs": [],
+        }
+    )
+    monkeypatch.setattr(
+        directives,
+        "bucket_stage",
+        lambda *_args, **_kwargs: [
+            (_dummy_gm(), [], [], []),
+            (_dummy_gm(), [], [], []),
+        ],
+    )
+
+    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 1)
+    split_keys = _validate_split_backward_order_stencil(
+        [
+            {
+                "op": "order",
+                "filters": [
+                    [{"PP": 0, "PASS": "BI"}],
+                    [{"PP": 0, "PASS": "BW"}],
+                ],
+            }
+        ]
+    )
+    _apply_split_backward_stencil(dag, split_keys)
+
+    weight_nodes = [
+        node for node in dag.nodes.values()
+        if node.compute_subkind == "BWD_W"
+    ]
+    assert len(weight_nodes) == 2
+    for weight_node in weight_nodes:
+        input_edges = dag.incoming_edges(weight_node.uid, dep_kind="data")
+        assert len(input_edges) == 1
+        input_node = dag.nodes[input_edges[0].src_uid]
+        assert input_node.compute_subkind == "BWD_I"
+        assert input_node.node_meta["bucket_key"] == weight_node.node_meta["bucket_key"]
+        assert input_node.node_meta["fwd_uid"] == weight_node.node_meta["fwd_uid"]
+        assert any(
+            edge.dst_uid == "upd" and edge.dep_kind == "temporal"
+            for edge in dag.outgoing_edges(weight_node.uid)
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "parameter_only_output",
+        "differentiable_input",
+        "provable_path",
+        "eligible",
+    ),
+    [
+        (False, True, True, True),
+        (True, True, True, False),
+        (False, False, True, False),
+        (False, True, False, False),
+    ],
+)
+def test_split_backward_requires_capturable_parameter_paths(
+    parameter_only_output: bool,
+    differentiable_input: bool,
+    provable_path: bool,
+    eligible: bool,
+) -> None:
+    dag = _single_bucket_training_dag()
+    gm = _backward_split_gm(
+        parameter_only_output=parameter_only_output
+    )
+    if not provable_path:
+        for node in gm.graph.nodes:
+            if node.op not in ("placeholder", "output"):
+                node.meta.pop("example_value", None)
+    dag.nodes["fwd"].node_meta.update(
+        {
+            "gm": gm,
+            "graphargs": [
+                torch.empty(
+                    2,
+                    2,
+                    device="meta",
+                    requires_grad=differentiable_input,
+                ),
+                torch.empty(2, 2, device="meta", requires_grad=True),
+            ],
+            "input_idxs": [0],
+            "param_idxs": [1],
+        }
+    )
+    split_keys = {(('PP', 0),)}
+
+    if not eligible:
+        with pytest.raises(
+            ValueError,
+            match=r"cannot split backward node 'bwd'.*parameter",
+        ):
+            _apply_split_backward_stencil(dag, split_keys)
+    else:
+        _apply_split_backward_stencil(dag, split_keys)
+        assert dag.nodes["bwd"].compute_subkind == "BWD_I"
+        assert dag.nodes["bwd.bw"].compute_subkind == "BWD_W"
+
+
+def test_split_backward_does_not_require_proof_after_captured_boundary() -> None:
+    dag = _single_bucket_training_dag()
+    dag.nodes["fwd"].node_meta.update(
+        {
+            "gm": _backward_split_gm(
+                parameter_only_output=False,
+                unknown_tail_after_boundary=True,
+            ),
+            "graphargs": [
+                torch.empty(2, 2, device="meta", requires_grad=True),
+                torch.empty(2, 2, device="meta", requires_grad=True),
+            ],
+            "input_idxs": [0],
+            "param_idxs": [1],
+        }
+    )
+
+    _apply_split_backward_stencil(dag, {(('PP', 0),)})
+
+    assert dag.nodes["bwd"].compute_subkind == "BWD_I"
+    assert dag.nodes["bwd.bw"].compute_subkind == "BWD_W"
 
 
 def test_apply_schedule_buckets_base_graph_before_microbatch_split(monkeypatch) -> None:

@@ -331,9 +331,13 @@ def test_compile_loads_identical_dag_on_every_actor_group_member(monkeypatch) ->
     compile_module._load_training_dags_on_actors([ffn, attn], info)
 
     for rank in (0, 2, 4, 5):
-        assert actors[rank].load_training_dag.calls == [((attn,), {})]
+        assert actors[rank].load_training_dag.calls == [
+            ((attn, ("attn",)), {})
+        ]
     for rank in (1, 3):
-        assert actors[rank].load_training_dag.calls == [((ffn,), {})]
+        assert actors[rank].load_training_dag.calls == [
+            ((ffn, ("ffn",)), {})
+        ]
 
 
 @pytest.mark.parametrize(

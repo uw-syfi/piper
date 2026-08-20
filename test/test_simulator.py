@@ -80,7 +80,11 @@ def _aligned_plan(*dags: TrainingDAG, mode: str = "interference_free"):
 
 
 def test_single_stream_fifo_sums_profile_times() -> None:
-    dag = _dag(_node("a", {0: 3.0}), _node("b", {0: 4.0}))
+    dag = _dag(
+        _node("a", {0: 3.0}),
+        _node("b", {0: 4.0}),
+        edges=(("a", "b", "temporal"),),
+    )
 
     result = simulate_training_step([dag])
 
@@ -100,6 +104,30 @@ def test_independent_streams_overlap_without_device_capacity_clock() -> None:
     assert result.step_time_us == pytest.approx(8.0)
     assert result.event(0, "a").start_us == pytest.approx(0.0)
     assert result.event(0, "b").start_us == pytest.approx(0.0)
+
+
+def test_issue_edge_orders_collective_arrival_without_waiting_for_completion() -> None:
+    first = _node(
+        "first",
+        {0: 8.0},
+        stream="ep_stream",
+        kind="A2A_COMM",
+        meta={"comm_id": "first", "participants": [0]},
+    )
+    second = _node(
+        "second",
+        {0: 5.0},
+        stream="dp_stream",
+        kind="REDUCE_COMM",
+        meta={"comm_id": "second", "participants": [0]},
+    )
+    dag = _dag(first, second, edges=(("first", "second", "issue"),))
+
+    result = simulate_training_step(_aligned_plan(dag))
+
+    assert result.step_time_us == pytest.approx(8.0)
+    assert result.event(0, "first").start_us == pytest.approx(0.0)
+    assert result.event(0, "second").start_us == pytest.approx(0.0)
 
 
 def test_named_profile_mode_selects_a_second_duration_dataset() -> None:
@@ -185,7 +213,7 @@ def test_profile_mode_comparison_reports_uncertainty_and_prediction_error() -> N
     assert comparison.normal_statistics.samples == 3
 
 
-def test_profile_mode_comparison_uses_paired_median_if_savings() -> None:
+def test_profile_mode_comparison_uses_mean_and_paired_if_savings() -> None:
     node = _node("a", {0: 1.0})
     node.profile_times_by_mode = {
         "interference_free": {
@@ -443,7 +471,7 @@ def test_p2p_send_and_recv_have_distinct_local_completions() -> None:
     assert result.step_time_us == pytest.approx(6.0)
 
 
-def test_nonblocking_dense_state_send_does_not_wait_for_peer_receive() -> None:
+def test_dense_state_send_cycle_is_not_relaxed_by_replay() -> None:
     send = _node(
         "send",
         {0: 1.0},
@@ -460,14 +488,14 @@ def test_nonblocking_dense_state_send_does_not_wait_for_peer_receive() -> None:
         "collective",
         {0: 2.0},
         stream="ep_stream",
-        kind="M_TO_N_COMM",
+        kind="ALL_REDUCE_COMM",
         meta={"comm_id": "routed", "participants": [0, 1]},
     )
     collective_1 = _node(
         "collective",
         {1: 2.0},
         stream="ep_stream",
-        kind="M_TO_N_COMM",
+        kind="ALL_REDUCE_COMM",
         meta={"comm_id": "routed", "participants": [0, 1]},
     )
     recv = _node(
@@ -483,25 +511,21 @@ def test_nonblocking_dense_state_send_does_not_wait_for_peer_receive() -> None:
         },
     )
 
-    result = simulate_training_step(
-        _aligned_plan(
-            _dag(
-                send,
-                collective_0,
-                edges=(("send", "collective", "temporal"),),
-            ),
-            _dag(
-                collective_1,
-                recv,
-                edges=(("collective", "recv", "temporal"),),
-            ),
+    with pytest.raises(SimulationValidationError, match="contains a cycle"):
+        simulate_training_step(
+            _aligned_plan(
+                _dag(
+                    send,
+                    collective_0,
+                    edges=(("send", "collective", "temporal"),),
+                ),
+                _dag(
+                    collective_1,
+                    recv,
+                    edges=(("collective", "recv", "temporal"),),
+                ),
+            )
         )
-    )
-
-    assert result.event(0, "send").end_us == pytest.approx(1.0)
-    assert result.event(0, "collective").start_us == pytest.approx(1.0)
-    assert result.event(1, "recv").start_us == pytest.approx(3.0)
-    assert result.step_time_us == pytest.approx(6.0)
 
 
 def test_p2p_profile_interval_subtracts_rendezvous_wait() -> None:
@@ -585,7 +609,7 @@ def test_p2p_inconsistent_interval_uses_latest_arrival_fallback() -> None:
     assert not result.warnings
 
 
-def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
+def test_opposite_p2p_temporal_cycle_is_not_relaxed_by_replay() -> None:
     send_b = _node(
         "send.b",
         {0: 7.0},
@@ -631,16 +655,13 @@ def test_opposite_p2p_temporal_order_does_not_create_rendezvous_cycle() -> None:
         },
     )
 
-    result = simulate_training_step(
-        [
-            _dag(send_b, recv_a, edges=(("send.b", "recv.a", "temporal"),)),
-            _dag(send_a, recv_b, edges=(("send.a", "recv.b", "temporal"),)),
-        ]
-    )
-
-    assert result.event(0, "send.b").start_us == pytest.approx(0.0)
-    assert result.event(1, "send.a").start_us == pytest.approx(0.0)
-    assert result.step_time_us == pytest.approx(7.0)
+    with pytest.raises(SimulationValidationError, match="contains a cycle"):
+        simulate_training_step(
+            [
+                _dag(send_b, recv_a, edges=(("send.b", "recv.a", "temporal"),)),
+                _dag(send_a, recv_b, edges=(("send.a", "recv.b", "temporal"),)),
+            ]
+        )
 
 
 def test_same_direction_p2p_transactions_preserve_directional_fifo() -> None:
@@ -685,7 +706,12 @@ def test_same_direction_p2p_transactions_preserve_directional_fifo() -> None:
         },
     )
 
-    result = simulate_training_step([_dag(send1, send2), _dag(recv1, recv2)])
+    result = simulate_training_step(
+        [
+            _dag(send1, send2, edges=(("send.1", "send.2", "temporal"),)),
+            _dag(recv1, recv2, edges=(("recv.1", "recv.2", "temporal"),)),
+        ]
+    )
 
     assert result.event(0, "send.1").start_us == pytest.approx(0.0)
     assert result.event(0, "send.2").start_us == pytest.approx(5.0)
@@ -759,7 +785,7 @@ def test_p2p_rejects_participants_outside_endpoint_device_groups() -> None:
         simulate_training_step([_dag(send), _dag(recv)])
 
 
-def test_collective_subtracts_arrival_skew_and_keeps_last_completion() -> None:
+def test_unaligned_collective_profile_is_rejected() -> None:
     producer = _node(
         "backward.0",
         {0: 8.0, 1: 2.0},
@@ -1125,7 +1151,7 @@ def test_routed_endpoints_must_declare_the_same_participants() -> None:
         simulate_training_step(_aligned_plan(_dag(first), _dag(second)))
 
 
-def test_opposite_routed_directions_remain_relaxable_before_global_ordering() -> None:
+def test_inconsistent_routed_transaction_order_is_rejected() -> None:
     participants = [0, 1]
     dispatch_source = _node(
         "dispatch.source",
@@ -1176,23 +1202,23 @@ def test_opposite_routed_directions_remain_relaxable_before_global_ordering() ->
         },
     )
 
-    result = simulate_training_step(
-        _aligned_plan(
-            _dag(
-                dispatch_source,
-                combine_destination,
-                edges=(("dispatch.source", "combine.destination", "temporal"),),
-            ),
-            _dag(
-                combine_source,
-                dispatch_destination,
-                edges=(("combine.source", "dispatch.destination", "temporal"),),
-            ),
+    with pytest.raises(
+        SimulationValidationError, match="communication simulation graph contains a cycle"
+    ):
+        simulate_training_step(
+            _aligned_plan(
+                _dag(
+                    dispatch_source,
+                    combine_destination,
+                    edges=(("dispatch.source", "combine.destination", "temporal"),),
+                ),
+                _dag(
+                    combine_source,
+                    dispatch_destination,
+                    edges=(("combine.source", "dispatch.destination", "temporal"),),
+                ),
+            )
         )
-    )
-
-    assert result.event(0, "dispatch.source").start_us == pytest.approx(0.0)
-    assert result.event(1, "combine.source").start_us == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("kind", ("M_TO_N_COMM", "N_TO_M_COMM"))

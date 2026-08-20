@@ -11,7 +11,11 @@ from .state import (
 )
 from .fx import _serialize_graphmodule
 from .model_state import DEFAULT_MODEL_SEED
-from .piper import _reset_annotation_state, piper
+from .piper import (
+    _interference_free_serial_orders,
+    _reset_annotation_state,
+    piper,
+)
 from .schedule import (
     derive_schedule_info,
     load_schedule_directives,
@@ -116,13 +120,21 @@ def _actor_group_dags_by_id(per_group_training_dags: list, schedule_info: dict) 
     return result
 
 
-def _load_training_dags_on_actors(per_group_training_dags: list, schedule_info: dict) -> None:
+def _load_training_dags_on_actors(
+    per_group_training_dags: list, schedule_info: dict
+) -> None:
     """Load one local DAG onto every actor in its schedule-defined group."""
     actor_groups = schedule_info.get("actor_groups", [])
     dag_by_group = _actor_group_dags_by_id(per_group_training_dags, schedule_info)
+    ordered_group_ids = sorted(dag_by_group)
+    orders = _interference_free_serial_orders(
+        [dag_by_group[group_id] for group_id in ordered_group_ids]
+    )
+    order_by_group = dict(zip(ordered_group_ids, orders))
     ray.get([
         piper_metadata.actors[int(global_rank)].load_training_dag.remote(
-            dag_by_group[int(group["id"])]
+            dag_by_group[int(group["id"])],
+            order_by_group[int(group["id"])],
         )
         for group in actor_groups
         for global_rank in group["devices"]

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .dag import TrainingDAG, TrainingDAGNode, _topological_levels
-from .ordering import _serial_topological_order
+from .ordering import _dispatch_order
 from .state import LOG_LEVEL, create_logger
 from .tasks import training_dag_task_type
 
@@ -93,7 +93,6 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
         return "\\n".join(lines)
 
     for uid, node in training_dag.nodes.items():
-        topo_label = f"topo={topo_levels.get(uid, '?')}"
         meta_label = _format_node_meta_lines(node)
         meta_suffix = f"\\n{meta_label}" if meta_label else ""
         if node.node_kind in (
@@ -107,7 +106,7 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             "N_TO_M_COMM",
         ):
             label = (
-                f"{topo_label}\\n{node.node_kind}\\n{_format_tag(node.tag)}\\n"
+                f"{node.node_kind}\\n{_format_tag(node.tag)}\\n"
                 f"{_format_device(node.device)}\\nstream={node.stream}"
                 f"{meta_suffix}"
             )
@@ -115,23 +114,32 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
         else:
             subkind = node.compute_subkind or "COMPUTE"
             label = (
-                f"{topo_label}\\n{subkind}\\n{_format_tag(node.tag)}\\n{_format_device(node.device)}\\nstream={node.stream}"
+                f"{subkind}\\n{_format_tag(node.tag)}\\n{_format_device(node.device)}\\nstream={node.stream}"
                 f"{meta_suffix}"
             )
             shape = "ellipse"
         dot.node(uid, label=label, shape=shape)
 
-    nodes_by_level: dict[int, list[str]] = {}
-    for uid, level in topo_levels.items():
-        nodes_by_level.setdefault(level, []).append(uid)
-    for level, uids in sorted(nodes_by_level.items()):
-        with dot.subgraph(name=f"topo_{level}") as sub:
+    nodes_by_dispatch_level: dict[int, list[str]] = {}
+    for uid, topo_level in topo_levels.items():
+        stored_dispatch_level = training_dag.nodes[uid].node_meta.get(
+            "dispatch_level"
+        )
+        display_level = (
+            stored_dispatch_level
+            if isinstance(stored_dispatch_level, int)
+            and not isinstance(stored_dispatch_level, bool)
+            else topo_level
+        )
+        nodes_by_dispatch_level.setdefault(display_level, []).append(uid)
+    for level, uids in sorted(nodes_by_dispatch_level.items()):
+        with dot.subgraph(name=f"dispatch_{level}") as sub:
             sub.attr(rank="same")
             for uid in sorted(uids):
                 sub.node(uid)
     level_reps = [
         sorted(uids)[0]
-        for _level, uids in sorted(nodes_by_level.items())
+        for _level, uids in sorted(nodes_by_dispatch_level.items())
         if uids
     ]
     for src_uid, dst_uid in zip(level_reps, level_reps[1:]):
@@ -142,6 +150,14 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             dot.edge(edge.src_uid, edge.dst_uid)
         elif edge.dep_kind == "temporal":
             dot.edge(edge.src_uid, edge.dst_uid, style="dashed", color="blue")
+        elif edge.dep_kind == "issue":
+            dot.edge(
+                edge.src_uid,
+                edge.dst_uid,
+                style="dotted",
+                color="darkorange",
+                label="issue",
+            )
 
     out = dot.render(output_path, format="png", cleanup=True)
     logger.info("Local DAG IR visualization saved to %s", out)
@@ -186,18 +202,23 @@ def print_training_dag_order(
 ) -> None:
     """Write and log the actor dispatch order for a TrainingDAG."""
     topo_levels = _topological_levels(dag)
-    topo = _serial_topological_order(dag, topo_levels)
+    topo = _dispatch_order(dag)
     data_preds: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
     data_succs: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
     temporal_preds: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
     temporal_succs: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
+    issue_preds: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
+    issue_succs: dict[str, list[str]] = {uid: [] for uid in dag.nodes}
     for e in dag.edges:
         if e.dep_kind == "data":
             data_preds[e.dst_uid].append(e.src_uid)
             data_succs[e.src_uid].append(e.dst_uid)
-        else:
+        elif e.dep_kind == "temporal":
             temporal_preds[e.dst_uid].append(e.src_uid)
             temporal_succs[e.src_uid].append(e.dst_uid)
+        elif e.dep_kind == "issue":
+            issue_preds[e.dst_uid].append(e.src_uid)
+            issue_succs[e.src_uid].append(e.dst_uid)
 
     header = f"--- TrainingDAG execution order{': ' + label if label else ''} ---"
     lines = [header]
@@ -210,12 +231,16 @@ def print_training_dag_order(
             if key in meta and meta[key] is not None:
                 extra.append(f"{key}={meta[key]}")
         extra_str = ("  " + " ".join(extra)) if extra else ""
+        dispatch_level = node.node_meta.get(
+            "dispatch_level", topo_levels[uid]
+        )
         line = (
-            f"  topo={topo_levels[uid]:<3d}  "
+            f"  topo={topo_levels[uid]:<3d} dispatch={dispatch_level:<3d}  "
             f"{task_type.value:<14s}  kind={node.node_kind:<19s}  uid={node.uid:<24s}  "
             f"tag=({_format_tag(node.tag)})  stream={node.stream}{extra_str}  "
             f"data_preds={sorted(data_preds[node.uid])} data_succs={sorted(data_succs[node.uid])}  "
-            f"temp_preds={sorted(temporal_preds[node.uid])} temp_succs={sorted(temporal_succs[node.uid])}"
+            f"temp_preds={sorted(temporal_preds[node.uid])} temp_succs={sorted(temporal_succs[node.uid])}  "
+            f"issue_preds={sorted(issue_preds[node.uid])} issue_succs={sorted(issue_succs[node.uid])}"
         )
         lines.append(line)
 

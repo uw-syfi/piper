@@ -1,4 +1,5 @@
 from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
+from src.ordering import assign_dispatch_levels
 from src.visualization import (
     _build_device_table,
     _compute_columns,
@@ -7,6 +8,7 @@ from src.visualization import (
     _placed_device_groups,
     _rows_from_schedule_directives,
     print_training_dag_order,
+    render_training_dag,
 )
 
 
@@ -53,6 +55,102 @@ def test_print_training_dag_order_supports_named_global_output(tmp_path) -> None
     )
     assert "data_succs=['backward']" in output
     assert "data_preds=['forward']" in output
+
+
+def test_print_training_dag_order_uses_persisted_dispatch_levels(tmp_path) -> None:
+    dag = TrainingDAG()
+    for node in (
+        TrainingDAGNode(
+            uid="compute",
+            node_kind="COMPUTE",
+            compute_subkind="FWD",
+            tag={"PASS": "F"},
+            device=[0],
+            stream="default_stream",
+        ),
+        TrainingDAGNode(
+            uid="recv",
+            node_kind="RECV_COMM",
+            compute_subkind=None,
+            tag={},
+            device=[0],
+            stream="pp_stream",
+        ),
+            TrainingDAGNode(
+                uid="a2a",
+            node_kind="A2A_COMM",
+            compute_subkind=None,
+            tag={},
+            device=[0],
+                stream="ep_stream",
+            ),
+            TrainingDAGNode(
+                uid="consumer",
+                node_kind="COMPUTE",
+                compute_subkind="FWD",
+                tag={"PASS": "F"},
+                device=[0],
+                stream="default_stream",
+            ),
+        ):
+            dag.add_node(node)
+
+    dag.nodes["recv"].node_meta["destination_compute_uid"] = "consumer"
+    dag.add_edge(TrainingDAGEdge("compute", "a2a", "data"))
+    dag.add_edge(TrainingDAGEdge("recv", "consumer", "data"))
+    dag.add_edge(TrainingDAGEdge("a2a", "consumer", "data"))
+    assign_dispatch_levels(dag)
+
+    print_training_dag_order(dag, out_dir=str(tmp_path))
+    lines = (tmp_path / "training_dag_order_rank0").read_text().splitlines()
+    printed_uids = [
+        next(
+            uid
+            for uid in ("compute", "a2a", "recv", "consumer")
+            if f"uid={uid}" in line
+        )
+        for line in lines[1:5]
+    ]
+    assert printed_uids == ["compute", "a2a", "recv", "consumer"]
+    assert "topo=0" in lines[3]
+    assert "dispatch=1" in lines[3]
+
+
+def test_render_training_dag_aligns_nodes_by_dispatch_level(
+    tmp_path, monkeypatch
+) -> None:
+    import graphviz
+
+    dag = TrainingDAG()
+    for uid in ("early", "late"):
+        dag.add_node(
+            TrainingDAGNode(
+                uid=uid,
+                node_kind="COMPUTE",
+                compute_subkind="FWD",
+                tag={"PASS": "F"},
+                device=[0],
+                stream="default_stream",
+            )
+        )
+    dag.nodes["early"].node_meta["dispatch_level"] = 0
+    dag.nodes["late"].node_meta["dispatch_level"] = 7
+
+    rendered: dict[str, str] = {}
+
+    def _capture_render(dot, output_path, *, format, cleanup):
+        rendered["source"] = dot.source
+        return f"{output_path}.{format}"
+
+    monkeypatch.setattr(graphviz.Digraph, "render", _capture_render)
+    render_training_dag(dag, str(tmp_path / "dag"))
+
+    source = rendered["source"]
+    assert "subgraph dispatch_0" in source
+    assert "subgraph dispatch_7" in source
+    assert "subgraph topo_0" not in source
+    assert "topo=" not in source
+    assert "dispatch=" not in source
 
 
 def test_schedule_visualization_resolves_non_pp_regions_from_placement() -> None:

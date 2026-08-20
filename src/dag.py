@@ -204,7 +204,9 @@ def restore_triton_side_table(
 class TrainingDAGEdge:
     src_uid: str
     dst_uid: str
-    dep_kind: str  # "data" | "temporal"
+    # ``issue`` constrains host dispatch only.  Unlike ``data`` and
+    # ``temporal``, it must never become a CUDA completion dependency.
+    dep_kind: str  # "data" | "temporal" | "issue"
     tensor_name: str | None = None
 
 
@@ -284,6 +286,11 @@ class TrainingDAG:
     def add_edge(self, edge: TrainingDAGEdge) -> None:
         if edge.src_uid not in self.nodes or edge.dst_uid not in self.nodes:
             raise ValueError(f"Edge references unknown node: {edge}")
+        if edge.dep_kind not in {"data", "temporal", "issue"}:
+            raise ValueError(
+                f"unsupported dependency kind {edge.dep_kind!r} on "
+                f"{edge.src_uid} -> {edge.dst_uid}"
+            )
         edge_key = (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
         if edge_key in self.edge_keys:
             return

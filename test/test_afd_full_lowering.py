@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from ray import cloudpickle
@@ -10,15 +11,25 @@ from examples.build_schedule import (
     infer_afpipe_num_layers,
 )
 from examples.models.qwen3 import AFDQwen3Model, create_qwen3_config
-from src.dag import TrainingDAG, build_training_dag
+from src.dag import TrainingDAG, _ReachabilityIndex, build_training_dag
 from src.compile import _prepare_training_dags_for_rpc
 from src.directives import _validate_schedule_tags_exist, apply_schedule_directives
 from src.fx import split_gm_by_annotations
-from src.ordering import resolve_total_order_per_stream
+from src.ordering import (
+    _resolve_default_stream_order,
+    assign_dispatch_levels,
+    execution_stream_domain,
+    resolve_total_order_per_stream,
+)
+from src.profiling import NodeProfile
+from src.simulator import simulate_training_step
 from src.piper import (
+    _materialize_global_communication_issue_edges,
+    _order_communication_transactions,
     _reset_annotation_state,
     _split_global_training_dag_by_pp_rank,
     _validate_dense_state_sequences,
+    _validate_global_communication_order,
     _validate_p2p_sequences,
     _validate_routed_collective_sequences,
 )
@@ -107,9 +118,21 @@ def _lower_afd_schedule(base_name: str, *, actor_groups: int) -> tuple[TrainingD
     # repeated local A/F chunks, without placement-based component merging.
     local_dags = _split_global_training_dag_by_pp_rank(global_dag)
     for local_dag in local_dags:
-        zero_chains = _prune_zero_lifetime_metadata(local_dag)
-        resolve_total_order_per_stream(local_dag)
+        _resolve_default_stream_order(local_dag)
+    zero_chains_by_dag = [
+        _prune_zero_lifetime_metadata(local_dag) for local_dag in local_dags
+    ]
+    for local_dag, zero_chains in zip(local_dags, zero_chains_by_dag):
         _add_inter_chain_temporal_edges(local_dag, zero_chains)
+    communication_order = _order_communication_transactions(local_dags)
+    for local_dag in local_dags:
+        resolve_total_order_per_stream(local_dag)
+    _materialize_global_communication_issue_edges(
+        local_dags, communication_order
+    )
+    for local_dag in local_dags:
+        assign_dispatch_levels(local_dag)
+    _validate_global_communication_order(local_dags, communication_order)
     _validate_routed_collective_sequences(local_dags)
     _validate_dense_state_sequences(local_dags)
     _validate_p2p_sequences(local_dags)
@@ -139,6 +162,37 @@ def _assert_connected(dag: TrainingDAG) -> None:
                 visited.add(neighbor)
                 pending.append(neighbor)
     assert visited == set(dag.nodes)
+
+
+def _assert_cpu_replay_completes(dags: list[TrainingDAG]) -> None:
+    mode = "interference_free"
+    for dag in dags:
+        for node in dag.nodes.values():
+            if node.node_kind == "ORDER_DUMMY":
+                continue
+            assert node.device is not None
+            node.profile_times_by_mode[mode] = {
+                int(rank): NodeProfile.from_samples(
+                    (1.0,),
+                    start_offset_samples_us=(0.0,),
+                )
+                for rank in node.device
+            }
+    plan = SimpleNamespace(
+        per_pp_dags=dags,
+        topology={},
+        profile_metadata={
+            "timeline_alignment": {
+                "modes": {
+                    mode: {
+                        "samples": 1,
+                        "max_pairwise_uncertainty_us": 0.0,
+                    }
+                }
+            }
+        },
+    )
+    assert simulate_training_step(plan, profile_mode=mode).step_time_us > 0
 
 
 @pytest.mark.parametrize(
@@ -196,6 +250,12 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
     assert [_device_key(dag) for dag in local_dags] == expected_devices
     for dag in local_dags:
         _assert_connected(dag)
+        for edge in dag.edges:
+            if edge.dep_kind != "issue":
+                continue
+            assert execution_stream_domain(
+                dag.nodes[edge.src_uid]
+            ) != execution_stream_domain(dag.nodes[edge.dst_uid])
 
     rpc_dags = _prepare_training_dags_for_rpc(local_dags)
     cloudpickle.dumps(rpc_dags)
@@ -210,6 +270,9 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
         for node in dag.nodes.values()
         if node.node_kind == "COMPUTE" and node.compute_subkind == "FWD"
     )
+
+    if base_name == "afd_placement_pp4.json":
+        _assert_cpu_replay_completes(local_dags)
 
     routed = [
         node for node in global_dag.nodes.values() if node.node_kind in _ROUTED_KINDS
@@ -332,3 +395,25 @@ def test_traced_afd_qwen_full_schedule_lowers_to_connected_actor_dags(
         assert sum(node.node_kind == "N_TO_M_COMM" for node in local_routed) == (
             expected_local_routed // 2
         )
+
+    if actor_groups == 2:
+        dense_dag = next(dag for dag in local_dags if _device_key(dag) == expected_devices[0])
+        first_dispatch = next(
+            node
+            for node in dense_dag.nodes.values()
+            if node.node_kind == "M_TO_N_COMM"
+            and node.node_meta["role"] == "source"
+            and node.tag.get("PASS") == "F"
+            and node.tag.get("ATTN") == 0
+            and node.tag.get("MB") == 0
+        )
+        next_attention = next(
+            node
+            for node in dense_dag.nodes.values()
+            if node.node_kind == "COMPUTE"
+            and node.compute_subkind == "FWD"
+            and node.tag.get("ATTN") == 0
+            and node.tag.get("MB") == 1
+        )
+        reachability = _ReachabilityIndex(dense_dag)
+        assert not reachability.has_path(first_dispatch.uid, next_attention.uid)

@@ -19,12 +19,8 @@ unavailable.
 P2P SEND/RECV endpoints retain distinct completion vertices.  Both arrivals
 gate their shared rendezvous, but send-side successors wait only for send
 completion and receive-side consumers wait only for receive completion.
-Nonblocking dense-state sends complete locally when they are posted while
-their arrivals continue to gate the peer's rendezvous; the retained work is
-drained separately by the runtime.
-Ordering-only dependencies between opposite directional P2P streams remain
-relaxable because schedule lowering can materialize logical ``pp_stream`` FIFO
-as explicit edges; data dependencies are always preserved.
+Every finalized DAG dependency is preserved. Directional P2P physical streams
+remain independent, but an explicit edge between them is never relaxed.
 """
 
 from __future__ import annotations
@@ -43,7 +39,6 @@ from .dag import TrainingDAG, TrainingDAGNode
 from .execution_plan import (
     PlannedOperation,
     build_execution_plan,
-    is_relaxable_p2p_ordering_dependency,
 )
 from .profiling import (
     NORMAL_PROFILE_MODE,
@@ -892,14 +887,6 @@ def _p2p_group(record: _InstanceRecord) -> str:
     return "pp_lo_hi" if source_pp < destination_pp else "pp_hi_lo"
 
 
-def _is_nonblocking_p2p_send(record: _InstanceRecord) -> bool:
-    """Whether local successors wait for posting rather than peer arrival."""
-    return (
-        record.node.node_kind == "SEND_COMM"
-        and bool(record.node.node_meta.get("dense_state_transfer"))
-    )
-
-
 def _representative(vertex: _Vertex, preferred_rank: int | None = None) -> NodeInstance:
     members = sorted((member.key for member in vertex.members))
     if preferred_rank is not None:
@@ -1259,27 +1246,18 @@ def simulate_training_step(
                 communication_id=communication_id,
                 emit_timeline=False,
             )
-            nonblocking_send = _is_nonblocking_p2p_send(member)
-            if nonblocking_send:
-                vertices[completion_id] = _Vertex(
-                    vertex_id=completion_id,
-                    members=[member],
-                    duration_us=member.profile_duration_us,
-                    communication_id=communication_id,
-                )
-            else:
-                vertices[completion_id] = _Vertex(
-                    vertex_id=completion_id,
-                    members=[member],
-                    # Calibrated profiles provide a fixed tail derived from the
-                    # observed rendezvous.
-                    duration_us=0.0,
-                    communication_id=communication_id,
-                    endpoint_arrival_vertex_id=arrival_id,
-                    endpoint_observed_service_us=observed_service_by_endpoint[
-                        member.key
-                    ],
-                )
+            vertices[completion_id] = _Vertex(
+                vertex_id=completion_id,
+                members=[member],
+                # Calibrated profiles provide a fixed tail derived from the
+                # observed rendezvous.
+                duration_us=0.0,
+                communication_id=communication_id,
+                endpoint_arrival_vertex_id=arrival_id,
+                endpoint_observed_service_us=observed_service_by_endpoint[
+                    member.key
+                ],
+            )
             arrival_ids[member.key] = arrival_id
             completion_ids[member.key] = completion_id
             instance_start_vertex[member.key] = arrival_id
@@ -1287,16 +1265,14 @@ def simulate_training_step(
 
         for member in members:
             _add_vertex_edge(vertices, arrival_ids[member.key], rendezvous_id)
-            nonblocking_send = _is_nonblocking_p2p_send(member)
             _add_vertex_edge(
                 vertices,
-                arrival_ids[member.key] if nonblocking_send else rendezvous_id,
+                rendezvous_id,
                 completion_ids[member.key],
             )
-            if not nonblocking_send:
-                vertices[
-                    completion_ids[member.key]
-                ].endpoint_rendezvous_vertex_id = rendezvous_id
+            vertices[
+                completion_ids[member.key]
+            ].endpoint_rendezvous_vertex_id = rendezvous_id
 
     for record in instances.values():
         if record.key in instance_vertex:
@@ -1345,11 +1321,9 @@ def simulate_training_step(
         instance_start_vertex[key] = vertex_id
 
     # Lower the same completion dependencies used by DagExecutor.  The shared
-    # plan includes stream FIFO order, DAG edges, RECV consumer-stream guards,
-    # and update synchronization. Profiling maps the two directional P2P
-    # communicators onto dedicated physical streams. Opposite-direction P2P
-    # issue-order edges are relaxed by the same shared predicate as the CUDA
-    # executor; data dependencies are never relaxed.
+    # plan contains every finalized DAG dependency. Directional P2P
+    # communicators retain dedicated physical streams, but explicit edges
+    # between those streams are preserved.
     for pp_index, dag in enumerate(dags):
         plan = dag_plans[pp_index]
         for rank in layout.ranks_by_pp[pp_index]:
@@ -1357,14 +1331,12 @@ def simulate_training_step(
                 node = dag.nodes[operation.uid]
                 dst = instance_start_vertex[NodeInstance(rank, operation.uid)]
                 for predecessor_uid in operation.completion_predecessors:
-                    predecessor = dag.nodes[predecessor_uid]
-                    if is_relaxable_p2p_ordering_dependency(
-                        predecessor,
-                        node,
-                        operation.reason_for(predecessor_uid),
-                    ):
-                        continue
                     src = instance_vertex[NodeInstance(rank, predecessor_uid)]
+                    _add_vertex_edge(vertices, src, dst)
+                for predecessor_uid in operation.issue_predecessors:
+                    src = instance_start_vertex[
+                        NodeInstance(rank, predecessor_uid)
+                    ]
                     _add_vertex_edge(vertices, src, dst)
 
     # Every prologue precedes every real operation on its rank.  Adding all

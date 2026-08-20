@@ -38,7 +38,7 @@ from .directives import (
     apply_schedule_directives,
 )
 from .fx import split_gm_by_annotations
-from .ordering import resolve_total_order_per_stream
+from .ordering import _resolve_default_stream_order, resolve_total_order_per_stream
 from .piper import (
     _reset_annotation_state,
     _split_global_training_dag_by_pp_rank,
@@ -596,9 +596,10 @@ class QwenTrainingDAGFactory:
             directives,
             skip_unmatched_directives=True,
         )
+        _resolve_default_stream_order(rank_zero_dag)
         zero_chains = _prune_zero_lifetime_metadata(rank_zero_dag)
-        resolve_total_order_per_stream(rank_zero_dag)
         _add_inter_chain_temporal_edges(rank_zero_dag, zero_chains)
+        resolve_total_order_per_stream(rank_zero_dag)
         strip_training_dag_payload(rank_zero_dag)
         per_actor_dags = [rank_zero_dag]
         lowering_time_s = time.perf_counter() - lower_start

@@ -9,10 +9,9 @@ import src.executors as executors
 from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
 from src.execution_plan import (
     build_execution_plan,
-    is_relaxable_directional_communication_ordering_dependency,
-    is_relaxable_p2p_ordering_dependency,
 )
 from src.executors import DagExecutor
+from src.ordering import assign_dispatch_levels
 from src.tasks import TaskType
 
 
@@ -44,7 +43,7 @@ def _by_uid(dag: TrainingDAG, order: list[str] | None = None):
     return {op.uid: op for op in build_execution_plan(dag, order)}
 
 
-def test_plan_materializes_stream_fifo_and_cross_stream_edges() -> None:
+def test_plan_materializes_only_finalized_dag_edges() -> None:
     dag = _dag(
         _node("a"),
         _node("b", stream="comm"),
@@ -53,7 +52,7 @@ def test_plan_materializes_stream_fifo_and_cross_stream_edges() -> None:
     )
     dag.add_edge(TrainingDAGEdge("a", "b", "data"))
     dag.add_edge(TrainingDAGEdge("b", "c", "temporal"))
-    dag.add_edge(TrainingDAGEdge("a", "c", "data"))  # same-stream, FIFO implies it
+    dag.add_edge(TrainingDAGEdge("a", "c", "data"))
     dag.add_edge(TrainingDAGEdge("c", "d", "data"))
 
     plan = _by_uid(dag, ["a", "b", "c", "d"])
@@ -62,14 +61,13 @@ def test_plan_materializes_stream_fifo_and_cross_stream_edges() -> None:
     assert plan["b"].completion_predecessors == ("a",)
     assert plan["b"].reason_for("a") == "cross_stream_data"
     assert plan["c"].completion_predecessors == ("a", "b")
-    assert plan["c"].reason_for("a") == "stream_fifo+same_stream_data"
+    assert plan["c"].reason_for("a") == "same_stream_data"
     assert plan["c"].reason_for("b") == "cross_stream_temporal"
-    assert plan["d"].completion_predecessors == ("b", "c")
-    assert plan["d"].reason_for("b") == "stream_fifo"
+    assert plan["d"].completion_predecessors == ("c",)
     assert plan["d"].reason_for("c") == "cross_stream_data"
 
 
-def test_recv_waits_for_latest_compute_on_consumer_stream() -> None:
+def test_plan_does_not_invent_recv_consumer_guard() -> None:
     dag = _dag(
         _node("prior_compute"),
         _node("recv", stream="pp", kind="RECV_COMM", subkind=None),
@@ -79,18 +77,100 @@ def test_recv_waits_for_latest_compute_on_consumer_stream() -> None:
 
     plan = _by_uid(dag, ["prior_compute", "recv", "consumer"])
 
-    assert plan["recv"].completion_predecessors == ("prior_compute",)
-    assert (
-        plan["recv"].reason_for("prior_compute")
-        == "recv_consumer_stream_guard"
+    assert plan["recv"].completion_predecessors == ()
+    assert plan["consumer"].completion_predecessors == ("recv",)
+
+
+def test_dispatch_level_places_recv_after_same_level_communication() -> None:
+    dag = _dag(
+        _node("compute"),
+        _node("recv", kind="RECV_COMM", subkind=None),
+        _node("routed", stream="ep", kind="A2A_COMM", subkind=None),
+        _node("consumer"),
     )
-    assert plan["consumer"].completion_predecessors == (
-        "prior_compute",
+    dag.nodes["recv"].node_meta["destination_compute_uid"] = "consumer"
+    dag.add_edge(TrainingDAGEdge("compute", "routed", "data"))
+    dag.add_edge(TrainingDAGEdge("recv", "consumer", "data"))
+    dag.add_edge(TrainingDAGEdge("routed", "consumer", "data"))
+    assign_dispatch_levels(dag)
+
+    assert [op.uid for op in build_execution_plan(dag)] == [
+        "compute",
+        "routed",
         "recv",
+        "consumer",
+    ]
+    assert dag.nodes["recv"].node_meta["dispatch_level"] == 1
+
+
+def test_dispatch_priority_never_overrides_an_encoded_dependency() -> None:
+    dag = _dag(
+        _node("recv", kind="RECV_COMM", subkind=None),
+        _node("send", kind="SEND_COMM", subkind=None),
     )
+    dag.add_edge(TrainingDAGEdge("recv", "send", "temporal"))
+
+    assert [op.uid for op in build_execution_plan(dag)] == ["recv", "send"]
 
 
-def test_update_waits_for_backward_and_gradient_synchronization() -> None:
+def test_dispatch_level_tie_priority_is_static_and_transport_generic() -> None:
+    dag = _dag(
+        _node("compute"),
+        _node("recv", kind="RECV_COMM", subkind=None),
+        _node("a2a", kind="A2A_COMM", subkind=None),
+        _node("send", kind="SEND_COMM", subkind=None),
+        _node("reduce", kind="REDUCE_COMM", subkind=None),
+    )
+    for node in dag.nodes.values():
+        node.node_meta["dispatch_level"] = 0
+
+    assert [op.uid for op in build_execution_plan(dag)] == [
+        "send",
+        "a2a",
+        "reduce",
+        "compute",
+        "recv",
+    ]
+
+
+def test_dispatch_level_endpoint_movement_is_clamped_by_dag_edges() -> None:
+    dag = _dag(
+        _node("producer"),
+        _node("gate0"),
+        _node("gate1"),
+        _node("send", kind="SEND_COMM", subkind=None),
+        _node("recv", kind="RECV_COMM", subkind=None),
+        _node("consumer"),
+    )
+    dag.nodes["send"].node_meta["source_compute_uid"] = "producer"
+    dag.nodes["recv"].node_meta["destination_compute_uid"] = "consumer"
+    dag.add_edge(TrainingDAGEdge("producer", "send", "data"))
+    dag.add_edge(TrainingDAGEdge("gate0", "gate1", "data"))
+    dag.add_edge(TrainingDAGEdge("gate1", "send", "temporal"))
+    dag.add_edge(TrainingDAGEdge("recv", "gate1", "temporal"))
+    dag.add_edge(TrainingDAGEdge("gate1", "consumer", "data"))
+    dag.add_edge(TrainingDAGEdge("recv", "consumer", "data"))
+
+    assign_dispatch_levels(dag)
+
+    assert dag.nodes["send"].node_meta["dispatch_level"] == 2
+    assert dag.nodes["recv"].node_meta["dispatch_level"] == 0
+    plan = build_execution_plan(dag)
+    index = {operation.uid: operation.dispatch_index for operation in plan}
+    assert all(index[edge.src_uid] < index[edge.dst_uid] for edge in dag.edges)
+
+
+def test_plan_rejects_persisted_dispatch_level_edge_violation() -> None:
+    dag = _dag(_node("source"), _node("destination"))
+    dag.add_edge(TrainingDAGEdge("source", "destination", "data"))
+    dag.nodes["source"].node_meta["dispatch_level"] = 1
+    dag.nodes["destination"].node_meta["dispatch_level"] = 1
+
+    with pytest.raises(ValueError, match="dispatch levels violate DAG edge"):
+        build_execution_plan(dag)
+
+
+def test_update_uses_explicit_backward_and_gradient_sync_edges() -> None:
     dag = _dag(
         _node("bwd", subkind="BWD"),
         _node("all_reduce", stream="dp", kind="REDUCE_COMM", subkind=None),
@@ -103,6 +183,9 @@ def test_update_waits_for_backward_and_gradient_synchronization() -> None:
         _node("upd", kind="UPD", subkind=None),
     )
 
+    for predecessor in ("bwd", "all_reduce", "reduce_scatter"):
+        dag.add_edge(TrainingDAGEdge(predecessor, "upd", "temporal"))
+
     plan = _by_uid(dag, ["bwd", "all_reduce", "reduce_scatter", "upd"])
 
     assert plan["upd"].completion_predecessors == (
@@ -110,11 +193,9 @@ def test_update_waits_for_backward_and_gradient_synchronization() -> None:
         "all_reduce",
         "reduce_scatter",
     )
-    assert plan["upd"].reason_for("bwd") == (
-        "stream_fifo+update_backward"
-    )
-    assert plan["upd"].reason_for("all_reduce") == "update_gradient_sync"
-    assert plan["upd"].reason_for("reduce_scatter") == "update_gradient_sync"
+    assert plan["upd"].reason_for("bwd") == "same_stream_temporal"
+    assert plan["upd"].reason_for("all_reduce") == "cross_stream_temporal"
+    assert plan["upd"].reason_for("reduce_scatter") == "cross_stream_temporal"
 
 
 def test_plan_rejects_dispatch_order_that_violates_an_edge() -> None:
@@ -125,7 +206,7 @@ def test_plan_rejects_dispatch_order_that_violates_an_edge() -> None:
         build_execution_plan(dag, ["b", "a"])
 
 
-def test_directional_p2p_relaxes_ordering_only_but_not_data_dependencies() -> None:
+def test_directional_p2p_preserves_every_explicit_dependency() -> None:
     lo_hi = _node("lo_hi", stream="pp", kind="SEND_COMM", subkind=None)
     hi_lo = _node("hi_lo", stream="pp", kind="RECV_COMM", subkind=None)
     lo_hi.node_meta["comm_group_kind"] = "pp_lo_hi"
@@ -141,21 +222,15 @@ def test_directional_p2p_relaxes_ordering_only_but_not_data_dependencies() -> No
     explicit_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
     explicit_reason = explicit_plan["hi_lo"].reason_for("lo_hi")
     assert explicit_reason == "cross_stream_temporal"
-    assert is_relaxable_p2p_ordering_dependency(
-        lo_hi, hi_lo, explicit_reason
-    )
 
     dag.edges.clear()
     dag.add_edge(TrainingDAGEdge("lo_hi", "hi_lo", "data"))
     data_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
     data_reason = data_plan["hi_lo"].reason_for("lo_hi")
     assert data_reason == "cross_stream_data"
-    assert not is_relaxable_p2p_ordering_dependency(
-        lo_hi, hi_lo, data_reason
-    )
 
 
-def test_directional_p2p_preserves_fifo_with_interposed_opposite_direction() -> None:
+def test_directional_p2p_plan_does_not_invent_fifo_edges() -> None:
     lo_hi_1 = _node("lo_hi_1", stream="pp", kind="SEND_COMM", subkind=None)
     hi_lo = _node("hi_lo", stream="pp", kind="RECV_COMM", subkind=None)
     lo_hi_2 = _node("lo_hi_2", stream="pp", kind="SEND_COMM", subkind=None)
@@ -167,25 +242,21 @@ def test_directional_p2p_preserves_fifo_with_interposed_opposite_direction() -> 
     plan = _by_uid(dag, ["lo_hi_1", "hi_lo", "lo_hi_2"])
 
     assert plan["hi_lo"].completion_predecessors == ()
-    assert plan["lo_hi_2"].completion_predecessors == ("lo_hi_1",)
-    assert plan["lo_hi_2"].reason_for("lo_hi_1") == "stream_fifo"
-    assert not is_relaxable_p2p_ordering_dependency(
-        lo_hi_1,
-        lo_hi_2,
-        plan["lo_hi_2"].reason_for("lo_hi_1"),
-    )
+    assert plan["lo_hi_2"].completion_predecessors == ()
 
 
-def test_p2p_ordering_without_direction_metadata_is_not_relaxed() -> None:
+def test_p2p_without_direction_metadata_uses_declared_stream() -> None:
     first = _node("first", stream="pp", kind="SEND_COMM", subkind=None)
     second = _node("second", stream="pp", kind="RECV_COMM", subkind=None)
 
-    assert not is_relaxable_p2p_ordering_dependency(
-        first, second, "stream_fifo"
-    )
+    dag = _dag(first, second)
+    dag.add_edge(TrainingDAGEdge("first", "second", "temporal"))
+    plan = _by_uid(dag, ["first", "second"])
+    assert plan["second"].logical_stream == "pp"
+    assert plan["second"].reason_for("first") == "same_stream_temporal"
 
 
-def test_directional_routed_collectives_use_independent_fifo_domains() -> None:
+def test_routed_collectives_use_declared_stream_and_explicit_edges() -> None:
     dispatch0 = _node(
         "dispatch0", stream="ep", kind="M_TO_N_COMM", subkind=None
     )
@@ -199,30 +270,22 @@ def test_directional_routed_collectives_use_independent_fifo_domains() -> None:
 
     plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
 
-    assert plan["dispatch0"].logical_stream == "m_to_n"
-    assert plan["combine"].logical_stream == "n_to_m"
+    assert plan["dispatch0"].logical_stream == "ep"
+    assert plan["combine"].logical_stream == "ep"
     assert plan["combine"].completion_predecessors == ()
-    assert plan["dispatch1"].completion_predecessors == ("dispatch0",)
-    assert plan["dispatch1"].reason_for("dispatch0") == "stream_fifo"
+    assert plan["dispatch1"].completion_predecessors == ()
 
     dag.add_edge(TrainingDAGEdge("dispatch0", "combine", "temporal"))
     temporal_plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
     reason = temporal_plan["combine"].reason_for("dispatch0")
-    assert reason == "cross_stream_temporal"
-    assert is_relaxable_directional_communication_ordering_dependency(
-        dispatch0, combine, reason
-    )
-    assert is_relaxable_p2p_ordering_dependency(dispatch0, combine, reason)
+    assert reason == "same_stream_temporal"
 
     dag.edges.clear()
     dag._rebuild_edge_indexes()
     dag.add_edge(TrainingDAGEdge("dispatch0", "combine", "data"))
     data_plan = _by_uid(dag, ["dispatch0", "combine", "dispatch1"])
     data_reason = data_plan["combine"].reason_for("dispatch0")
-    assert data_reason == "cross_stream_data"
-    assert not is_relaxable_directional_communication_ordering_dependency(
-        dispatch0, combine, data_reason
-    )
+    assert data_reason == "same_stream_data"
 
 
 def test_plan_rejects_missing_or_duplicate_dispatch_nodes() -> None:
@@ -407,3 +470,55 @@ def test_executor_applies_plan_and_serialization_waits_outside_ranges(
     assert serialization_wait_index < second_push_index
     assert serialization_wait_index < second_rf_push_index
     assert trace[-2:] == [("synchronize",), ("finish",)]
+
+
+def test_executor_uses_fifo_without_event_wait_for_same_physical_stream(
+    monkeypatch,
+) -> None:
+    waits = []
+
+    class FakeStream:
+        def wait_event(self, event) -> None:
+            waits.append(event)
+
+    class FakeEvent:
+        def record(self, _stream) -> None:
+            pass
+
+    stream = FakeStream()
+    runtime = SimpleNamespace(
+        streams={"default_stream": stream},
+        default_stream=lambda: stream,
+        stream_for_task=lambda _node: stream,
+        stream_id=lambda node: node.stream,
+        nvtx_push=lambda _label: None,
+        nvtx_pop=lambda: None,
+    )
+    first = _node("first", kind="ORDER_DUMMY", subkind=None)
+    second = _node("second", kind="ORDER_DUMMY", subkind=None)
+    for node in (first, second):
+        node.task_type = TaskType.ORDER_DUMMY
+        node.batches = [SimpleNamespace(mb_idx=0)]
+    dag = _dag(first, second)
+    dag.add_edge(TrainingDAGEdge("first", "second", "temporal"))
+
+    monkeypatch.setattr(executors.torch.cuda, "Event", FakeEvent)
+    logger = Mock()
+    logger.isEnabledFor.return_value = False
+    executor = DagExecutor(
+        runtime=runtime,
+        stages=Mock(),
+        buffers=Mock(),
+        events=Mock(),
+        params=Mock(),
+        communication=Mock(),
+        compute=Mock(),
+        logger=logger,
+    )
+    executor._rf_enter = lambda _label: None
+    executor._rf_exit = lambda _handle: None
+    prepared = executor.prepare(dag, [first, second])
+
+    executor.run(prepared, None, None, [], serialize_nodes=True)
+
+    assert waits == []

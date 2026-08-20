@@ -1,5 +1,6 @@
 import time
 import json
+import heapq
 from pathlib import Path
 import warnings
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
     TrainingDAGNode,
+    _ReachabilityIndex,
     build_training_dag,
 )
 from .directives import (
@@ -36,7 +38,11 @@ from .directives import (
     apply_schedule_directives,
 )
 from .ordering import (
+    _dispatch_order,
+    _resolve_default_stream_order,
     _serial_topological_order,
+    assign_dispatch_levels,
+    execution_stream_domain,
     resolve_total_order_per_stream,
 )
 from .profile_statistics import summarize_timing_samples
@@ -56,11 +62,11 @@ from .visualization import (
     print_training_dag_order,
     render_training_dag,
 )
-_MAX_KINETO_CAPTURE_LOSS_RATE = 1e-4
-_MAX_KINETO_CPU_LAUNCH_LOSS_RATE = 1e-4
 from .zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
 
 logger = create_logger("piper_backend", LOG_LEVEL)
+_MAX_KINETO_CAPTURE_LOSS_RATE = 1e-4
+_MAX_KINETO_CPU_LAUNCH_LOSS_RATE = 1e-4
 _ANNOTATION_STACK: list[dict[str, int]] = []
 _ANNOTATION_COUNTS: dict[str, int] = {}
 _ANNOTATION_UID = 0
@@ -307,12 +313,1368 @@ def _split_global_training_dag_by_pp_rank(
 
 
 _ROUTED_CROSS_GROUP_KINDS = frozenset({"M_TO_N_COMM", "N_TO_M_COMM"})
+_ROUTED_ISSUE_ORDERED_COMM_KINDS = frozenset(
+    {"A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"}
+)
+_P2P_COMM_KINDS = frozenset({"SEND_COMM", "RECV_COMM"})
+
+
+def _order_routed_communication_transactions(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    """Add one consistent routed-collective order per stream domain.
+
+    Existing model and schedule reachability is projected onto transaction IDs
+    across all actor DAGs. A common linear extension is then materialized only
+    between communication endpoints local to each actor, leaving unrelated
+    compute incomparable.
+    """
+    endpoint_by_dag_and_comm: dict[tuple[int, str], str] = {}
+    domain_by_comm: dict[str, str] = {}
+
+    for dag_index, dag in enumerate(actor_group_dags):
+        for uid, node in dag.nodes.items():
+            if node.node_kind not in _ROUTED_ISSUE_ORDERED_COMM_KINDS:
+                continue
+            comm_id = node.node_meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"communication node {uid} requires a non-empty comm_id"
+                )
+            endpoint_key = (dag_index, comm_id)
+            if endpoint_key in endpoint_by_dag_and_comm:
+                raise ValueError(
+                    f"actor DAG {dag_index} contains multiple endpoints for "
+                    f"communication transaction {comm_id!r}"
+                )
+            endpoint_by_dag_and_comm[endpoint_key] = uid
+            domain = execution_stream_domain(node)
+            previous_domain = domain_by_comm.setdefault(comm_id, domain)
+            if previous_domain != domain:
+                raise ValueError(
+                    f"communication transaction {comm_id!r} endpoints disagree "
+                    f"on physical stream domain: {previous_domain!r} and "
+                    f"{domain!r}"
+                )
+
+    comms_by_domain: dict[str, set[str]] = {}
+    for comm_id, domain in domain_by_comm.items():
+        comms_by_domain.setdefault(domain, set()).add(comm_id)
+
+    reachability_by_dag = [
+        _ReachabilityIndex(dag) for dag in actor_group_dags
+    ]
+    canonical_index_by_domain: dict[str, dict[str, int]] = {}
+    for domain, comm_ids in sorted(comms_by_domain.items()):
+        successors = {comm_id: set() for comm_id in comm_ids}
+        indegree = {comm_id: 0 for comm_id in comm_ids}
+
+        for dag_index, dag in enumerate(actor_group_dags):
+            local = [
+                (comm_id, endpoint_by_dag_and_comm[(dag_index, comm_id)])
+                for comm_id in sorted(comm_ids)
+                if (dag_index, comm_id) in endpoint_by_dag_and_comm
+            ]
+            reachability = reachability_by_dag[dag_index]
+            for left_index, (left_comm, left_uid) in enumerate(local):
+                for right_comm, right_uid in local[left_index + 1 :]:
+                    if reachability.has_path(left_uid, right_uid):
+                        src_comm, dst_comm = left_comm, right_comm
+                    elif reachability.has_path(right_uid, left_uid):
+                        src_comm, dst_comm = right_comm, left_comm
+                    else:
+                        continue
+                    if dst_comm not in successors[src_comm]:
+                        successors[src_comm].add(dst_comm)
+                        indegree[dst_comm] += 1
+
+        ready = [
+            comm_id for comm_id, degree in indegree.items() if degree == 0
+        ]
+        heapq.heapify(ready)
+        canonical: list[str] = []
+        while ready:
+            comm_id = heapq.heappop(ready)
+            canonical.append(comm_id)
+            for successor in sorted(successors[comm_id]):
+                indegree[successor] -= 1
+                if indegree[successor] == 0:
+                    heapq.heappush(ready, successor)
+        if len(canonical) != len(comm_ids):
+            cyclic = sorted(
+                comm_id for comm_id, degree in indegree.items() if degree > 0
+            )
+            raise ValueError(
+                "communication schedule has a cross-actor issue-order cycle "
+                f"on stream={domain!r}: transactions={cyclic}"
+            )
+        canonical_index_by_domain[domain] = {
+            comm_id: index for index, comm_id in enumerate(canonical)
+        }
+
+    for dag_index, dag in enumerate(actor_group_dags):
+        reachability = reachability_by_dag[dag_index]
+        local_by_domain: dict[str, list[tuple[str, str]]] = {}
+        for (endpoint_dag_index, comm_id), uid in endpoint_by_dag_and_comm.items():
+            if endpoint_dag_index != dag_index:
+                continue
+            local_by_domain.setdefault(domain_by_comm[comm_id], []).append(
+                (comm_id, uid)
+            )
+        for domain, local in sorted(local_by_domain.items()):
+            canonical_index = canonical_index_by_domain[domain]
+            local.sort(key=lambda item: canonical_index[item[0]])
+            for (_src_comm, src_uid), (_dst_comm, dst_uid) in zip(
+                local, local[1:]
+            ):
+                if reachability.has_path(dst_uid, src_uid):
+                    raise ValueError(
+                        "canonical communication order conflicts with actor DAG "
+                        f"{dag_index} on stream={domain!r}: "
+                        f"{src_uid}->{dst_uid}"
+                    )
+                if reachability.has_path(src_uid, dst_uid):
+                    continue
+                dag.add_edge(
+                    TrainingDAGEdge(
+                        src_uid=src_uid,
+                        dst_uid=dst_uid,
+                        dep_kind="temporal",
+                        tensor_name=None,
+                    )
+                )
+                reachability.add_edge(src_uid, dst_uid)
+
+
+@dataclass(frozen=True)
+class _P2PTransaction:
+    comm_id: str
+    source_dag_index: int
+    source_uid: str
+    destination_dag_index: int
+    destination_uid: str
+    source_compute_uid: str
+    destination_compute_uid: str
+    source_compute_index: int
+    destination_compute_index: int
+    physical_stream_domain: str
+
+    @property
+    def priority(self) -> tuple[int, int, str]:
+        # Receives needed by earlier consumers lead. The source index is a
+        # readiness-oriented secondary preference; neither index can override
+        # an encoded transaction dependency.
+        return (
+            self.destination_compute_index,
+            self.source_compute_index,
+            self.comm_id,
+        )
+
+
+def _collect_p2p_transactions(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> dict[str, _P2PTransaction]:
+    endpoints: dict[
+        str,
+        list[tuple[int, str, TrainingDAGNode]],
+    ] = {}
+    compute_index_by_dag: list[dict[str, int]] = []
+    for dag in actor_group_dags:
+        compute_order = [
+            uid
+            for uid in _serial_topological_order(dag)
+            if dag.nodes[uid].node_kind == "COMPUTE"
+        ]
+        compute_index_by_dag.append(
+            {uid: index for index, uid in enumerate(compute_order)}
+        )
+
+    allowed_domains = {
+        "pp_lo_hi",
+        "pp_hi_lo",
+        "dense_state_lo_hi",
+        "dense_state_hi_lo",
+    }
+    for dag_index, dag in enumerate(actor_group_dags):
+        seen_local: set[str] = set()
+        for uid, node in dag.nodes.items():
+            if node.node_kind not in _P2P_COMM_KINDS:
+                continue
+            comm_id = node.node_meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"P2P node {uid} requires a non-empty comm_id"
+                )
+            if comm_id in seen_local:
+                raise ValueError(
+                    f"actor DAG {dag_index} contains multiple endpoints for "
+                    f"P2P transaction {comm_id!r}"
+                )
+            seen_local.add(comm_id)
+            domain = execution_stream_domain(node)
+            if domain not in allowed_domains:
+                raise ValueError(
+                    f"pipeline P2P node {uid} requires a directional "
+                    "comm_group_kind before actor-DAG ordering"
+                )
+            endpoints.setdefault(comm_id, []).append((dag_index, uid, node))
+
+    transactions: dict[str, _P2PTransaction] = {}
+    for comm_id, paired in endpoints.items():
+        if len(paired) != 2 or {
+            endpoint[2].node_kind for endpoint in paired
+        } != {"SEND_COMM", "RECV_COMM"}:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} requires exactly one SEND and "
+                "one RECV endpoint, got "
+                f"{[(uid, node.node_kind) for _dag, uid, node in paired]}"
+            )
+        source = next(
+            endpoint for endpoint in paired
+            if endpoint[2].node_kind == "SEND_COMM"
+        )
+        destination = next(
+            endpoint for endpoint in paired
+            if endpoint[2].node_kind == "RECV_COMM"
+        )
+        source_meta = source[2].node_meta
+        destination_meta = destination[2].node_meta
+        for field in (
+            "source_compute_uid",
+            "destination_compute_uid",
+            "comm_group_kind",
+            "participants",
+        ):
+            if source_meta.get(field) != destination_meta.get(field):
+                raise ValueError(
+                    f"P2P transaction {comm_id!r} endpoints disagree on "
+                    f"{field}: source={source_meta.get(field)!r}, "
+                    f"destination={destination_meta.get(field)!r}"
+                )
+        source_compute_uid = source_meta.get("source_compute_uid")
+        destination_compute_uid = source_meta.get(
+            "destination_compute_uid"
+        )
+        if not isinstance(source_compute_uid, str) or not source_compute_uid:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} requires a non-empty "
+                "source_compute_uid"
+            )
+        if (
+            not isinstance(destination_compute_uid, str)
+            or not destination_compute_uid
+        ):
+            raise ValueError(
+                f"P2P transaction {comm_id!r} requires a non-empty "
+                "destination_compute_uid"
+            )
+        source_dag_index = source[0]
+        destination_dag_index = destination[0]
+        for role, dag_index, compute_uid in (
+            ("source", source_dag_index, source_compute_uid),
+            (
+                "destination",
+                destination_dag_index,
+                destination_compute_uid,
+            ),
+        ):
+            compute_node = actor_group_dags[dag_index].nodes.get(compute_uid)
+            if compute_node is None or compute_node.node_kind != "COMPUTE":
+                raise ValueError(
+                    f"P2P transaction {comm_id!r} {role} anchor "
+                    f"{compute_uid!r} is not a local COMPUTE node in actor "
+                    f"DAG {dag_index}"
+                )
+        source_domain = execution_stream_domain(source[2])
+        destination_domain = execution_stream_domain(destination[2])
+        if source_domain != destination_domain:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} endpoints disagree on "
+                f"physical stream domain: source={source_domain!r}, "
+                f"destination={destination_domain!r}"
+            )
+        participants = source_meta.get("participants")
+        if (
+            not isinstance(participants, (list, tuple))
+            or not participants
+            or any(
+                isinstance(rank, bool) or not isinstance(rank, int)
+                for rank in participants
+            )
+            or tuple(participants) != tuple(sorted(set(participants)))
+        ):
+            raise ValueError(
+                f"P2P transaction {comm_id!r} requires sorted unique integer "
+                f"participants, got {participants!r}"
+            )
+        represented_participants = tuple(
+            sorted(
+                {
+                    int(rank)
+                    for endpoint in (source[2], destination[2])
+                    for rank in (endpoint.device or ())
+                }
+            )
+        )
+        if tuple(participants) != represented_participants:
+            raise ValueError(
+                f"P2P transaction {comm_id!r} endpoints represent ranks="
+                f"{represented_participants}, but metadata declares "
+                f"participants={tuple(participants)}"
+            )
+        transactions[comm_id] = _P2PTransaction(
+            comm_id=comm_id,
+            source_dag_index=source_dag_index,
+            source_uid=source[1],
+            destination_dag_index=destination_dag_index,
+            destination_uid=destination[1],
+            source_compute_uid=source_compute_uid,
+            destination_compute_uid=destination_compute_uid,
+            source_compute_index=compute_index_by_dag[source_dag_index][
+                source_compute_uid
+            ],
+            destination_compute_index=compute_index_by_dag[
+                destination_dag_index
+            ][destination_compute_uid],
+            physical_stream_domain=source_domain,
+        )
+    return transactions
+
+
+def _p2p_transaction_precedence(
+    actor_group_dags: Sequence[TrainingDAG],
+    transactions: Mapping[str, _P2PTransaction],
+) -> dict[str, set[str]]:
+    """Return encoded precedence between transactions in each P2P domain."""
+    successors = {comm_id: set() for comm_id in transactions}
+    endpoints_by_dag_and_domain: dict[
+        tuple[int, str], list[tuple[str, str]]
+    ] = {}
+    for transaction in transactions.values():
+        endpoints_by_dag_and_domain.setdefault(
+            (
+                transaction.source_dag_index,
+                transaction.physical_stream_domain,
+            ),
+            [],
+        ).append((transaction.comm_id, transaction.source_uid))
+        endpoints_by_dag_and_domain.setdefault(
+            (
+                transaction.destination_dag_index,
+                transaction.physical_stream_domain,
+            ),
+            [],
+        ).append((transaction.comm_id, transaction.destination_uid))
+
+    for (dag_index, _domain), local_endpoints in sorted(
+        endpoints_by_dag_and_domain.items()
+    ):
+        reachability = _ReachabilityIndex(actor_group_dags[dag_index])
+        local = sorted(local_endpoints)
+        for left_index, (left_comm, left_uid) in enumerate(local):
+            for right_comm, right_uid in local[left_index + 1 :]:
+                if left_comm == right_comm:
+                    continue
+                if reachability.has_path(left_uid, right_uid):
+                    successors[left_comm].add(right_comm)
+                elif reachability.has_path(right_uid, left_uid):
+                    successors[right_comm].add(left_comm)
+    return successors
+
+
+def _find_p2p_transaction_cycle(
+    successors: Mapping[str, set[str]],
+    transaction_ids: set[str],
+) -> list[str]:
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    position: dict[str, int] = {}
+
+    def visit(comm_id: str) -> list[str] | None:
+        state[comm_id] = 1
+        position[comm_id] = len(stack)
+        stack.append(comm_id)
+        for successor in sorted(successors[comm_id] & transaction_ids):
+            if state.get(successor, 0) == 0:
+                found = visit(successor)
+                if found is not None:
+                    return found
+            elif state.get(successor) == 1:
+                return stack[position[successor] :] + [successor]
+        stack.pop()
+        position.pop(comm_id)
+        state[comm_id] = 2
+        return None
+
+    for comm_id in sorted(transaction_ids):
+        if state.get(comm_id, 0) != 0:
+            continue
+        found = visit(comm_id)
+        if found is not None:
+            return found
+    return []
+
+
+def _describe_p2p_transaction(transaction: _P2PTransaction) -> str:
+    return (
+        f"{transaction.comm_id}["
+        f"dag{transaction.source_dag_index}:{transaction.source_uid}->"
+        f"dag{transaction.destination_dag_index}:"
+        f"{transaction.destination_uid}]"
+    )
+
+
+def _topologically_order_p2p_transactions(
+    transactions: Mapping[str, _P2PTransaction],
+    successors: Mapping[str, set[str]],
+) -> dict[str, list[str]]:
+    ordered_by_domain: dict[str, list[str]] = {}
+    domains = sorted(
+        {transaction.physical_stream_domain for transaction in transactions.values()}
+    )
+    for domain in domains:
+        transaction_ids = {
+            comm_id
+            for comm_id, transaction in transactions.items()
+            if transaction.physical_stream_domain == domain
+        }
+        indegree = {comm_id: 0 for comm_id in transaction_ids}
+        for comm_id in transaction_ids:
+            for successor in successors[comm_id]:
+                if successor in transaction_ids:
+                    indegree[successor] += 1
+        ready = [
+            (transactions[comm_id].priority, comm_id)
+            for comm_id, degree in indegree.items()
+            if degree == 0
+        ]
+        heapq.heapify(ready)
+        ordered: list[str] = []
+        while ready:
+            _priority, comm_id = heapq.heappop(ready)
+            ordered.append(comm_id)
+            for successor in sorted(successors[comm_id] & transaction_ids):
+                indegree[successor] -= 1
+                if indegree[successor] == 0:
+                    heapq.heappush(
+                        ready,
+                        (transactions[successor].priority, successor),
+                    )
+        if len(ordered) != len(transaction_ids):
+            cycle = _find_p2p_transaction_cycle(
+                successors,
+                transaction_ids,
+            )
+            details = " -> ".join(
+                _describe_p2p_transaction(transactions[comm_id])
+                for comm_id in cycle
+            )
+            raise ValueError(
+                "P2P transaction graph is cyclic on directional stream "
+                f"{domain!r}: {details}"
+            )
+        ordered_by_domain[domain] = ordered
+    return ordered_by_domain
+
+
+def _validate_global_p2p_transaction_graph(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    transactions = _collect_p2p_transactions(actor_group_dags)
+    if not transactions:
+        return
+    successors = _p2p_transaction_precedence(
+        actor_group_dags,
+        transactions,
+    )
+    _topologically_order_p2p_transactions(transactions, successors)
+
+
+def _order_p2p_transactions(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> None:
+    transactions = _collect_p2p_transactions(actor_group_dags)
+    if not transactions:
+        return
+    successors = _p2p_transaction_precedence(
+        actor_group_dags,
+        transactions,
+    )
+    canonical_by_domain = _topologically_order_p2p_transactions(
+        transactions,
+        successors,
+    )
+    canonical_index_by_domain = {
+        domain: {
+            comm_id: index for index, comm_id in enumerate(canonical)
+        }
+        for domain, canonical in canonical_by_domain.items()
+    }
+
+    local_by_dag_and_domain: dict[
+        tuple[int, str], list[tuple[str, str]]
+    ] = {}
+    for transaction in transactions.values():
+        local_by_dag_and_domain.setdefault(
+            (
+                transaction.source_dag_index,
+                transaction.physical_stream_domain,
+            ),
+            [],
+        ).append((transaction.comm_id, transaction.source_uid))
+        local_by_dag_and_domain.setdefault(
+            (
+                transaction.destination_dag_index,
+                transaction.physical_stream_domain,
+            ),
+            [],
+        ).append((transaction.comm_id, transaction.destination_uid))
+
+    reachability_by_dag = [
+        _ReachabilityIndex(dag) for dag in actor_group_dags
+    ]
+    for (dag_index, domain), local in sorted(
+        local_by_dag_and_domain.items()
+    ):
+        canonical_index = canonical_index_by_domain[domain]
+        local.sort(key=lambda item: canonical_index[item[0]])
+        reachability = reachability_by_dag[dag_index]
+        for (_src_comm, src_uid), (_dst_comm, dst_uid) in zip(
+            local, local[1:]
+        ):
+            if reachability.has_path(dst_uid, src_uid):
+                raise ValueError(
+                    "global P2P transaction order conflicts with actor DAG "
+                    f"{dag_index} on stream={domain!r}: "
+                    f"{src_uid}->{dst_uid}"
+                )
+            if reachability.has_path(src_uid, dst_uid):
+                continue
+            actor_group_dags[dag_index].add_edge(
+                TrainingDAGEdge(
+                    src_uid=src_uid,
+                    dst_uid=dst_uid,
+                    dep_kind="temporal",
+                    tensor_name=None,
+                )
+            )
+            reachability.add_edge(src_uid, dst_uid)
+
+    _validate_global_p2p_transaction_graph(actor_group_dags)
+
+
+_GLOBAL_COLLECTIVE_COMM_KINDS = frozenset(
+    {
+        "A2A_COMM",
+        "M_TO_N_COMM",
+        "N_TO_M_COMM",
+        "REDUCE_COMM",
+        "ALL_REDUCE_COMM",
+        "ALL_GATHER_COMM",
+        "REDUCE_SCATTER_COMM",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _CommunicationEndpoint:
+    dag_index: int
+    uid: str
+    physical_stream_domain: str
+
+
+@dataclass(frozen=True)
+class _CommunicationTransaction:
+    identity: tuple[str, str]
+    comm_id: str
+    kind: str
+    participants: tuple[int, ...]
+    channels: tuple[str, ...]
+    endpoints: tuple[_CommunicationEndpoint, ...]
+    preferred_position: tuple[int, int]
+
+    @property
+    def priority(self) -> tuple[int, int, str, str]:
+        return (*self.preferred_position, self.kind, self.comm_id)
+
+
+@dataclass(frozen=True)
+class _GlobalCommunicationOrder:
+    identities: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _CommunicationPrecedenceProvenance:
+    dag_index: int
+    path: tuple[tuple[str, str, str], ...]
+
+
+def _validated_participants(
+    node: TrainingDAGNode,
+    *,
+    context: str,
+) -> tuple[int, ...]:
+    raw = node.node_meta.get("participants")
+    if (
+        not isinstance(raw, (list, tuple))
+        or not raw
+        or any(isinstance(rank, bool) or not isinstance(rank, int) for rank in raw)
+    ):
+        raise ValueError(
+            f"{context} requires non-empty integer participants, got {raw!r}"
+        )
+    participants = tuple(int(rank) for rank in raw)
+    if participants != tuple(sorted(set(participants))):
+        raise ValueError(
+            f"{context} requires sorted unique participants, got {raw!r}"
+        )
+    return participants
+
+
+def _collect_communication_transactions(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> tuple[
+    dict[tuple[str, str], _CommunicationTransaction],
+    dict[tuple[int, str], tuple[str, str]],
+]:
+    """Normalize every DAG-visible communication into logical transactions."""
+
+    serial_index_by_dag = [
+        {
+            uid: index
+            for index, uid in enumerate(_serial_topological_order(dag))
+        }
+        for dag in actor_group_dags
+    ]
+    transactions: dict[tuple[str, str], _CommunicationTransaction] = {}
+    endpoint_identity: dict[tuple[int, str], tuple[str, str]] = {}
+    identity_by_text_id: dict[str, tuple[str, str]] = {}
+
+    def register(transaction: _CommunicationTransaction) -> None:
+        previous_identity = identity_by_text_id.setdefault(
+            transaction.comm_id, transaction.identity
+        )
+        if previous_identity != transaction.identity:
+            raise ValueError(
+                f"communication comm_id {transaction.comm_id!r} is reused by "
+                f"incompatible transactions {previous_identity!r} and "
+                f"{transaction.identity!r}"
+            )
+        if transaction.identity in transactions:
+            raise ValueError(
+                f"duplicate communication transaction {transaction.identity!r}"
+            )
+        transactions[transaction.identity] = transaction
+        for endpoint in transaction.endpoints:
+            key = (endpoint.dag_index, endpoint.uid)
+            if key in endpoint_identity:
+                raise ValueError(
+                    f"communication endpoint dag{endpoint.dag_index}:"
+                    f"{endpoint.uid} belongs to multiple transactions"
+                )
+            endpoint_identity[key] = transaction.identity
+
+    for p2p in _collect_p2p_transactions(actor_group_dags).values():
+        source_node = actor_group_dags[p2p.source_dag_index].nodes[p2p.source_uid]
+        destination_node = actor_group_dags[
+            p2p.destination_dag_index
+        ].nodes[p2p.destination_uid]
+        participants = _validated_participants(
+            source_node, context=f"P2P transaction {p2p.comm_id!r}"
+        )
+        channel = source_node.node_meta.get("comm_group_kind")
+        if not isinstance(channel, str) or not channel:
+            raise ValueError(
+                f"P2P transaction {p2p.comm_id!r} requires comm_group_kind"
+            )
+        endpoints = (
+            _CommunicationEndpoint(
+                p2p.source_dag_index,
+                p2p.source_uid,
+                p2p.physical_stream_domain,
+            ),
+            _CommunicationEndpoint(
+                p2p.destination_dag_index,
+                p2p.destination_uid,
+                p2p.physical_stream_domain,
+            ),
+        )
+        register(
+            _CommunicationTransaction(
+                identity=("P2P", p2p.comm_id),
+                comm_id=p2p.comm_id,
+                kind="P2P",
+                participants=participants,
+                channels=(channel,),
+                endpoints=endpoints,
+                preferred_position=(
+                    p2p.destination_compute_index,
+                    p2p.source_compute_index,
+                ),
+            )
+        )
+
+    collective_endpoints: dict[
+        tuple[str, str], list[tuple[int, str, TrainingDAGNode]]
+    ] = {}
+    for dag_index, dag in enumerate(actor_group_dags):
+        seen_local: set[tuple[str, str]] = set()
+        for uid, node in dag.nodes.items():
+            if node.node_kind in _P2P_COMM_KINDS:
+                continue
+            if not node.node_kind.endswith("_COMM"):
+                continue
+            if node.node_kind not in _GLOBAL_COLLECTIVE_COMM_KINDS:
+                raise ValueError(
+                    f"unsupported communication node kind {node.node_kind!r} "
+                    f"for dag{dag_index}:{uid}"
+                )
+            comm_id = node.node_meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"communication node dag{dag_index}:{uid} requires a "
+                    "non-empty comm_id"
+                )
+            identity = (node.node_kind, comm_id)
+            if identity in seen_local:
+                raise ValueError(
+                    f"actor DAG {dag_index} contains multiple endpoints for "
+                    f"communication transaction {identity!r}"
+                )
+            seen_local.add(identity)
+            collective_endpoints.setdefault(identity, []).append(
+                (dag_index, uid, node)
+            )
+
+    for identity, raw_endpoints in sorted(collective_endpoints.items()):
+        kind, comm_id = identity
+        first_node = raw_endpoints[0][2]
+        participants = _validated_participants(
+            first_node, context=f"communication transaction {identity!r}"
+        )
+        comm_group_kind = first_node.node_meta.get("comm_group_kind")
+        if not isinstance(comm_group_kind, str) or not comm_group_kind:
+            raise ValueError(
+                f"communication transaction {identity!r} requires "
+                "comm_group_kind"
+            )
+        first_domain = execution_stream_domain(first_node)
+        represented: list[int] = []
+        roles: set[str] = set()
+        endpoints: list[_CommunicationEndpoint] = []
+        positions: list[int] = []
+        for dag_index, uid, node in raw_endpoints:
+            endpoint_participants = _validated_participants(
+                node, context=f"communication endpoint dag{dag_index}:{uid}"
+            )
+            if endpoint_participants != participants:
+                raise ValueError(
+                    f"communication transaction {identity!r} endpoints "
+                    f"disagree on participants: {participants} and "
+                    f"{endpoint_participants}"
+                )
+            endpoint_group = node.node_meta.get("comm_group_kind")
+            if endpoint_group != comm_group_kind:
+                raise ValueError(
+                    f"communication transaction {identity!r} endpoints "
+                    f"disagree on comm_group_kind: {comm_group_kind!r} and "
+                    f"{endpoint_group!r}"
+                )
+            domain = execution_stream_domain(node)
+            if domain != first_domain:
+                raise ValueError(
+                    f"communication transaction {identity!r} endpoints "
+                    f"disagree on physical stream: {first_domain!r} and "
+                    f"{domain!r}"
+                )
+            if node.device is None or not node.device:
+                raise ValueError(
+                    f"communication endpoint dag{dag_index}:{uid} has no "
+                    "represented devices"
+                )
+            represented.extend(int(rank) for rank in node.device)
+            if kind in _ROUTED_CROSS_GROUP_KINDS:
+                role = node.node_meta.get("role")
+                if role not in {"source", "destination"}:
+                    raise ValueError(
+                        f"routed transaction {identity!r} endpoint "
+                        f"dag{dag_index}:{uid} has invalid role={role!r}"
+                    )
+                roles.add(str(role))
+            endpoints.append(_CommunicationEndpoint(dag_index, uid, domain))
+            positions.append(serial_index_by_dag[dag_index][uid])
+        if len(represented) != len(set(represented)):
+            raise ValueError(
+                f"communication transaction {identity!r} has overlapping "
+                f"ActorGroup endpoint devices={represented}"
+            )
+        represented_participants = tuple(sorted(represented))
+        if represented_participants != participants:
+            raise ValueError(
+                f"communication transaction {identity!r} represents ranks="
+                f"{represented_participants}, but declares participants="
+                f"{participants}"
+            )
+        if kind in _ROUTED_CROSS_GROUP_KINDS and (
+            len(raw_endpoints) != 2
+            or roles != {"source", "destination"}
+        ):
+            raise ValueError(
+                f"routed transaction {identity!r} requires one source and one "
+                "destination ActorGroup endpoint, got "
+                f"endpoints={len(raw_endpoints)}, roles={sorted(roles)}"
+            )
+        channels = (
+            ("routed_layout", kind.removesuffix("_COMM").lower())
+            if kind in _ROUTED_CROSS_GROUP_KINDS
+            else (comm_group_kind,)
+        )
+        register(
+            _CommunicationTransaction(
+                identity=identity,
+                comm_id=comm_id,
+                kind=kind,
+                participants=participants,
+                channels=channels,
+                endpoints=tuple(sorted(endpoints, key=lambda item: item.dag_index)),
+                preferred_position=(min(positions), max(positions)),
+            )
+        )
+
+    return transactions, endpoint_identity
+
+
+def _global_communication_precedence(
+    actor_group_dags: Sequence[TrainingDAG],
+    transactions: Mapping[tuple[str, str], _CommunicationTransaction],
+    endpoint_identity: Mapping[tuple[int, str], tuple[str, str]],
+) -> tuple[
+    dict[tuple[str, str], set[tuple[str, str]]],
+    dict[
+        tuple[tuple[str, str], tuple[str, str]],
+        list[_CommunicationPrecedenceProvenance],
+    ],
+]:
+    successors = {identity: set() for identity in transactions}
+    provenance: dict[
+        tuple[tuple[str, str], tuple[str, str]],
+        list[_CommunicationPrecedenceProvenance],
+    ] = {}
+
+    def dependency_path(
+        dag: TrainingDAG, source_uid: str, destination_uid: str
+    ) -> tuple[tuple[str, str, str], ...]:
+        pending = [source_uid]
+        predecessor: dict[str, tuple[str, str]] = {}
+        seen = {source_uid}
+        while pending:
+            uid = pending.pop(0)
+            if uid == destination_uid:
+                break
+            for edge in sorted(
+                dag.outgoing_edges(uid),
+                key=lambda item: (
+                    item.dst_uid,
+                    item.dep_kind,
+                    item.tensor_name or "",
+                ),
+            ):
+                if edge.dst_uid in seen:
+                    continue
+                seen.add(edge.dst_uid)
+                predecessor[edge.dst_uid] = (uid, edge.dep_kind)
+                pending.append(edge.dst_uid)
+        if destination_uid not in seen:
+            raise AssertionError(
+                f"missing dependency path {source_uid}->{destination_uid}"
+            )
+        reversed_path: list[tuple[str, str, str]] = []
+        cursor = destination_uid
+        while cursor != source_uid:
+            previous, dep_kind = predecessor[cursor]
+            reversed_path.append((previous, cursor, dep_kind))
+            cursor = previous
+        return tuple(reversed(reversed_path))
+
+    for dag_index, dag in enumerate(actor_group_dags):
+        local = sorted(
+            (
+                identity,
+                uid,
+            )
+            for (endpoint_dag, uid), identity in endpoint_identity.items()
+            if endpoint_dag == dag_index
+        )
+        reachability = _ReachabilityIndex(dag)
+        for left_index, (left_identity, left_uid) in enumerate(local):
+            for right_identity, right_uid in local[left_index + 1 :]:
+                if left_identity == right_identity:
+                    continue
+                if reachability.has_path(left_uid, right_uid):
+                    source, destination = left_identity, right_identity
+                    source_uid, destination_uid = left_uid, right_uid
+                elif reachability.has_path(right_uid, left_uid):
+                    source, destination = right_identity, left_identity
+                    source_uid, destination_uid = right_uid, left_uid
+                else:
+                    continue
+                successors[source].add(destination)
+                provenance.setdefault((source, destination), []).append(
+                    _CommunicationPrecedenceProvenance(
+                        dag_index,
+                        dependency_path(
+                            dag, source_uid, destination_uid
+                        ),
+                    )
+                )
+    return successors, provenance
+
+
+def _find_communication_cycle(
+    successors: Mapping[tuple[str, str], set[tuple[str, str]]],
+) -> list[tuple[str, str]]:
+    state: dict[tuple[str, str], int] = {}
+    stack: list[tuple[str, str]] = []
+    positions: dict[tuple[str, str], int] = {}
+
+    def visit(identity: tuple[str, str]) -> list[tuple[str, str]] | None:
+        state[identity] = 1
+        positions[identity] = len(stack)
+        stack.append(identity)
+        for successor in sorted(successors[identity]):
+            if state.get(successor, 0) == 0:
+                found = visit(successor)
+                if found is not None:
+                    return found
+            elif state.get(successor) == 1:
+                return stack[positions[successor] :] + [successor]
+        stack.pop()
+        positions.pop(identity)
+        state[identity] = 2
+        return None
+
+    for identity in sorted(successors):
+        if state.get(identity, 0) == 0:
+            found = visit(identity)
+            if found is not None:
+                return found
+    return []
+
+
+def _describe_communication_cycle(
+    cycle: Sequence[tuple[str, str]],
+    transactions: Mapping[tuple[str, str], _CommunicationTransaction],
+    provenance: Mapping[
+        tuple[tuple[str, str], tuple[str, str]],
+        Sequence[_CommunicationPrecedenceProvenance],
+    ],
+) -> str:
+    parts: list[str] = []
+    for source, destination in zip(cycle, cycle[1:]):
+        transaction = transactions[source]
+        edge_provenance = provenance.get((source, destination), ())
+        provenance_text = [
+            {
+                "actor_dag": item.dag_index,
+                "path": [
+                    f"{src}-[{dep_kind}]->{dst}"
+                    for src, dst, dep_kind in item.path
+                ],
+            }
+            for item in edge_provenance
+        ]
+        parts.append(
+            f"{transaction.kind}:{transaction.comm_id}"
+            f"[participants={transaction.participants}, "
+            f"streams={sorted({endpoint.physical_stream_domain for endpoint in transaction.endpoints})}]"
+            f" --{provenance_text}--> "
+        )
+    if cycle:
+        final = transactions[cycle[-1]]
+        parts.append(f"{final.kind}:{final.comm_id}")
+    return "".join(parts)
+
+
+def _canonical_global_communication_order(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> tuple[
+    _GlobalCommunicationOrder,
+    dict[tuple[str, str], _CommunicationTransaction],
+]:
+    transactions, endpoint_identity = _collect_communication_transactions(
+        actor_group_dags
+    )
+    successors, provenance = _global_communication_precedence(
+        actor_group_dags, transactions, endpoint_identity
+    )
+    indegree = {identity: 0 for identity in transactions}
+    for source in successors:
+        for destination in successors[source]:
+            indegree[destination] += 1
+    ready = [
+        (transaction.priority, identity)
+        for identity, transaction in transactions.items()
+        if indegree[identity] == 0
+    ]
+    heapq.heapify(ready)
+    ordered: list[tuple[str, str]] = []
+    while ready:
+        _priority, identity = heapq.heappop(ready)
+        ordered.append(identity)
+        for successor in sorted(successors[identity]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(
+                    ready,
+                    (transactions[successor].priority, successor),
+                )
+    if len(ordered) != len(transactions):
+        cycle = _find_communication_cycle(successors)
+        raise ValueError(
+            "global communication transaction graph is cyclic: "
+            + _describe_communication_cycle(
+                cycle, transactions, provenance
+            )
+        )
+    return _GlobalCommunicationOrder(tuple(ordered)), transactions
+
+
+def _materialize_same_stream_communication_order(
+    actor_group_dags: Sequence[TrainingDAG],
+    order: _GlobalCommunicationOrder,
+    transactions: Mapping[tuple[str, str], _CommunicationTransaction],
+) -> None:
+    global_index = {
+        identity: index for index, identity in enumerate(order.identities)
+    }
+    local_by_dag_and_stream: dict[
+        tuple[int, str], list[tuple[tuple[str, str], str]]
+    ] = {}
+    for identity, transaction in transactions.items():
+        for endpoint in transaction.endpoints:
+            actor_group_dags[endpoint.dag_index].nodes[
+                endpoint.uid
+            ].node_meta["global_communication_index"] = global_index[
+                identity
+            ]
+            local_by_dag_and_stream.setdefault(
+                (endpoint.dag_index, endpoint.physical_stream_domain), []
+            ).append((identity, endpoint.uid))
+    reachability_by_dag = [
+        _ReachabilityIndex(dag) for dag in actor_group_dags
+    ]
+    for (dag_index, domain), local in sorted(local_by_dag_and_stream.items()):
+        local.sort(key=lambda item: global_index[item[0]])
+        reachability = reachability_by_dag[dag_index]
+        for (_source_identity, source_uid), (
+            _destination_identity,
+            destination_uid,
+        ) in zip(local, local[1:]):
+            if reachability.has_path(destination_uid, source_uid):
+                raise ValueError(
+                    "global communication order conflicts with actor DAG "
+                    f"{dag_index} on stream={domain!r}: "
+                    f"{source_uid}->{destination_uid}"
+                )
+            if reachability.has_path(source_uid, destination_uid):
+                continue
+            actor_group_dags[dag_index].add_edge(
+                TrainingDAGEdge(
+                    source_uid,
+                    destination_uid,
+                    "temporal",
+                    None,
+                )
+            )
+            reachability.add_edge(source_uid, destination_uid)
+
+
+def _materialize_global_communication_issue_edges(
+    actor_group_dags: Sequence[TrainingDAG],
+    order: _GlobalCommunicationOrder,
+) -> None:
+    """Add the transitive-reduced actor projection as ``issue`` DAG edges."""
+
+    transactions, _endpoint_identity = _collect_communication_transactions(
+        actor_group_dags
+    )
+    if set(transactions) != set(order.identities):
+        raise ValueError(
+            "communication transactions changed during stream finalization: "
+            f"before={sorted(order.identities)!r}, "
+            f"after={sorted(transactions)!r}"
+        )
+    global_index = {
+        identity: index for index, identity in enumerate(order.identities)
+    }
+    local_by_dag: dict[int, list[tuple[tuple[str, str], str]]] = {}
+    for identity, transaction in transactions.items():
+        for endpoint in transaction.endpoints:
+            local_by_dag.setdefault(endpoint.dag_index, []).append(
+                (identity, endpoint.uid)
+            )
+    for dag_index, local in sorted(local_by_dag.items()):
+        local.sort(key=lambda item: global_index[item[0]])
+        dag = actor_group_dags[dag_index]
+        reachability = _ReachabilityIndex(dag)
+        for (_source_identity, source_uid), (
+            _destination_identity,
+            destination_uid,
+        ) in zip(local, local[1:]):
+            if reachability.has_path(destination_uid, source_uid):
+                raise ValueError(
+                    "global communication issue order conflicts with actor DAG "
+                    f"{dag_index}: {source_uid}->{destination_uid}"
+                )
+            if reachability.has_path(source_uid, destination_uid):
+                continue
+            dag.add_edge(
+                TrainingDAGEdge(
+                    source_uid,
+                    destination_uid,
+                    "issue",
+                    None,
+                )
+            )
+            reachability.add_edge(source_uid, destination_uid)
+
+
+def _validate_global_communication_order(
+    actor_group_dags: Sequence[TrainingDAG],
+    order: _GlobalCommunicationOrder,
+) -> None:
+    transactions, endpoint_identity = _collect_communication_transactions(
+        actor_group_dags
+    )
+    successors, provenance = _global_communication_precedence(
+        actor_group_dags, transactions, endpoint_identity
+    )
+    cycle = _find_communication_cycle(successors)
+    if cycle:
+        raise ValueError(
+            "finalized global communication transaction graph is cyclic: "
+            + _describe_communication_cycle(cycle, transactions, provenance)
+        )
+    if set(transactions) != set(order.identities):
+        raise ValueError("finalized communication transaction set changed")
+    global_index = {
+        identity: index for index, identity in enumerate(order.identities)
+    }
+    for source, destinations in successors.items():
+        for destination in destinations:
+            if global_index[source] >= global_index[destination]:
+                raise ValueError(
+                    "finalized communication precedence contradicts global "
+                    f"order: {source!r}->{destination!r}"
+                )
+
+
+def _order_communication_transactions(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> _GlobalCommunicationOrder:
+    order, transactions = _canonical_global_communication_order(
+        actor_group_dags
+    )
+    _materialize_same_stream_communication_order(
+        actor_group_dags, order, transactions
+    )
+    return order
+
+
+def _interference_free_serial_orders(
+    actor_group_dags: Sequence[TrainingDAG],
+) -> tuple[tuple[str, ...], ...]:
+    """Return transaction-consistent profiling orders without mutating DAGs."""
+
+    if not actor_group_dags:
+        raise ValueError(
+            "interference-free serialization requires ActorGroup DAGs"
+        )
+
+    Unit = tuple[str, str, str]
+    unit_by_node: dict[tuple[int, str], Unit] = {}
+    members_by_unit: dict[Unit, list[tuple[int, str]]] = {}
+    participants_by_collective: dict[tuple[str, str], tuple[int, ...]] = {}
+    local_collective_endpoints: set[tuple[int, str, str]] = set()
+
+    def add_member(unit: Unit, dag_index: int, uid: str) -> None:
+        key = (dag_index, uid)
+        if key in unit_by_node:
+            raise ValueError(
+                f"node {uid!r} in actor DAG {dag_index} belongs to multiple "
+                "interference-free serialization units"
+            )
+        unit_by_node[key] = unit
+        members_by_unit.setdefault(unit, []).append(key)
+
+    p2p_transactions = _collect_p2p_transactions(actor_group_dags)
+    for transaction in p2p_transactions.values():
+        unit = ("p2p", transaction.comm_id, "")
+        add_member(
+            unit, transaction.source_dag_index, transaction.source_uid
+        )
+        add_member(
+            unit,
+            transaction.destination_dag_index,
+            transaction.destination_uid,
+        )
+
+    for dag_index, dag in enumerate(actor_group_dags):
+        for uid, node in dag.nodes.items():
+            key = (dag_index, uid)
+            if key in unit_by_node:
+                continue
+            if not node.node_kind.endswith("_COMM"):
+                add_member(("local", str(dag_index), uid), dag_index, uid)
+                continue
+            if node.node_kind in _P2P_COMM_KINDS:
+                raise ValueError(
+                    f"P2P node {uid!r} in actor DAG {dag_index} was not "
+                    "matched to one transaction"
+                )
+            comm_id = node.node_meta.get("comm_id")
+            if not isinstance(comm_id, str) or not comm_id:
+                raise ValueError(
+                    f"communication node {uid!r} in actor DAG {dag_index} "
+                    "requires a non-empty comm_id"
+                )
+            raw_participants = node.node_meta.get("participants")
+            if (
+                not isinstance(raw_participants, (list, tuple))
+                or not raw_participants
+                or any(
+                    isinstance(rank, bool) or not isinstance(rank, int)
+                    for rank in raw_participants
+                )
+                or tuple(raw_participants)
+                != tuple(sorted(set(raw_participants)))
+            ):
+                raise ValueError(
+                    f"communication node {uid!r} in actor DAG {dag_index} "
+                    "requires sorted unique integer participants, got "
+                    f"{raw_participants!r}"
+                )
+            identity = (node.node_kind, comm_id)
+            participants = tuple(int(rank) for rank in raw_participants)
+            previous = participants_by_collective.setdefault(
+                identity, participants
+            )
+            if previous != participants:
+                raise ValueError(
+                    f"communication transaction {identity!r} endpoints "
+                    f"disagree on participants: {previous} and {participants}"
+                )
+            local_identity = (dag_index, node.node_kind, comm_id)
+            if local_identity in local_collective_endpoints:
+                raise ValueError(
+                    f"actor DAG {dag_index} contains multiple endpoints for "
+                    f"communication transaction {identity!r}"
+                )
+            local_collective_endpoints.add(local_identity)
+            add_member(
+                ("collective", node.node_kind, comm_id), dag_index, uid
+            )
+
+    for unit, members in members_by_unit.items():
+        if unit[0] != "collective":
+            continue
+        identity = (unit[1], unit[2])
+        represented = tuple(
+            sorted(
+                {
+                    int(rank)
+                    for dag_index, uid in members
+                    for rank in (
+                        actor_group_dags[dag_index].nodes[uid].device or ()
+                    )
+                }
+            )
+        )
+        expected = participants_by_collective[identity]
+        if represented != expected:
+            raise ValueError(
+                f"communication transaction {identity!r} represents ranks="
+                f"{represented}, but metadata declares participants={expected}"
+            )
+
+    successors: dict[Unit, set[Unit]] = {
+        unit: set() for unit in members_by_unit
+    }
+    indegree = {unit: 0 for unit in members_by_unit}
+    for dag_index, dag in enumerate(actor_group_dags):
+        for edge in dag.edges:
+            source = unit_by_node[(dag_index, edge.src_uid)]
+            destination = unit_by_node[(dag_index, edge.dst_uid)]
+            if source == destination or destination in successors[source]:
+                continue
+            successors[source].add(destination)
+            indegree[destination] += 1
+
+    dispatch_index_by_dag = [
+        {uid: index for index, uid in enumerate(_dispatch_order(dag))}
+        for dag in actor_group_dags
+    ]
+
+    def priority(unit: Unit) -> tuple[int, int, str, Unit]:
+        local_index, dag_index, uid = min(
+            (
+                dispatch_index_by_dag[member_dag][member_uid],
+                member_dag,
+                member_uid,
+            )
+            for member_dag, member_uid in members_by_unit[unit]
+        )
+        return local_index, dag_index, uid, unit
+
+    ready = [priority(unit) for unit, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    global_order: list[Unit] = []
+    while ready:
+        *_tie_break, unit = heapq.heappop(ready)
+        global_order.append(unit)
+        for successor in sorted(successors[unit]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, priority(successor))
+    if len(global_order) != len(members_by_unit):
+        cyclic = sorted(
+            unit for unit, degree in indegree.items() if degree > 0
+        )
+        cyclic_members = {
+            unit: sorted(members_by_unit[unit]) for unit in cyclic
+        }
+        raise ValueError(
+            "interference-free transaction graph is cyclic: "
+            f"units={cyclic!r}, actor_dag_members={cyclic_members!r}"
+        )
+
+    global_index = {
+        unit: index for index, unit in enumerate(global_order)
+    }
+    result: list[tuple[str, ...]] = []
+    for dag_index, dag in enumerate(actor_group_dags):
+        order = tuple(
+            sorted(
+                dag.nodes,
+                key=lambda uid: global_index[unit_by_node[(dag_index, uid)]],
+            )
+        )
+        issue_index = {uid: index for index, uid in enumerate(order)}
+        for edge in dag.edges:
+            if issue_index[edge.src_uid] >= issue_index[edge.dst_uid]:
+                raise ValueError(
+                    "interference-free projection violates actor DAG edge "
+                    f"{dag_index}:{edge.src_uid}->{edge.dst_uid} "
+                    f"({edge.dep_kind})"
+                )
+        result.append(order)
+    return tuple(result)
 
 
 def _validate_routed_collective_sequences(
     actor_group_dags: Sequence[TrainingDAG],
 ) -> None:
-    """Reject actor-local routed-collective orders that would mismatch NCCL.
+    """Reject mismatched endpoint sequences on each routed communicator.
 
     Cross-group communication is represented by one local node on each side
     of a collective.  Nodes with the same actor-group pair, physical
@@ -321,8 +1683,9 @@ def _validate_routed_collective_sequences(
     same order, so compare the actor execution orders after all split/order and
     per-stream ordering transforms have run.
 
-    M-to-N and N-to-M intentionally use distinct channels.  Their sequences
-    are therefore validated independently and may interleave differently.
+    The earlier common communication-ordering pass handles ordering across
+    distinct channels that share one schedule-declared CUDA stream. This check
+    independently verifies that each channel's paired endpoints agree.
     """
 
     def dag_device_key(dag: TrainingDAG) -> tuple[int, ...]:
@@ -366,7 +1729,7 @@ def _validate_routed_collective_sequences(
 
     for dag in actor_group_dags:
         local_devices = dag_device_key(dag)
-        ordered_uids = _serial_topological_order(dag)
+        ordered_uids = _dispatch_order(dag)
         local_by_channel: dict[
             tuple[
                 tuple[tuple[int, ...], tuple[int, ...]],
@@ -691,7 +2054,7 @@ def _validate_p2p_sequences(
             tuple[tuple[tuple[int, ...], tuple[int, ...]], str],
             tuple[str, list[str]],
         ] = {}
-        for uid in _serial_topological_order(dag):
+        for uid in _dispatch_order(dag):
             node = dag.nodes[uid]
             if node.node_kind not in {"SEND_COMM", "RECV_COMM"}:
                 continue
@@ -794,7 +2157,12 @@ def _validate_p2p_sequences(
         destination = next(
             endpoint[2] for endpoint in endpoints if endpoint[0] == "destination"
         )
-        for field in ("comm_group_kind", "participants"):
+        for field in (
+            "comm_group_kind",
+            "participants",
+            "source_compute_uid",
+            "destination_compute_uid",
+        ):
             if source.node_meta.get(field) != destination.node_meta.get(field):
                 raise ValueError(
                     f"P2P transaction {comm_id!r} endpoints disagree on "
@@ -899,7 +2267,7 @@ def _validate_dense_state_sequences(
             tuple[tuple[int, ...], tuple[int, ...], str],
             tuple[str, list[str]],
         ] = {}
-        for uid in _serial_topological_order(dag):
+        for uid in _dispatch_order(dag):
             node = dag.nodes[uid]
             meta = node.node_meta
             if (
@@ -1283,6 +2651,8 @@ def _validate_dense_state_sequences(
         "rank_pairs",
         "from_uid",
         "to_uid",
+        "source_compute_uid",
+        "destination_compute_uid",
     )
     dense_state_lifecycles: dict[
         tuple[str, object],
@@ -1444,14 +2814,35 @@ def piper(gm, example_inputs, **kwargs):
             output_name="global_training_dag_order",
         )
     per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
-    for i, subdag in enumerate(per_pp_training_dags):
-        zero_chains = _prune_zero_lifetime_metadata(subdag)
-        resolve_total_order_per_stream(subdag)
+    for subdag in per_pp_training_dags:
+        _resolve_default_stream_order(subdag)
+    zero_chains_by_dag = [
+        _prune_zero_lifetime_metadata(subdag)
+        for subdag in per_pp_training_dags
+    ]
+    for subdag, zero_chains in zip(
+        per_pp_training_dags, zero_chains_by_dag
+    ):
         _add_inter_chain_temporal_edges(subdag, zero_chains)
+    communication_order = _order_communication_transactions(
+        per_pp_training_dags
+    )
+    for subdag in per_pp_training_dags:
+        resolve_total_order_per_stream(subdag)
+    _materialize_global_communication_issue_edges(
+        per_pp_training_dags, communication_order
+    )
+    for subdag in per_pp_training_dags:
+        assign_dispatch_levels(subdag)
+    for i, subdag in enumerate(per_pp_training_dags):
         if getattr(piper_metadata, "visualize_dag", False):
             log_training_dag_dependencies(subdag)
             print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
             # render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
+    _validate_global_p2p_transaction_graph(per_pp_training_dags)
+    _validate_global_communication_order(
+        per_pp_training_dags, communication_order
+    )
     _validate_routed_collective_sequences(per_pp_training_dags)
     _validate_dense_state_sequences(per_pp_training_dags)
     _validate_p2p_sequences(per_pp_training_dags)
@@ -1594,7 +2985,7 @@ def piper_measure_dags(
 
 
 def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any]:
-    """Compare exact per-node-range GPU activity sequences across IF/normal."""
+    """Compare per-occurrence CPU launches, then their GPU activities."""
 
     by_mode_rank = {
         (normalize_profile_mode(result.profile_mode), int(result.global_rank)): result

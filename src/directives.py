@@ -2,6 +2,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.fx as fx
 
 from .bucket import bucket_stage
@@ -165,10 +166,143 @@ def _apply_split_backward_stencil(
         _split_fused_bwd_node(dag, node.uid)
 
 
+def _split_backward_unsupported_params(fwd_node: TrainingDAGNode) -> list[str]:
+    """Return trainable FX parameters with an uncapturable gradient path."""
+    gm = fwd_node.node_meta.get("gm")
+    graphargs = fwd_node.node_meta.get("graphargs")
+    input_idxs = fwd_node.node_meta.get("input_idxs")
+    param_idxs = fwd_node.node_meta.get("param_idxs")
+    if not isinstance(gm, fx.GraphModule):
+        return ["<missing GraphModule metadata>"]
+    if not isinstance(graphargs, (list, tuple)):
+        return ["<missing graphargs metadata>"]
+    if not isinstance(input_idxs, (list, tuple)) or not isinstance(param_idxs, (list, tuple)):
+        return ["<missing input/parameter index metadata>"]
+
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    output = next((node for node in gm.graph.nodes if node.op == "output"), None)
+    if output is None:
+        return ["<missing FX output>"]
+
+    def _example(node: fx.Node) -> Any:
+        return node.meta.get("example_value", node.meta.get("val"))
+
+    def _arg(index: int) -> Any:
+        return graphargs[index] if 0 <= index < len(graphargs) else None
+
+    def _is_differentiable_value(value: Any) -> bool:
+        return isinstance(value, torch.Tensor) and bool(value.requires_grad)
+
+    def _node_grad_state(node: fx.Node) -> bool | None:
+        example = _example(node)
+        if not isinstance(example, torch.Tensor):
+            return None
+        return bool(example.requires_grad)
+
+    def _has_provable_backward(node: fx.Node) -> bool:
+        if node.op == "call_module":
+            return False
+        target = str(node.target)
+        return "autograd_function_apply" not in target
+
+    output_ancestors: set[fx.Node] = set(output.all_input_nodes)
+    pending = list(output_ancestors)
+    while pending:
+        node = pending.pop()
+        for predecessor in node.all_input_nodes:
+            if predecessor not in output_ancestors:
+                output_ancestors.add(predecessor)
+                pending.append(predecessor)
+
+    differentiable_inputs = {
+        placeholders[index]
+        for index in input_idxs
+        if 0 <= index < len(placeholders)
+        and _is_differentiable_value(
+            _arg(index) if _arg(index) is not None else _example(placeholders[index])
+        )
+    }
+    trainable_params = [
+        placeholders[index]
+        for index in param_idxs
+        if 0 <= index < len(placeholders)
+        and (
+            _arg(index) is None
+            or _is_differentiable_value(_arg(index))
+        )
+    ]
+
+    input_reachable: set[fx.Node] = set()
+    pending = list(differentiable_inputs)
+    while pending:
+        node = pending.pop()
+        for user in node.users:
+            if (
+                user is output
+                or user not in output_ancestors
+                or user in input_reachable
+                or _node_grad_state(user) is not True
+                or not _has_provable_backward(user)
+            ):
+                continue
+            input_reachable.add(user)
+            pending.append(user)
+
+    unsupported: list[str] = []
+    for parameter in trainable_params:
+        if parameter not in output_ancestors:
+            continue
+        # Track whether each parameter-to-output path has crossed a node whose
+        # backward is exercised while differentiating a stage activation input.
+        pending_paths = [(parameter, False)]
+        seen: set[tuple[fx.Node, bool]] = set()
+        has_uncaptured_path = False
+        while pending_paths and not has_uncaptured_path:
+            node, crossed_input_path = pending_paths.pop()
+            state = (node, crossed_input_path)
+            if state in seen:
+                continue
+            seen.add(state)
+            # A hook at the first input-reachable intersection captures the
+            # complete downstream gradient for this parameter-side path.  FX
+            # nodes after that boundary need not expose enough metadata to
+            # prove their own backward implementation.
+            if crossed_input_path:
+                continue
+            for user in node.users:
+                if user is output:
+                    has_uncaptured_path = True
+                    break
+                if user not in output_ancestors or _node_grad_state(user) is False:
+                    continue
+                if _node_grad_state(user) is None or not _has_provable_backward(user):
+                    has_uncaptured_path = True
+                    break
+                pending_paths.append(
+                    (user, crossed_input_path or user in input_reachable)
+                )
+        if has_uncaptured_path:
+            unsupported.append(parameter.name)
+    return sorted(unsupported)
+
+
 def _split_fused_bwd_node(dag: TrainingDAG, bwd_uid: str) -> None:
     bwd_i = dag.nodes[bwd_uid]
     if bwd_i.node_kind != "COMPUTE" or bwd_i.compute_subkind != "BWD":
         raise ValueError(f"expected fused BWD compute node, got {bwd_uid}: {bwd_i}")
+    fwd_uid = bwd_i.node_meta.get("fwd_uid")
+    fwd_node = dag.nodes.get(fwd_uid)
+    unsupported = (
+        [f"<missing forward node {fwd_uid!r}>"]
+        if fwd_node is None
+        else _split_backward_unsupported_params(fwd_node)
+    )
+    if unsupported:
+        raise ValueError(
+            f"cannot split backward node {bwd_uid!r}: trainable parameters have "
+            "no capturable differentiable activation-input boundary on every "
+            f"gradient path: {unsupported}"
+        )
     bwd_w_uid = f"{bwd_uid}.bw"
     if bwd_w_uid in dag.nodes:
         raise ValueError(f"duplicate BWD_W uid while splitting {bwd_uid}: {bwd_w_uid}")
@@ -193,17 +327,21 @@ def _split_fused_bwd_node(dag: TrainingDAG, bwd_uid: str) -> None:
         )
     )
 
+    update_uids = [
+        uid for uid, node in dag.nodes.items() if node.node_kind == "UPD"
+    ]
     for edge in [
         e for e in dag.outgoing_edges(bwd_uid, dep_kind="temporal")
         if dag.nodes[e.dst_uid].node_kind == "UPD"
     ]:
         _remove_edge(dag, edge)
+    for update_uid in update_uids:
         dag.add_edge(
             TrainingDAGEdge(
                 src_uid=bwd_w_uid,
-                dst_uid=edge.dst_uid,
+                dst_uid=update_uid,
                 dep_kind="temporal",
-                tensor_name=edge.tensor_name,
+                tensor_name=None,
             )
         )
 
@@ -555,6 +693,27 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
         comm_id = f"p2p:{src.uid}->{dst.uid}:{edge.tensor_name or '-'}"
         comm_group_kind = "pp_lo_hi" if src_pp_rank < dst_pp_rank else "pp_hi_lo"
         participants = sorted(set(int(rank) for rank in (*src.device, *dst.device)))
+        receive_kind = (
+            "backward"
+            if _is_backward_activation_subkind(dst.compute_subkind)
+            else "forward"
+        )
+        shape_reference_fwd_uid: str | None = None
+        if receive_kind == "backward":
+            shape_reference_fwd_uid = dst.node_meta.get("fwd_uid")
+            shape_reference = dag.nodes.get(shape_reference_fwd_uid)
+            if (
+                not isinstance(shape_reference_fwd_uid, str)
+                or shape_reference is None
+                or shape_reference.node_kind != "COMPUTE"
+                or shape_reference.compute_subkind != "FWD"
+                or shape_reference.device != dst.device
+            ):
+                raise ValueError(
+                    f"backward pipeline edge {src.uid}->{dst.uid} requires a "
+                    "local forward shape reference; got "
+                    f"fwd_uid={shape_reference_fwd_uid!r}"
+                )
         send_node = TrainingDAGNode(
             uid=send_uid,
             node_kind="SEND_COMM",
@@ -570,6 +729,9 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
                 "comm_id": comm_id,
                 "comm_group_kind": comm_group_kind,
                 "participants": participants,
+                "receive_kind": receive_kind,
+                "source_compute_uid": src.uid,
+                "destination_compute_uid": dst.uid,
             },
         )
         recv_node = TrainingDAGNode(
@@ -587,6 +749,14 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
                 "comm_id": comm_id,
                 "comm_group_kind": comm_group_kind,
                 "participants": participants,
+                "receive_kind": receive_kind,
+                "source_compute_uid": src.uid,
+                "destination_compute_uid": dst.uid,
+                **(
+                    {"shape_reference_fwd_uid": shape_reference_fwd_uid}
+                    if shape_reference_fwd_uid is not None
+                    else {}
+                ),
             },
         )
         dag.add_node(send_node)
@@ -594,6 +764,18 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
         replaced_edges.append(edge)
         dag.add_edge(TrainingDAGEdge(src_uid=src.uid, dst_uid=send_uid, dep_kind="data", tensor_name=edge.tensor_name))
         dag.add_edge(TrainingDAGEdge(src_uid=recv_uid, dst_uid=dst.uid, dep_kind="data", tensor_name=edge.tensor_name))
+        if shape_reference_fwd_uid is not None:
+            # Backward receive buffers have dynamic shapes captured by the
+            # corresponding local forward.  Make that runtime prerequisite an
+            # explicit DAG dependency instead of relying on dispatch order.
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=shape_reference_fwd_uid,
+                    dst_uid=recv_uid,
+                    dep_kind="temporal",
+                    tensor_name=None,
+                )
+            )
     _remove_edges(dag, replaced_edges)
 
 
@@ -2406,6 +2588,8 @@ def _insert_cross_group_routed_comm_nodes(
         combine_consumer: TrainingDAGNode,
         dense_state_spec: dict[str, Any],
         direction: str,
+        source_compute_uid: str,
+        destination_compute_uid: str,
     ) -> tuple[str, str]:
         if len(source_devices) != len(destination_devices):
             raise ValueError(
@@ -2505,6 +2689,8 @@ def _insert_cross_group_routed_comm_nodes(
             "combine_consumer_fwd_uid": combine_consumer.uid,
             "comm_id": comm_id,
             "comm_group_kind": comm_group_kind,
+            "source_compute_uid": source_compute_uid,
+            "destination_compute_uid": destination_compute_uid,
             "transfer_mode": "ordinal_one_to_one",
             "rank_pairs": rank_pairs,
             "from_uid": (
@@ -2621,6 +2807,8 @@ def _insert_cross_group_routed_comm_nodes(
             combine_consumer=combine_consumer,
             dense_state_spec=dense_state_spec,
             direction="forward",
+            source_compute_uid=state_owner.uid,
+            destination_compute_uid=combine_consumer.uid,
         )
         forward_dense_recv_by_expert_fwd_uid[expert_fwd_uid] = (
             forward_recv_uid
@@ -2666,6 +2854,8 @@ def _insert_cross_group_routed_comm_nodes(
             combine_consumer=combine_consumer,
             dense_state_spec=dense_state_spec,
             direction="backward",
+            source_compute_uid=consumer_bwd.uid,
+            destination_compute_uid=owner_bwd.uid,
         )
         dag.add_edge(
             TrainingDAGEdge(
@@ -3292,6 +3482,8 @@ def _apply_split_directive(
         "from_uid",
         "to_uid",
         "shape_reference_fwd_uid",
+        "source_compute_uid",
+        "destination_compute_uid",
         "state_owner_fwd_uid",
         "combine_consumer_fwd_uid",
     )
@@ -3600,28 +3792,17 @@ def _apply_order_directive(
                     exclude_node_kinds={"ORDER_DUMMY"},
                 )
             )
-            srcs, snks, _csrcs, _csnks = _match_set_contiguous_subdag(
+            _srcs, _snks, compute_srcs, compute_snks = _match_set_contiguous_subdag(
                 dag,
                 matched,
                 context=f"order filter[{group_idx}][{filter_idx}]={flt}",
             )
-            has_cross_group_boundary = any(
-                dag.nodes[uid].node_kind in {"M_TO_N_COMM", "N_TO_M_COMM"}
-                or (
-                    dag.nodes[uid].node_kind in {"SEND_COMM", "RECV_COMM"}
-                    and bool(
-                        dag.nodes[uid].node_meta.get("dense_state_transfer")
-                    )
-                )
-                for uid in matched
-            )
-            # Cross-group routed regions include their local communication
-            # endpoints in the ordered boundary. This keeps both actors on a
-            # collective channel in the same order and connects any dense
-            # direct dense-state path through ordinary order edges. Other schedules
-            # retain the existing compute-boundary ordering semantics.
-            group_sources.append(srcs if has_cross_group_boundary else _csrcs)
-            group_sinks.append(snks if has_cross_group_boundary else _csnks)
+            # Schedule ordering describes model-region execution. Communication
+            # issue order is finalized separately across actor DAGs; including
+            # outgoing communication here would unnecessarily prevent overlap
+            # with otherwise-ready compute.
+            group_sources.append(compute_srcs)
+            group_sinks.append(compute_snks)
             grouped_uids.update(matched)
 
         if len(group) == 1:

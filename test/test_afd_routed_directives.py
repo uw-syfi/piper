@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,13 +14,21 @@ from src.directives import (
     _validate_route_owned_parameters,
     apply_schedule_directives,
 )
-from src.ordering import resolve_total_order_per_stream
+from src.ordering import (
+    _resolve_default_stream_order,
+    _serial_topological_order,
+    execution_stream_domain,
+    resolve_total_order_per_stream,
+)
 from src.piper import (
+    _order_communication_transactions,
     _split_global_training_dag_by_pp_rank,
     _validate_dense_state_sequences,
+    _validate_global_p2p_transaction_graph,
     _validate_p2p_sequences,
     _validate_routed_collective_sequences,
 )
+from src.simulator import simulate_training_step
 from src.tasks import TaskType, training_dag_task_type
 
 
@@ -1004,7 +1013,7 @@ def _routed_actor_dag(
     return dag
 
 
-def test_routed_collective_sequence_validation_accepts_matching_channels() -> None:
+def test_shared_routed_stream_rejects_cross_channel_issue_cycle() -> None:
     dense = [0, 2]
     expert = [1, 3]
     dense_dag = _routed_actor_dag(
@@ -1028,9 +1037,425 @@ def test_routed_collective_sequence_validation_accepts_matching_channels() -> No
         ["n1.src", "n0.src", "m0.dst", "m1.dst"],
     )
 
-    # Opposite physical directions may interleave differently because they use
-    # separate communicator channels; each direction's own sequence matches.
+    # Matching per-channel subsequences are insufficient when both channels
+    # share one CUDA stream: the opposite local orders form a wait cycle.
     _validate_routed_collective_sequences([dense_dag, expert_dag])
+    with pytest.raises(
+        ValueError, match="global communication transaction graph is cyclic"
+    ):
+        _order_communication_transactions([dense_dag, expert_dag])
+
+
+def test_shared_routed_stream_gets_one_mixed_collective_issue_order() -> None:
+    dense = [0, 2]
+    expert = [1, 3]
+    dense_dag = _routed_actor_dag(
+        dense,
+        [
+            ("m.src", "M_TO_N_COMM", "source", "m", dense, expert),
+            ("n.dst", "N_TO_M_COMM", "destination", "n", expert, dense),
+        ],
+        [],
+    )
+    a2a = TrainingDAGNode(
+        uid="a2a",
+        node_kind="A2A_COMM",
+        compute_subkind=None,
+        tag={"PASS": "F"},
+        device=list(dense),
+        stream="routed_stream",
+        node_meta={
+            "comm_id": "a",
+            "comm_group_kind": "ep",
+            "participants": list(dense),
+        },
+    )
+    dense_dag.add_node(a2a)
+    expert_dag = _routed_actor_dag(
+        expert,
+        [
+            ("m.dst", "M_TO_N_COMM", "destination", "m", dense, expert),
+            ("n.src", "N_TO_M_COMM", "source", "n", expert, dense),
+        ],
+        [],
+    )
+
+    _order_communication_transactions([dense_dag, expert_dag])
+
+    dense_temporal = {
+        (edge.src_uid, edge.dst_uid)
+        for edge in dense_dag.edges
+        if edge.dep_kind == "temporal"
+    }
+    expert_temporal = {
+        (edge.src_uid, edge.dst_uid)
+        for edge in expert_dag.edges
+        if edge.dep_kind == "temporal"
+    }
+    assert dense_temporal == {("a2a", "m.src"), ("m.src", "n.dst")}
+    assert expert_temporal == {("m.dst", "n.src")}
+
+
+def test_communication_ordering_rejects_endpoint_stream_mismatch() -> None:
+    dense = [0, 2]
+    expert = [1, 3]
+    dense_dag = _routed_actor_dag(
+        dense,
+        [("src", "M_TO_N_COMM", "source", "m", dense, expert)],
+        [],
+    )
+    expert_dag = _routed_actor_dag(
+        expert,
+        [("dst", "M_TO_N_COMM", "destination", "m", dense, expert)],
+        [],
+    )
+    expert_dag.nodes["dst"].stream = "other_routed_stream"
+
+    with pytest.raises(ValueError, match="endpoints disagree"):
+        _order_communication_transactions([dense_dag, expert_dag])
+
+
+def test_communication_ordering_requires_directional_p2p_metadata() -> None:
+    dag = TrainingDAG()
+    dag.add_node(
+        TrainingDAGNode(
+            uid="send",
+            node_kind="SEND_COMM",
+            compute_subkind=None,
+            tag={},
+            device=[0],
+            stream="pp_stream",
+            node_meta={"comm_id": "p2p", "peer_pp_rank": 1},
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires a directional"):
+        _order_communication_transactions([dag])
+
+
+def _p2p_compute_node(uid: str, device: int) -> TrainingDAGNode:
+    return TrainingDAGNode(
+        uid=uid,
+        node_kind="COMPUTE",
+        compute_subkind="FWD",
+        tag={"PASS": "F"},
+        device=[device],
+        stream="default_stream",
+    )
+
+
+def _add_p2p_transaction(
+    source_dag: TrainingDAG,
+    destination_dag: TrainingDAG,
+    *,
+    comm_id: str,
+    source_compute_uid: str,
+    destination_compute_uid: str,
+    source_rank: int,
+    destination_rank: int,
+) -> tuple[str, str]:
+    direction = "lo_hi" if source_rank < destination_rank else "hi_lo"
+    common_meta = {
+        "comm_id": comm_id,
+        "comm_group_kind": f"pp_{direction}",
+        "participants": sorted([source_rank, destination_rank]),
+        "source_compute_uid": source_compute_uid,
+        "destination_compute_uid": destination_compute_uid,
+    }
+    send_uid = f"send.{comm_id}"
+    recv_uid = f"recv.{comm_id}"
+    source_dag.add_node(
+        TrainingDAGNode(
+            uid=send_uid,
+            node_kind="SEND_COMM",
+            compute_subkind=None,
+            tag={"PASS": "F"},
+            device=[source_rank],
+            stream="pp_stream",
+            node_meta={**common_meta, "peer_pp_rank": destination_rank},
+        )
+    )
+    destination_dag.add_node(
+        TrainingDAGNode(
+            uid=recv_uid,
+            node_kind="RECV_COMM",
+            compute_subkind=None,
+            tag={"PASS": "F"},
+            device=[destination_rank],
+            stream="pp_stream",
+            node_meta={**common_meta, "peer_pp_rank": source_rank},
+        )
+    )
+    source_dag.add_edge(
+        TrainingDAGEdge(source_compute_uid, send_uid, "data")
+    )
+    destination_dag.add_edge(
+        TrainingDAGEdge(recv_uid, destination_compute_uid, "data")
+    )
+    return send_uid, recv_uid
+
+
+def test_p2p_order_prefers_earlier_consumer_over_comm_id() -> None:
+    destination_dag = TrainingDAG()
+    source_dag = TrainingDAG()
+    for dag, device, prefix in (
+        (destination_dag, 0, "destination"),
+        (source_dag, 1, "source"),
+    ):
+        dag.add_node(_p2p_compute_node(f"{prefix}.early", device))
+        dag.add_node(_p2p_compute_node(f"{prefix}.late", device))
+        dag.add_edge(
+            TrainingDAGEdge(
+                f"{prefix}.early",
+                f"{prefix}.late",
+                "temporal",
+            )
+        )
+    early_send, early_recv = _add_p2p_transaction(
+        source_dag,
+        destination_dag,
+        comm_id="z.early",
+        source_compute_uid="source.early",
+        destination_compute_uid="destination.early",
+        source_rank=1,
+        destination_rank=0,
+    )
+    late_send, late_recv = _add_p2p_transaction(
+        source_dag,
+        destination_dag,
+        comm_id="a.late",
+        source_compute_uid="source.late",
+        destination_compute_uid="destination.late",
+        source_rank=1,
+        destination_rank=0,
+    )
+
+    _order_communication_transactions([destination_dag, source_dag])
+    for dag in (destination_dag, source_dag):
+        resolve_total_order_per_stream(dag)
+    _validate_global_p2p_transaction_graph(
+        [destination_dag, source_dag]
+    )
+    _validate_p2p_sequences([destination_dag, source_dag])
+
+    assert any(
+        edge.src_uid == early_send and edge.dst_uid == late_send
+        for edge in source_dag.edges
+    )
+    assert any(
+        edge.src_uid == early_recv and edge.dst_uid == late_recv
+        for edge in destination_dag.edges
+    )
+    assert [
+        node.node_meta["comm_id"]
+        for node in (
+            destination_dag.nodes[uid]
+            for uid in _serial_topological_order(destination_dag)
+        )
+        if node.node_kind == "RECV_COMM"
+        and execution_stream_domain(node) == "pp_hi_lo"
+    ] == ["z.early", "a.late"]
+
+    for dag in (destination_dag, source_dag):
+        for node in dag.nodes.values():
+            node.profile_times_by_mode = {
+                "interference_free": {
+                    node.device[0]: SimpleNamespace(estimate_us=1.0)
+                }
+            }
+    assert simulate_training_step(
+        [destination_dag, source_dag]
+    ).step_time_us > 0
+
+
+def test_p2p_order_keeps_opposite_directions_independent() -> None:
+    dag_0 = TrainingDAG()
+    dag_1 = TrainingDAG()
+    for uid in ("compute.0.source", "compute.0.destination"):
+        dag_0.add_node(_p2p_compute_node(uid, 0))
+    for uid in ("compute.1.source", "compute.1.destination"):
+        dag_1.add_node(_p2p_compute_node(uid, 1))
+    one_to_zero_send, one_to_zero_recv = _add_p2p_transaction(
+        dag_1,
+        dag_0,
+        comm_id="one_to_zero",
+        source_compute_uid="compute.1.source",
+        destination_compute_uid="compute.0.destination",
+        source_rank=1,
+        destination_rank=0,
+    )
+    zero_to_one_send, zero_to_one_recv = _add_p2p_transaction(
+        dag_0,
+        dag_1,
+        comm_id="zero_to_one",
+        source_compute_uid="compute.0.source",
+        destination_compute_uid="compute.1.destination",
+        source_rank=0,
+        destination_rank=1,
+    )
+
+    _order_communication_transactions([dag_0, dag_1])
+
+    edges = {
+        (edge.src_uid, edge.dst_uid)
+        for dag in (dag_0, dag_1)
+        for edge in dag.edges
+    }
+    assert (one_to_zero_send, zero_to_one_recv) not in edges
+    assert (zero_to_one_send, one_to_zero_recv) not in edges
+
+
+def test_p2p_order_rejects_cyclic_directional_transaction_graph() -> None:
+    dag_0, dag_1, dag_2 = TrainingDAG(), TrainingDAG(), TrainingDAG()
+    for dag, device, uids in (
+        (dag_0, 0, ("a.source", "c.source")),
+        (dag_1, 1, ("a.destination", "b.source")),
+        (dag_2, 2, ("b.destination", "c.destination")),
+    ):
+        for uid in uids:
+            dag.add_node(_p2p_compute_node(uid, device))
+    send_a, recv_a = _add_p2p_transaction(
+        dag_0,
+        dag_1,
+        comm_id="a",
+        source_compute_uid="a.source",
+        destination_compute_uid="a.destination",
+        source_rank=0,
+        destination_rank=1,
+    )
+    send_b, recv_b = _add_p2p_transaction(
+        dag_1,
+        dag_2,
+        comm_id="b",
+        source_compute_uid="b.source",
+        destination_compute_uid="b.destination",
+        source_rank=1,
+        destination_rank=2,
+    )
+    send_c, recv_c = _add_p2p_transaction(
+        dag_0,
+        dag_2,
+        comm_id="c",
+        source_compute_uid="c.source",
+        destination_compute_uid="c.destination",
+        source_rank=0,
+        destination_rank=2,
+    )
+    dag_0.add_edge(TrainingDAGEdge(send_c, send_a, "temporal"))
+    dag_1.add_edge(TrainingDAGEdge(recv_a, send_b, "temporal"))
+    dag_2.add_edge(TrainingDAGEdge(recv_b, recv_c, "temporal"))
+
+    with pytest.raises(
+        ValueError,
+        match="global communication transaction graph is cyclic.*a.*b.*c",
+    ):
+        _order_communication_transactions([dag_0, dag_1, dag_2])
+
+
+def test_p2p_order_rejects_missing_compute_anchor() -> None:
+    destination_dag = TrainingDAG()
+    source_dag = TrainingDAG()
+    destination_dag.add_node(_p2p_compute_node("destination", 0))
+    source_dag.add_node(_p2p_compute_node("source", 1))
+    send_uid, _recv_uid = _add_p2p_transaction(
+        source_dag,
+        destination_dag,
+        comm_id="transfer",
+        source_compute_uid="source",
+        destination_compute_uid="destination",
+        source_rank=1,
+        destination_rank=0,
+    )
+    del source_dag.nodes[send_uid].node_meta["source_compute_uid"]
+
+    with pytest.raises(ValueError, match="source_compute_uid"):
+        _order_communication_transactions([destination_dag, source_dag])
+
+
+def test_p2p_validation_rejects_participant_mismatch() -> None:
+    destination_dag = TrainingDAG()
+    source_dag = TrainingDAG()
+    destination_dag.add_node(_p2p_compute_node("destination", 0))
+    source_dag.add_node(_p2p_compute_node("source", 1))
+    send_uid, _recv_uid = _add_p2p_transaction(
+        source_dag,
+        destination_dag,
+        comm_id="transfer",
+        source_compute_uid="source",
+        destination_compute_uid="destination",
+        source_rank=1,
+        destination_rank=0,
+    )
+    source_dag.nodes[send_uid].node_meta["participants"] = [0, 1, 2]
+
+    with pytest.raises(ValueError, match="participants"):
+        _validate_global_p2p_transaction_graph(
+            [destination_dag, source_dag]
+        )
+
+
+def test_p2p_validation_ignores_non_p2p_collective_metadata() -> None:
+    destination_dag = TrainingDAG()
+    source_dag = TrainingDAG()
+    destination_dag.add_node(_p2p_compute_node("destination", 0))
+    source_dag.add_node(_p2p_compute_node("source", 1))
+    _add_p2p_transaction(
+        source_dag,
+        destination_dag,
+        comm_id="shared",
+        source_compute_uid="source",
+        destination_compute_uid="destination",
+        source_rank=1,
+        destination_rank=0,
+    )
+    source_dag.add_node(
+        TrainingDAGNode(
+            uid="unrelated.collective",
+            node_kind="ALL_GATHER_COMM",
+            compute_subkind=None,
+            tag={},
+            device=[1],
+            stream="collective_stream",
+            node_meta={"comm_id": "shared", "participants": "malformed"},
+        )
+    )
+
+    _validate_global_p2p_transaction_graph(
+        [destination_dag, source_dag]
+    )
+
+
+def test_communication_ordering_rejects_multi_actor_pair_cycle() -> None:
+    group_a, group_b, group_c = [0], [1], [2]
+    dag_a = _routed_actor_dag(
+        group_a,
+        [
+            ("ab.src", "M_TO_N_COMM", "source", "ab", group_a, group_b),
+            ("ac.src", "M_TO_N_COMM", "source", "ac", group_a, group_c),
+        ],
+        ["ac.src", "ab.src"],
+    )
+    dag_b = _routed_actor_dag(
+        group_b,
+        [
+            ("ab.dst", "M_TO_N_COMM", "destination", "ab", group_a, group_b),
+            ("bc.src", "M_TO_N_COMM", "source", "bc", group_b, group_c),
+        ],
+        ["ab.dst", "bc.src"],
+    )
+    dag_c = _routed_actor_dag(
+        group_c,
+        [
+            ("bc.dst", "M_TO_N_COMM", "destination", "bc", group_b, group_c),
+            ("ac.dst", "M_TO_N_COMM", "destination", "ac", group_a, group_c),
+        ],
+        ["bc.dst", "ac.dst"],
+    )
+
+    with pytest.raises(
+        ValueError, match="global communication transaction graph is cyclic"
+    ):
+        _order_communication_transactions([dag_a, dag_b, dag_c])
 
 
 def test_routed_collective_sequence_validation_rejects_mismatch() -> None:
@@ -1236,6 +1661,9 @@ def test_full_afd_directive_path_builds_connected_sequence_safe_actor_dags() -> 
         for node in actor_dag.nodes.values()
     )
     for actor_dag in actor_dags:
+        _resolve_default_stream_order(actor_dag)
+    _order_communication_transactions(actor_dags)
+    for actor_dag in actor_dags:
         resolve_total_order_per_stream(actor_dag)
     _validate_routed_collective_sequences(actor_dags)
     _validate_dense_state_sequences(actor_dags)
@@ -1283,6 +1711,9 @@ def test_pp4_routes_combine_and_state_to_the_actual_dense_consumer() -> None:
     actor_dags = _split_global_training_dag_by_pp_rank(dag)
     assert len(actor_dags) == 4
     for actor_dag in actor_dags:
+        _resolve_default_stream_order(actor_dag)
+    _order_communication_transactions(actor_dags)
+    for actor_dag in actor_dags:
         resolve_total_order_per_stream(actor_dag)
     _validate_routed_collective_sequences(actor_dags)
     _validate_dense_state_sequences(actor_dags)
@@ -1319,6 +1750,22 @@ def test_pp4_routes_combine_and_state_to_the_actual_dense_consumer() -> None:
         node.node_meta["transfer_mode"] == "ordinal_one_to_one"
         for node in state_transfers
     )
+    for actor_dag in actor_dags:
+        for node in actor_dag.nodes.values():
+            if not node.node_meta.get("dense_state_transfer"):
+                continue
+            anchor_field = (
+                "source_compute_uid"
+                if node.node_kind == "SEND_COMM"
+                else "destination_compute_uid"
+            )
+            anchor_uid = node.node_meta[anchor_field]
+            assert actor_dag.nodes[anchor_uid].node_kind == "COMPUTE"
+            if node.node_meta["direction"] == "backward":
+                assert actor_dag.nodes[anchor_uid].compute_subkind in {
+                    "BWD",
+                    "BWD_I",
+                }
     assert all(node.node_meta["dense_state_arity"] == 0 for node in state_transfers)
     assert all(node.node_meta["model_tensor_indices"] == [] for node in state_transfers)
     assert all(

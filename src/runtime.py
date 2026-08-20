@@ -151,9 +151,6 @@ class RuntimeState:
     directional_p2p_streams: dict[str, torch.cuda.Stream] = field(
         default_factory=dict
     )
-    directional_routed_streams: dict[str, torch.cuda.Stream] = field(
-        default_factory=dict
-    )
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
 
@@ -485,30 +482,6 @@ class RuntimeState:
         )
         return self.directional_p2p_streams[group_kind]
 
-    def initialize_directional_routed_streams(self) -> None:
-        """Create independent physical streams for opposite AFD directions."""
-        if self.directional_routed_streams:
-            return
-        self.directional_routed_streams = {
-            "m_to_n": torch.cuda.Stream(device=self.device),
-            "n_to_m": torch.cuda.Stream(device=self.device),
-        }
-
-    def directional_routed_stream_for_task(self, task: Any) -> torch.cuda.Stream:
-        """Return the physical stream matching routed collective direction."""
-        self.initialize_directional_routed_streams()
-        node_kind = getattr(task, "node_kind", None)
-        if node_kind == "M_TO_N_COMM":
-            channel = "m_to_n"
-        elif node_kind == "N_TO_M_COMM":
-            channel = "n_to_m"
-        else:
-            raise ValueError(
-                "directional_routed_stream_for_task requires M_TO_N_COMM or "
-                f"N_TO_M_COMM, got node_kind={node_kind!r}"
-            )
-        return self.directional_routed_streams[channel]
-
     def execution_stream_for_task(
         self,
         task: Any,
@@ -517,8 +490,6 @@ class RuntimeState:
         """Resolve the physical stream used by an ordinary training step."""
         if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
             return self.directional_p2p_stream_for_task(task)
-        if getattr(task, "node_kind", None) in {"M_TO_N_COMM", "N_TO_M_COMM"}:
-            return self.directional_routed_stream_for_task(task)
         return logical_stream
 
     def profile_stream_for_task(
@@ -534,17 +505,13 @@ class RuntimeState:
         assignment.  Interference-free execution is serialized separately by
         :class:`DagExecutor`, using a CUDA-event handoff between nodes.
 
-        Directional communication is deliberately identical to ordinary
-        execution in both modes: P2P sends/receives use dedicated lo->hi and
-        hi->lo streams, while routed collectives use dedicated M-to-N and
-        N-to-M streams.
+        Directional P2P communication is identical to ordinary execution in
+        both modes. Routed collectives preserve their DAG-declared stream.
         """
 
         normalize_profile_mode(profile_mode)
         if getattr(task, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
             return self.directional_p2p_stream_for_task(task)
-        if getattr(task, "node_kind", None) in {"M_TO_N_COMM", "N_TO_M_COMM"}:
-            return self.directional_routed_stream_for_task(task)
         return logical_stream
 
     def nvtx_push(self, label: str) -> None:
