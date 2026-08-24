@@ -54,21 +54,24 @@ def _model_config(name: str):
 
 
 def _raw_metrics(args, iter_times, peak_memory_stats):
-    """Assemble raw per-dp-rank measurements + run config for the harness.
+    """Assemble the single program driver's measurements for the harness.
 
     No derived statistics are computed here; the harness summarizes the metrics
-    and writes the CSV. ``peak_memory_by_rank`` maps global rank -> peak bytes.
+    and writes the CSV. ``peak_memory_by_rank`` maps actor rank -> peak bytes.
     """
     info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
     return {
-        "dp_rank": int(os.environ["PIPER_DP_RANK"]),
+        "program_rank": 0,
         "model": args.model,
         "schedule": info.get(
             "name", os.path.splitext(os.path.basename(args.schedule_directives_file))[0]
         ),
         "schedule_directives_file": args.schedule_directives_file,
         "pp": info.get("pp_degree"),
-        "dp": info.get("dp_degree"),
+        "actor_groups": info.get("actor_groups"),
+        "world_size": info.get("world_size"),
+        "input_actor_group_id": info.get("input_actor_group_id"),
+        "input_actor_group_size": info.get("input_actor_group_size", 1),
         "batch_size": args.batch_size,
         "num_microbatches": int(info.get("num_microbatches", 1)),
         "seq_len": args.seq_len,
@@ -161,29 +164,33 @@ def main(args, pg):
         _add_profile_comparison_metrics(metrics, comparison, plan)
 
     if args.pytorch_profiler:
+        if args.pytorch_profiler_iters < 1:
+            raise ValueError("--pytorch-profiler-iters must be at least 1")
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
             "out", "pytorch_profiles"
         )
-        profiler_warmup_iters = 1
         logger.info(
-            "Running %d PyTorch-profiler warmup iteration and %d active iteration(s)",
-            profiler_warmup_iters,
+            "Running %d PyTorch-profiler warmup iteration(s) and %d active iteration(s)",
+            args.pytorch_profiler_warmup_iters,
             args.pytorch_profiler_iters,
         )
         ray.get([
             actor.start_pytorch_profiler.remote(
-                warmup_iters=profiler_warmup_iters,
+                warmup_iters=args.pytorch_profiler_warmup_iters,
                 active_iters=args.pytorch_profiler_iters,
             )
             for actor in actors.values()
         ])
-        for _ in range(profiler_warmup_iters + args.pytorch_profiler_iters):
+        for _ in range(
+            args.pytorch_profiler_warmup_iters + args.pytorch_profiler_iters
+        ):
             piper_exec_dag(loss_fn)
             time.sleep(1)
         ray.get([
             actor.stop_pytorch_profiler.remote(profile_dir)
             for actor in actors.values()
         ])
+        time.sleep(1)
 
     if args.nsight:
         logger.info("Stopping Piper actors so Nsight Systems reports are flushed")
@@ -224,7 +231,13 @@ def parse_args(argv=None):
         action="store_true",
         default=False,
         help="Run extra iterations under torch.profiler on every actor and write "
-             "per-actor chrome traces (combined per dp-rank by test_harness).",
+             "one chrome trace per global actor rank.",
+    )
+    parser.add_argument(
+        "--pytorch-profiler-warmup-iters",
+        type=int,
+        default=2,
+        help="Number of profiler-instrumented warmup iterations discarded before capture.",
     )
     parser.add_argument(
         "--pytorch-profiler-iters",

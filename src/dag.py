@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import torch
 import torch.fx as fx
 
 from .fx import AnnotationSegment
@@ -10,33 +11,209 @@ from .fx import AnnotationSegment
 if TYPE_CHECKING:
     from .profiling import NodeProfile
 
-def _collect_triton_constant_args(gm: fx.GraphModule) -> dict[int, Any]:
+def _triton_wrapper_targets() -> frozenset[Any]:
+    """Return PyTorch's concrete Triton HOP objects for this installation."""
+    from torch._higher_order_ops import triton_kernel_wrap
+
+    return frozenset(
+        target
+        for name in (
+            "triton_kernel_wrapper_mutation",
+            "triton_kernel_wrapper_functional",
+        )
+        if (target := getattr(triton_kernel_wrap, name, None)) is not None
+    )
+
+
+def _iter_triton_wrapper_nodes(gm: fx.GraphModule):
+    targets = _triton_wrapper_targets()
+    for module in gm.modules():
+        if not isinstance(module, fx.GraphModule):
+            continue
+        for node in module.graph.nodes:
+            if node.op == "call_function" and node.target in targets:
+                yield module, node
+
+
+def _resolve_imported_qualname(module_name: str, qualname: str) -> Any:
+    import importlib
+
+    value: Any = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _serialize_triton_kernel(kernel: Any) -> dict[str, Any]:
+    """Encode a kernel without copying its process-local locks/caches."""
+    module_name = getattr(kernel, "__module__", None)
+    qualname = getattr(kernel, "__qualname__", None)
+    if (
+        isinstance(module_name, str)
+        and module_name
+        and isinstance(qualname, str)
+        and qualname
+        and "<locals>" not in qualname
+    ):
+        try:
+            imported = _resolve_imported_qualname(module_name, qualname)
+        except (ImportError, AttributeError):
+            imported = None
+        if imported is kernel:
+            return {
+                "kind": "import",
+                "module": module_name,
+                "qualname": qualname,
+            }
+
+    # This fallback supports serializable callable objects while producing a
+    # precise early error for JIT/autotuner objects with process-local locks.
+    import ray.cloudpickle as cloudpickle
+
+    return {"kind": "cloudpickle", "payload": cloudpickle.dumps(kernel)}
+
+
+def _deserialize_triton_kernel(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        # Compatibility for in-process/internal callers that still provide a
+        # live kernel object.
+        return payload
+    kind = payload.get("kind")
+    if kind == "import":
+        return _resolve_imported_qualname(
+            str(payload["module"]), str(payload["qualname"])
+        )
+    if kind == "cloudpickle":
+        import ray.cloudpickle as cloudpickle
+
+        return cloudpickle.loads(payload["payload"])
+    raise ValueError(f"Unknown transported Triton kernel encoding: {kind!r}")
+
+
+def _collect_triton_side_table(gm: fx.GraphModule) -> dict[str, dict[int, Any]]:
+    """Capture all side-table state referenced by Triton HOPs in ``gm``.
+
+    FX graphs contain integer references rather than Triton kernel objects.
+    Those integers are process-local, so Piper transports serialized kernels
+    and constant arguments separately and remaps every reference on the actor.
+    No kernel/operator semantics are inspected here.
+    """
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
-    out: dict[int, Any] = {}
-    for node in gm.graph.nodes:
-        if node.op != "call_function":
+
+    kernels: dict[int, Any] = {}
+    constant_args: dict[int, Any] = {}
+    for _module, node in _iter_triton_wrapper_nodes(gm):
+        kernel_idx = node.kwargs.get("kernel_idx")
+        if isinstance(kernel_idx, bool) or not isinstance(kernel_idx, int):
+            raise ValueError(
+                f"Triton wrapper node {node.name!r} has invalid "
+                f"kernel_idx={kernel_idx!r}"
+            )
+        try:
+            kernel = kernel_side_table.get_kernel(kernel_idx)
+        except (AssertionError, KeyError) as exc:
+            raise ValueError(
+                f"Triton wrapper node {node.name!r} references missing "
+                f"kernel_idx={kernel_idx}"
+            ) from exc
+        try:
+            kernels.setdefault(kernel_idx, _serialize_triton_kernel(kernel))
+        except Exception as exc:
+            raise TypeError(
+                f"Triton kernel at side-table index {kernel_idx} is not "
+                "serializable for actor transport"
+            ) from exc
+
+        constant_idx = node.kwargs.get("constant_args_idx")
+        if constant_idx is None:
             continue
-        target_str = getattr(node.target, "__name__", "") or str(node.target)
-        if "triton_kernel_wrapper" not in target_str:
-            continue
-        idx = node.kwargs.get("constant_args_idx")
-        if idx is not None and idx in kernel_side_table.constant_args:
-            out[int(idx)] = kernel_side_table.constant_args[idx]
-    return out
+        if isinstance(constant_idx, bool) or not isinstance(constant_idx, int):
+            raise ValueError(
+                f"Triton wrapper node {node.name!r} has invalid "
+                f"constant_args_idx={constant_idx!r}"
+            )
+        try:
+            constant_args.setdefault(
+                constant_idx,
+                kernel_side_table.get_constant_args(constant_idx),
+            )
+        except (AssertionError, KeyError) as exc:
+            raise ValueError(
+                f"Triton wrapper node {node.name!r} references missing "
+                f"constant_args_idx={constant_idx}"
+            ) from exc
+
+    return {"kernels": kernels, "constant_args": constant_args}
+
+
+def _collect_triton_constant_args(gm: fx.GraphModule) -> dict[int, Any]:
+    """Compatibility accessor for callers that only consume constant args."""
+    return _collect_triton_side_table(gm)["constant_args"]
+
+
+def restore_triton_side_table(
+    gms: list[fx.GraphModule],
+    *,
+    kernels: dict[int, Any],
+    constant_args: dict[int, Any],
+) -> None:
+    """Register transported Triton state locally and remap graph references."""
+    from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+    kernel_index_map: dict[int, int] = {}
+    for old_idx, payload in sorted(kernels.items()):
+        kernel = _deserialize_triton_kernel(payload)
+        kernel_index_map[int(old_idx)] = kernel_side_table.add_kernel(kernel)
+
+    constant_index_map = {
+        int(old_idx): kernel_side_table.add_constant_args(args)
+        for old_idx, args in sorted(constant_args.items())
+    }
+
+    for gm in gms:
+        changed_modules: set[fx.GraphModule] = set()
+        for module, node in _iter_triton_wrapper_nodes(gm):
+            kwargs = dict(node.kwargs)
+            old_kernel_idx = kwargs.get("kernel_idx")
+            if old_kernel_idx not in kernel_index_map:
+                raise ValueError(
+                    f"Triton wrapper node {node.name!r} references "
+                    f"kernel_idx={old_kernel_idx!r}, but no transported kernel "
+                    "was provided"
+                )
+            kwargs["kernel_idx"] = kernel_index_map[old_kernel_idx]
+
+            old_constant_idx = kwargs.get("constant_args_idx")
+            if old_constant_idx is not None:
+                if old_constant_idx not in constant_index_map:
+                    raise ValueError(
+                        f"Triton wrapper node {node.name!r} references "
+                        f"constant_args_idx={old_constant_idx!r}, but no "
+                        "transported constant arguments were provided"
+                    )
+                kwargs["constant_args_idx"] = constant_index_map[
+                    old_constant_idx
+                ]
+            node.kwargs = kwargs
+            changed_modules.add(module)
+        for module in changed_modules:
+            module.recompile()
 
 
 @dataclass(frozen=True)
 class TrainingDAGEdge:
     src_uid: str
     dst_uid: str
-    dep_kind: str  # "data" | "temporal"
+    # ``issue`` constrains host dispatch only.  Unlike ``data`` and
+    # ``temporal``, it must never become a CUDA completion dependency.
+    dep_kind: str  # "data" | "temporal" | "issue"
     tensor_name: str | None = None
 
 
 @dataclass
 class TrainingDAGNode:
     uid: str
-    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "ORDER_DUMMY"
+    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "M_TO_N_COMM" | "N_TO_M_COMM" | "ORDER_DUMMY"
     compute_subkind: str | None  # "FWD" | "BWD" | "BWD_I" | "BWD_W" when node_kind == "COMPUTE"
     tag: dict[str, int | None]
     device: list[int] | None
@@ -109,6 +286,11 @@ class TrainingDAG:
     def add_edge(self, edge: TrainingDAGEdge) -> None:
         if edge.src_uid not in self.nodes or edge.dst_uid not in self.nodes:
             raise ValueError(f"Edge references unknown node: {edge}")
+        if edge.dep_kind not in {"data", "temporal", "issue"}:
+            raise ValueError(
+                f"unsupported dependency kind {edge.dep_kind!r} on "
+                f"{edge.src_uid} -> {edge.dst_uid}"
+            )
         edge_key = (edge.src_uid, edge.dst_uid, edge.dep_kind, edge.tensor_name)
         if edge_key in self.edge_keys:
             return
@@ -174,11 +356,17 @@ class TrainingDAG:
         tag_filter: dict[str, Any],
         *,
         wildcard_value: Any,
+        absent_value: Any | None = None,
         exclude_node_kinds: set[str] | None = None,
     ) -> list[str]:
         candidates: set[str] | None = None
         for key, value in tag_filter.items():
-            if value == wildcard_value:
+            if absent_value is not None and value == absent_value:
+                present = self._tag_uids_non_none_by_key.get(key, set()) | (
+                    self._tag_uids_by_key_value.get((key, None), set())
+                )
+                matching = set(self.nodes) - present
+            elif value == wildcard_value:
                 matching = self._tag_uids_non_none_by_key.get(key, set())
             else:
                 matching = self._tag_uids_by_key_value.get((key, value), set())
@@ -258,13 +446,30 @@ def _flatten_output_nodes(out_arg: Any) -> list[fx.Node]:
 
 
 
-def _node_io_names(seg_gm: fx.GraphModule) -> tuple[list[str], list[str]]:
+def _node_io_names(
+    seg_gm: fx.GraphModule,
+) -> tuple[list[str], list[str], list[int], list[int]]:
     inputs = [n.name for n in seg_gm.graph.nodes if n.op == "placeholder"]
     out_node = next((n for n in seg_gm.graph.nodes if n.op == "output"), None)
     if out_node is None:
-        return inputs, []
-    outputs = [n.name for n in _flatten_output_nodes(out_node.args[0])]
-    return inputs, outputs
+        return inputs, [], [], []
+    output_nodes = _flatten_output_nodes(out_node.args[0])
+    outputs = [n.name for n in output_nodes]
+    tensor_output_indices: list[int] = []
+    differentiable_output_indices: list[int] = []
+    for index, node in enumerate(output_nodes):
+        example = node.meta.get("example_value", node.meta.get("val"))
+        if not isinstance(example, torch.Tensor):
+            continue
+        tensor_output_indices.append(index)
+        if bool(getattr(example, "requires_grad", False)):
+            differentiable_output_indices.append(index)
+    return (
+        inputs,
+        outputs,
+        tensor_output_indices,
+        differentiable_output_indices,
+    )
 
 def _with_pass_tag(tag: dict[str, Any], pass_value: str | None) -> dict[str, Any]:
     t = dict(tag)
@@ -277,12 +482,21 @@ def build_training_dag(
     """Build a TrainingDAG where each node is one annotated GraphModule segment."""
     dag = TrainingDAG()
 
-    global_prev_uid: str | None = None
+    uid_by_segment_id: dict[int, str] = {}
+    segment_by_id = {
+        segment.segment_id: segment for segment in annotation_segments
+    }
 
     for segment in annotation_segments:
         uid = f"s{segment.stage_id}.seg{segment.segment_id}"
         tag = _with_pass_tag(segment.tag, "F")
-        in_names, out_names = _node_io_names(segment.gm)
+        triton_side_table = _collect_triton_side_table(segment.gm)
+        (
+            in_names,
+            out_names,
+            tensor_output_indices,
+            differentiable_output_indices,
+        ) = _node_io_names(segment.gm)
         node = TrainingDAGNode(
             uid=uid,
             node_kind="COMPUTE",
@@ -300,16 +514,80 @@ def build_training_dag(
                 "graphargs": list(segment.graphargs),
                 "input_names": in_names,
                 "output_names": out_names,
+                "tensor_output_indices": tensor_output_indices,
+                "differentiable_output_indices": differentiable_output_indices,
+                "runtime_input_values": list(segment.runtime_input_values),
+                "runtime_output_values": list(segment.runtime_output_values),
+                "runtime_inputs_by_source": {},
+                "runtime_outputs_by_destination": {},
                 "a2a_boundary_after": segment.a2a_boundary_after,
-                "triton_constant_args": _collect_triton_constant_args(segment.gm),
+                "triton_kernels": triton_side_table["kernels"],
+                "triton_constant_args": triton_side_table["constant_args"],
             },
         )
         dag.add_node(node)
+        uid_by_segment_id[segment.segment_id] = uid
 
-        # Explicit activation-flow ordering in annotation segment order.
-        if global_prev_uid is not None:
-            dag.add_edge(TrainingDAGEdge(src_uid=global_prev_uid, dst_uid=uid, dep_kind="data"))
-        global_prev_uid = uid
+    # Build activation dependencies from actual FX value producers. Multiple
+    # values shared by the same producer/consumer pair form one structured DAG
+    # edge; a value that skips a segment therefore becomes a direct edge rather
+    # than an artificial identity slot in the intervening GraphModule ABI.
+    for segment in annotation_segments:
+        dst_uid = uid_by_segment_id[segment.segment_id]
+        values_by_source: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+        for input_slot, descriptor in enumerate(segment.runtime_input_values):
+            source_segment_id = descriptor.get("source_segment_id")
+            if source_segment_id is None:
+                continue
+            values_by_source.setdefault(int(source_segment_id), []).append(
+                (input_slot, descriptor)
+            )
+        for source_segment_id, input_values in values_by_source.items():
+            source_segment = segment_by_id[source_segment_id]
+            src_uid = uid_by_segment_id[source_segment_id]
+            output_slot_by_value = {
+                descriptor["value_id"]: output_slot
+                for output_slot, descriptor in enumerate(
+                    source_segment.runtime_output_values
+                )
+            }
+            mapping: list[dict[str, Any]] = []
+            for input_slot, descriptor in input_values:
+                value_id = descriptor["value_id"]
+                if value_id not in output_slot_by_value:
+                    raise ValueError(
+                        f"segment {source_segment_id} does not expose runtime "
+                        f"value {value_id!r} required by segment "
+                        f"{segment.segment_id}"
+                    )
+                mapping.append(
+                    {
+                        "value_id": value_id,
+                        "source_output_idx": output_slot_by_value[value_id],
+                        "destination_input_idx": input_slot,
+                        "destination_grapharg_idx": segment.input_idxs[
+                            input_slot
+                        ],
+                        "schema": descriptor.get("schema"),
+                        "is_tensor": descriptor.get("is_tensor"),
+                    }
+                )
+            dag.nodes[src_uid].node_meta["runtime_outputs_by_destination"][
+                dst_uid
+            ] = mapping
+            dag.nodes[dst_uid].node_meta["runtime_inputs_by_source"][src_uid] = (
+                mapping
+            )
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=src_uid,
+                    dst_uid=dst_uid,
+                    dep_kind="data",
+                    tensor_name="runtime_values:" + ",".join(
+                        item["value_id"] for item in mapping
+                    ),
+                )
+            )
 
     # Build backward-pass nodes and dependencies by reversing forward data edges.
     fwd_compute_uids = [
@@ -351,6 +629,13 @@ def build_training_dag(
     for e in fwd_edges:
         bwd_src = fwd_uid_to_bwd_uid[e.dst_uid]
         bwd_dst = fwd_uid_to_bwd_uid[e.src_uid]
+        value_mapping = dag.nodes[e.src_uid].node_meta.get(
+            "runtime_outputs_by_destination", {}
+        ).get(e.dst_uid)
+        if isinstance(value_mapping, list):
+            dag.nodes[bwd_dst].node_meta.setdefault(
+                "runtime_output_grads_by_source", {}
+            )[bwd_src] = list(value_mapping)
         dag.add_edge(
             TrainingDAGEdge(
                 src_uid=bwd_src,

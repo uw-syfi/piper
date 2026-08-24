@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 from .dag import (
@@ -14,15 +15,19 @@ from .state import LOG_LEVEL, create_logger
 logger = create_logger("zero", LOG_LEVEL)
 
 
-def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
+@dataclass(frozen=True)
+class _ZeroLifetimeChains:
+    gradient: list[list[str]]
+    parameter: list[list[str]]
+
+
+def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> _ZeroLifetimeChains:
     """Prune redundant ZeRO param/grad lifetimes across same-bucket compute chains.
 
-    Returns the union of gradient and parameter chains used for pruning, one
-    list per chain ordered by topo. The caller passes these to
-    ``_add_inter_chain_temporal_edges`` *after*
-    ``resolve_total_order_per_stream`` runs, so the inter-chain check sees the
-    post-stream-serialization topo levels for the gather_stream and
-    reduce_stream nodes.
+    Returns explicitly typed gradient and parameter chains used for pruning,
+    each chain ordered by topo. Default compute order is finalized before this
+    pass; the caller then adds inter-chain lifetime edges before materializing
+    gather/reduce stream FIFO.
     """
     topo_levels = _topological_levels(dag)
     topo = _serial_topological_order(dag, topo_levels)
@@ -96,7 +101,15 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                         if nxt not in seen:
                             seen.add(nxt)
                             stack.append(nxt)
-                chains.append(sorted(component, key=lambda u: topo_idx[u]))
+                ordered_component = sorted(component, key=lambda u: topo_idx[u])
+                chain = [ordered_component[0]]
+                for next_uid in ordered_component[1:]:
+                    if _has_direct_compute_dependency(chain[-1], next_uid):
+                        chain.append(next_uid)
+                    else:
+                        chains.append(chain)
+                        chain = [next_uid]
+                chains.append(chain)
         return chains
 
     def _data_preds(uid: str) -> list[TrainingDAGEdge]:
@@ -336,14 +349,17 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                 f"{stale_rs_param_frees}; chain={chain}"
             )
 
-    return grad_chains + param_chains
+    return _ZeroLifetimeChains(
+        gradient=grad_chains,
+        parameter=param_chains,
+    )
 
 
 def _add_inter_chain_temporal_edges(
     dag: TrainingDAG,
-    chains: list[list[str]],
+    chains: _ZeroLifetimeChains,
 ) -> None:
-    """Force later same-bucket ZeRO chains to wait for earlier bucket frees.
+    """Order disconnected same-bucket ZeRO lifetimes without overlap.
 
     Parameter chains: prev_tail compute frees full params, next root's
     all-gather predecessor materializes them. Edge: prev_tail -> ag_uid.
@@ -351,10 +367,12 @@ def _add_inter_chain_temporal_edges(
     Gradient chains: prev_tail's reduce-scatter successor frees full grads,
     next root compute allocates them. Edge: rs_uid -> next_root.
     """
-    if not chains:
+    if not chains.gradient and not chains.parameter:
         return
 
     topo_levels = _topological_levels(dag)
+    topo_order = _serial_topological_order(dag, topo_levels)
+    topo_index = {uid: index for index, uid in enumerate(topo_order)}
     reachability = _ReachabilityIndex(dag)
 
     def _chain_bucket(uid: str) -> Any:
@@ -376,13 +394,97 @@ def _add_inter_chain_temporal_edges(
             and dag.nodes[e.dst_uid].node_kind == "REDUCE_SCATTER_COMM"
         )
 
-    def _maybe_add_edge(src_uid: str, dst_uid: str) -> None:
-        if topo_levels.get(src_uid, 0) < topo_levels.get(dst_uid, 0):
-            return
+    def _order_intervals(
+        bucket_chains: list[list[str]],
+        *,
+        bucket: Any,
+        lifetime_kind: str,
+        starts,
+        ends,
+    ) -> list[list[str]]:
+        """Choose a stable interval order compatible with DAG reachability."""
+        count = len(bucket_chains)
+        if count < 2:
+            return bucket_chains
+
+        must_precede: dict[int, set[int]] = {
+            index: set() for index in range(count)
+        }
+        indegree = [0] * count
+        for before in range(count):
+            for after in range(count):
+                if before == after:
+                    continue
+                # ``before -> after`` would add every end(before) ->
+                # start(after). If an after-start already reaches a
+                # before-end, that direction is cyclic, so after must precede
+                # before instead.
+                if not any(
+                    reachability.has_path(after_start, before_end)
+                    for after_start in starts(bucket_chains[after])
+                    for before_end in ends(bucket_chains[before])
+                ):
+                    continue
+                if before not in must_precede[after]:
+                    must_precede[after].add(before)
+                    indegree[before] += 1
+
+        def _preference(index: int) -> tuple[int, int]:
+            root = bucket_chains[index][0]
+            return (
+                topo_levels.get(root, 0),
+                topo_index.get(root, 0),
+            )
+
+        ready = sorted(
+            (index for index, degree in enumerate(indegree) if degree == 0),
+            key=_preference,
+        )
+        ordered_indices: list[int] = []
+        while ready:
+            index = ready.pop(0)
+            ordered_indices.append(index)
+            for successor in sorted(
+                must_precede[index], key=_preference
+            ):
+                indegree[successor] -= 1
+                if indegree[successor] == 0:
+                    ready.append(successor)
+                    ready.sort(key=_preference)
+
+        if len(ordered_indices) != count:
+            cyclic = [
+                {
+                    "chain": bucket_chains[index],
+                    "starts": starts(bucket_chains[index]),
+                    "ends": ends(bucket_chains[index]),
+                }
+                for index, degree in enumerate(indegree)
+                if degree > 0
+            ]
+            raise ValueError(
+                "zero_lifetime_order: cyclic "
+                f"{lifetime_kind} lifetime order for bucket={bucket!r}: "
+                f"{cyclic}"
+            )
+        return [bucket_chains[index] for index in ordered_indices]
+
+    def _maybe_add_edge(
+        src_uid: str,
+        dst_uid: str,
+        *,
+        bucket: Any,
+        lifetime_kind: str,
+    ) -> None:
         if reachability.has_path(src_uid, dst_uid):
             return
         if reachability.has_path(dst_uid, src_uid):
-            return
+            raise ValueError(
+                "zero_lifetime_order: contradictory "
+                f"{lifetime_kind} lifetime for bucket={bucket!r}: required "
+                f"{src_uid}->{dst_uid}, but the DAG already orders "
+                f"{dst_uid}->{src_uid}"
+            )
         dag.add_edge(TrainingDAGEdge(
             src_uid=src_uid,
             dst_uid=dst_uid,
@@ -395,21 +497,43 @@ def _add_inter_chain_temporal_edges(
     # between consecutive same-bucket chains.
     param_by_bucket: dict[Any, list[list[str]]] = {}
     grad_by_bucket: dict[Any, list[list[str]]] = {}
-    for chain in chains:
+    for chain in chains.parameter:
         bucket = _chain_bucket(chain[0])
-        if _all_gather_preds(chain[0]):
-            param_by_bucket.setdefault(bucket, []).append(chain)
-        if dag.nodes[chain[0]].node_meta.get("zero_alloc_full_grads_before"):
-            grad_by_bucket.setdefault(bucket, []).append(chain)
+        param_by_bucket.setdefault(bucket, []).append(chain)
+    for chain in chains.gradient:
+        bucket = _chain_bucket(chain[0])
+        grad_by_bucket.setdefault(bucket, []).append(chain)
 
-    for bucket_chains in param_by_bucket.values():
-        bucket_chains.sort(key=lambda c: topo_levels.get(c[0], 0))
+    for bucket, bucket_chains in param_by_bucket.items():
+        bucket_chains = _order_intervals(
+            bucket_chains,
+            bucket=bucket,
+            lifetime_kind="parameter",
+            starts=lambda chain: _all_gather_preds(chain[0]),
+            ends=lambda chain: [chain[-1]],
+        )
         for prev_chain, next_chain in zip(bucket_chains, bucket_chains[1:]):
             for ag_uid in _all_gather_preds(next_chain[0]):
-                _maybe_add_edge(prev_chain[-1], ag_uid)
+                _maybe_add_edge(
+                    prev_chain[-1],
+                    ag_uid,
+                    bucket=bucket,
+                    lifetime_kind="parameter",
+                )
 
-    for bucket_chains in grad_by_bucket.values():
-        bucket_chains.sort(key=lambda c: topo_levels.get(c[0], 0))
+    for bucket, bucket_chains in grad_by_bucket.items():
+        bucket_chains = _order_intervals(
+            bucket_chains,
+            bucket=bucket,
+            lifetime_kind="gradient",
+            starts=lambda chain: [chain[0]],
+            ends=lambda chain: _reduce_scatter_succs(chain[-1]),
+        )
         for prev_chain, next_chain in zip(bucket_chains, bucket_chains[1:]):
             for rs_uid in _reduce_scatter_succs(prev_chain[-1]):
-                _maybe_add_edge(rs_uid, next_chain[0])
+                _maybe_add_edge(
+                    rs_uid,
+                    next_chain[0],
+                    bucket=bucket,
+                    lifetime_kind="gradient",
+                )

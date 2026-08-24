@@ -26,7 +26,7 @@ import torch
 
 from .dag import TrainingDAG
 from .executors import DagExecutor
-from .ordering import _serial_topological_order
+from .ordering import _dispatch_order
 from .runtime import BufferStore, EventStore
 from .tasks import TaskType
 
@@ -146,7 +146,7 @@ class ControlPlaneHarness:
         self._hydrate_for_dry_dispatch()
         self.sorted_nodes = [
             self.dag.nodes[uid]
-            for uid in _serial_topological_order(self.dag)
+            for uid in _dispatch_order(self.dag)
         ]
         stream_names = {
             str(node.stream or "default_stream")
@@ -163,7 +163,7 @@ class ControlPlaneHarness:
             buffers=BufferStore(),
             events=EventStore(),
             params=_NoOpParameterStorage(),
-            communication=SimpleNamespace(),
+            communication=SimpleNamespace(reap_completed_p2p=lambda: None),
             compute=SimpleNamespace(),
             logger=self.logger,
         )
@@ -224,6 +224,11 @@ class ControlPlaneHarness:
             elif edge.dep_kind == "temporal":
                 src.temporal_succs.append(dst)
                 dst.temporal_preds.append(src)
+            elif edge.dep_kind == "issue":
+                # Static dispatch order satisfies issue-only edges.  The
+                # control-plane executor must not treat them as completion
+                # dependencies.
+                continue
             else:
                 raise ValueError(
                     f"unsupported dependency kind {edge.dep_kind!r} on "

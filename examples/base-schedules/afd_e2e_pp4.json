@@ -1,0 +1,123 @@
+[
+  {
+    "op": "place",
+    "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": 0},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": 2},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": 4},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"PP": 3, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1]
+  },
+  {
+    "op": "place",
+    "filter": {"FFN": 0},
+    "devices": [2]
+  },
+  {
+    "op": "place",
+    "filter": {"FFN": 2},
+    "devices": [2]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": 1},
+    "devices": [3, 4]
+  },
+  {
+    "op": "place",
+    "filter": {"ATTN": 3},
+    "devices": [3, 4]
+  },
+  {
+    "op": "place",
+    "filter": {"FFN": 1},
+    "devices": [5]
+  },
+  {
+    "op": "place",
+    "filter": {"FFN": 3},
+    "devices": [5]
+  },
+  {
+    "op": "replicate",
+    "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": 0},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": 2},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": 4},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"PP": 3, "ATTN": "-", "FFN": "-"},
+    "devices": [0, 1],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": 1},
+    "devices": [3, 4],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {"ATTN": 3},
+    "devices": [3, 4],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {"FFN": 0},
+    "devices": [2],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {"FFN": 2},
+    "devices": [2],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {"FFN": 1},
+    "devices": [5],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {"FFN": 3},
+    "devices": [5],
+    "stream": "ep_stream"
+  }
+]

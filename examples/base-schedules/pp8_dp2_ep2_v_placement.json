@@ -49,49 +49,57 @@
   },
   {
     "op": "replicate",
-    "filter": { "PP": 0 },
+    "filter": { "PP": 0,
+      "EP": "-" },
     "devices": [0, 4],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 1 },
+    "filter": { "PP": 1,
+      "EP": "-" },
     "devices": [1, 5],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 2 },
+    "filter": { "PP": 2,
+      "EP": "-" },
     "devices": [2, 6],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 3 },
+    "filter": { "PP": 3,
+      "EP": "-" },
     "devices": [3, 7],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 4 },
+    "filter": { "PP": 4,
+      "EP": "-" },
     "devices": [3, 7],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 5 },
+    "filter": { "PP": 5,
+      "EP": "-" },
     "devices": [2, 6],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 6 },
+    "filter": { "PP": 6,
+      "EP": "-" },
     "devices": [1, 5],
     "reduce_stream": "dp_stream"
   },
   {
     "op": "replicate",
-    "filter": { "PP": 7 },
+    "filter": { "PP": 7,
+      "EP": "-" },
     "devices": [0, 4],
     "reduce_stream": "dp_stream"
   },

@@ -12,11 +12,34 @@ _DEFAULT_STREAM = "default_stream"
 _CRITICAL_PATH_COMM_KINDS = {
     "ALL_GATHER_COMM",
     "A2A_COMM",
+    "M_TO_N_COMM",
+    "N_TO_M_COMM",
 }
 _REDUCTION_COMM_KINDS = {
     "REDUCE_COMM",
     "REDUCE_SCATTER_COMM",
 }
+_DIRECTIONAL_P2P_DOMAINS = {
+    "pp_lo_hi",
+    "pp_hi_lo",
+    "dense_state_lo_hi",
+    "dense_state_hi_lo",
+}
+
+
+def execution_stream_domain(node: object) -> str:
+    """Return the physical FIFO domain represented by a finalized DAG node.
+
+    Schedule-declared streams are authoritative except for pipeline P2P, whose
+    opposite directions deliberately use independent physical streams.
+    """
+    if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
+        direction = (getattr(node, "node_meta", {}) or {}).get(
+            "comm_group_kind"
+        )
+        if direction in _DIRECTIONAL_P2P_DOMAINS:
+            return str(direction)
+    return str(getattr(node, "stream", None) or _DEFAULT_STREAM)
 
 
 def _serial_topological_order(
@@ -34,22 +57,153 @@ def _serial_topological_order(
     base_order = _topological_order(dag)
     topo_idx = {uid: i for i, uid in enumerate(base_order)}
 
-    def node_priority(uid: str) -> int:
-        kind = dag.nodes[uid].node_kind
-        if kind == "SEND_COMM":
-            return 0
-        if kind in _CRITICAL_PATH_COMM_KINDS:
-            return 1
-        if kind in _REDUCTION_COMM_KINDS:
-            return 2
-        if kind == "RECV_COMM":
-            return 4
-        return 3
-
     return sorted(
         dag.nodes,
-        key=lambda uid: (topo_levels[uid], node_priority(uid), topo_idx[uid]),
+        key=lambda uid: (
+            topo_levels[uid],
+            _serial_priority(dag, uid),
+            topo_idx[uid],
+        ),
     )
+
+
+def _serial_priority(dag: TrainingDAG, uid: str) -> int:
+    kind = dag.nodes[uid].node_kind
+    if kind == "SEND_COMM":
+        return 0
+    if kind in _CRITICAL_PATH_COMM_KINDS:
+        return 1
+    if kind in _REDUCTION_COMM_KINDS:
+        return 2
+    if kind == "RECV_COMM":
+        return 4
+    return 3
+
+
+def _dispatch_priority(dag: TrainingDAG, uid: str) -> int:
+    kind = dag.nodes[uid].node_kind
+    if kind == "SEND_COMM":
+        return 0
+    if kind.endswith("_COMM") and kind != "RECV_COMM":
+        return 1
+    if kind == "RECV_COMM":
+        return 3
+    return 2
+
+
+def _compute_dispatch_levels(
+    dag: TrainingDAG,
+    *,
+    require_p2p_anchors: bool,
+) -> dict[str, int]:
+    """Place P2P endpoints near compute anchors without changing DAG edges."""
+    topo_levels = _topological_levels(dag)
+    base_order = _topological_order(dag)
+    dispatch_levels = dict(topo_levels)
+
+    def anchor(uid: str, field: str) -> str | None:
+        value = dag.nodes[uid].node_meta.get(field)
+        anchor_node = dag.nodes.get(value) if isinstance(value, str) else None
+        if anchor_node is not None and anchor_node.node_kind == "COMPUTE":
+            return value
+        if require_p2p_anchors:
+            raise ValueError(
+                f"P2P node {uid!r} requires local COMPUTE anchor {field}, "
+                f"got {value!r}"
+            )
+        return None
+
+    # Moving a SEND earlier can only threaten its incoming edges. Process
+    # sources forward so every predecessor already has its final level.
+    for uid in base_order:
+        if dag.nodes[uid].node_kind != "SEND_COMM":
+            continue
+        producer_uid = anchor(uid, "source_compute_uid")
+        if producer_uid is None:
+            continue
+        predecessor_floor = max(
+            (dispatch_levels[pred_uid] + 1 for pred_uid in dag.preds[uid]),
+            default=0,
+        )
+        target = dispatch_levels[producer_uid] + 1
+        dispatch_levels[uid] = max(target, predecessor_floor)
+
+    # Moving a RECV later can only threaten its outgoing edges. Process sinks
+    # backward so every successor already has its final level.
+    for uid in reversed(base_order):
+        if dag.nodes[uid].node_kind != "RECV_COMM":
+            continue
+        consumer_uid = anchor(uid, "destination_compute_uid")
+        if consumer_uid is None:
+            continue
+        successor_ceiling = min(
+            (dispatch_levels[succ_uid] - 1 for succ_uid in dag.succs[uid]),
+            default=dispatch_levels[consumer_uid] - 1,
+        )
+        target = dispatch_levels[consumer_uid] - 1
+        dispatch_levels[uid] = min(target, successor_ceiling)
+
+    for edge in dag.edges:
+        src_level = dispatch_levels[edge.src_uid]
+        dst_level = dispatch_levels[edge.dst_uid]
+        if src_level >= dst_level:
+            raise ValueError(
+                "dispatch-level assignment violates DAG edge "
+                f"{edge.src_uid}->{edge.dst_uid} ({edge.dep_kind}): "
+                f"levels={src_level}->{dst_level}"
+            )
+    return dispatch_levels
+
+
+def assign_dispatch_levels(dag: TrainingDAG) -> None:
+    """Persist the finalized static issue level on every actor-DAG node."""
+    dispatch_levels = _compute_dispatch_levels(
+        dag,
+        require_p2p_anchors=True,
+    )
+    for uid, level in dispatch_levels.items():
+        dag.nodes[uid].node_meta["dispatch_level"] = int(level)
+
+
+def _dispatch_order(dag: TrainingDAG) -> list[str]:
+    """Return the static executor/simulator issue order for a finalized DAG."""
+    stored_levels: dict[str, int] = {}
+    for uid, node in dag.nodes.items():
+        value = node.node_meta.get("dispatch_level")
+        if isinstance(value, bool) or not isinstance(value, int):
+            stored_levels = {}
+            break
+        stored_levels[uid] = value
+    dispatch_levels = stored_levels or _compute_dispatch_levels(
+        dag,
+        require_p2p_anchors=False,
+    )
+    for edge in dag.edges:
+        if dispatch_levels[edge.src_uid] >= dispatch_levels[edge.dst_uid]:
+            raise ValueError(
+                "persisted dispatch levels violate DAG edge "
+                f"{edge.src_uid}->{edge.dst_uid} ({edge.dep_kind}): "
+                f"levels={dispatch_levels[edge.src_uid]}->"
+                f"{dispatch_levels[edge.dst_uid]}"
+            )
+    base_order = _topological_order(dag)
+    topo_idx = {uid: index for index, uid in enumerate(base_order)}
+    ordered = sorted(
+        dag.nodes,
+        key=lambda uid: (
+            dispatch_levels[uid],
+            _dispatch_priority(dag, uid),
+            topo_idx[uid],
+        ),
+    )
+    issue_index = {uid: index for index, uid in enumerate(ordered)}
+    for edge in dag.edges:
+        if issue_index[edge.src_uid] >= issue_index[edge.dst_uid]:
+            raise ValueError(
+                "dispatch order violates DAG edge "
+                f"{edge.src_uid}->{edge.dst_uid} ({edge.dep_kind})"
+            )
+    return ordered
 
 
 def _resolve_default_stream_order(
@@ -140,95 +294,42 @@ def _resolve_default_stream_order(
 
 
 def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
-    """Serialize the default stream, then strictly chain non-default streams.
+    """Materialize one DAG-compatible FIFO order for every physical stream.
 
-    The default-stream pass runs first so the per-non-default-stream anchors
-    below see the post-serialization topological order of default-stream nodes.
-
-    Non-default stream nodes are ordered by their nearest ready point on the
-    default stream.  A post-compute operation with multiple default-stream
-    predecessors (for example an accumulated reduce-scatter) is anchored to
-    its latest predecessor, while a pure pre-compute operation (for example an
-    all-gather) is anchored to its earliest default-stream successor.
+    Default-stream compute keeps its established downstream-aware ordering.
+    Every stream domain is then chained in a deterministic topological order,
+    so the executor and simulator consume the same FIFO without inventing
+    dependencies independently.
     """
     reachability = _ReachabilityIndex(dag)
     _resolve_default_stream_order(dag, reachability)
+    _materialize_execution_stream_fifo(dag)
 
-    topo = _topological_order(dag)
-    topo_idx = {uid: i for i, uid in enumerate(topo)}
-    topo_levels = _topological_levels(dag)
-    default_uids = [
-        uid for uid in topo
-        if dag.nodes[uid].stream == _DEFAULT_STREAM
-    ]
-    streams = sorted({
-        n.stream for n in dag.nodes.values()
-        if n.stream != _DEFAULT_STREAM
-    })
-    if not default_uids or not streams:
-        return
 
-    for stream in streams:
-        associated_by_default: dict[str, list[str]] = {uid: [] for uid in default_uids}
-        default_preds_by_stream_uid: dict[str, list[str]] = {}
-        default_succs_by_stream_uid: dict[str, list[str]] = {}
-        for edge in dag.edges:
-            src = dag.nodes[edge.src_uid]
-            dst = dag.nodes[edge.dst_uid]
-            if src.stream == _DEFAULT_STREAM and dst.stream == stream:
-                default_preds_by_stream_uid.setdefault(edge.dst_uid, []).append(
-                    edge.src_uid
-                )
-            elif src.stream == stream and dst.stream == _DEFAULT_STREAM:
-                default_succs_by_stream_uid.setdefault(edge.src_uid, []).append(
-                    edge.dst_uid
-                )
+def _materialize_execution_stream_fifo(dag: TrainingDAG) -> None:
+    """Represent every physical-stream FIFO relation as a temporal DAG edge."""
+    reachability = _ReachabilityIndex(dag)
+    ordered_by_domain: dict[str, list[str]] = {}
+    for uid in _serial_topological_order(dag):
+        ordered_by_domain.setdefault(
+            execution_stream_domain(dag.nodes[uid]), []
+        ).append(uid)
 
-        for stream_uid in {
-            uid for uid, node in dag.nodes.items()
-            if node.stream == stream
-        }:
-            default_preds = default_preds_by_stream_uid.get(stream_uid, [])
-            default_succs = default_succs_by_stream_uid.get(stream_uid, [])
-            if default_preds:
-                # The stream operation is not ready until all direct default
-                # predecessors complete.  Anchoring to the earliest one can
-                # incorrectly place an accumulated collective before a later
-                # all-gather that feeds one of its remaining contributors.
-                anchor_uid = max(
-                    default_preds,
-                    key=lambda uid: (topo_levels[uid], topo_idx[uid]),
+    for domain, uids in sorted(ordered_by_domain.items()):
+        for src_uid, dst_uid in zip(uids, uids[1:]):
+            if reachability.has_path(dst_uid, src_uid):
+                raise ValueError(
+                    "physical stream order conflicts with DAG reachability: "
+                    f"stream={domain!r}, requested={src_uid}->{dst_uid}"
                 )
-            elif default_succs:
-                anchor_uid = min(
-                    default_succs,
-                    key=lambda uid: (topo_levels[uid], topo_idx[uid]),
-                )
-            else:
+            if reachability.has_path(src_uid, dst_uid):
                 continue
-            associated_by_default.setdefault(anchor_uid, []).append(stream_uid)
-
-        current_uid: str | None = None
-        for default_uid in default_uids:
-            stream_uids = sorted(
-                set(associated_by_default.get(default_uid, [])),
-                key=lambda u: (topo_levels[u], topo_idx[u]),
+            dag.add_edge(
+                TrainingDAGEdge(
+                    src_uid=src_uid,
+                    dst_uid=dst_uid,
+                    dep_kind="temporal",
+                    tensor_name=None,
+                )
             )
-            for next_uid in stream_uids:
-                if current_uid is not None and current_uid != next_uid:
-                    if reachability.has_path(next_uid, current_uid):
-                        raise ValueError(
-                            "resolve_total_order_per_stream would create a cycle while ordering "
-                            f"stream={stream}: {current_uid} -> {next_uid}"
-                        )
-                    if not reachability.has_path(current_uid, next_uid):
-                        dag.add_edge(
-                            TrainingDAGEdge(
-                                src_uid=current_uid,
-                                dst_uid=next_uid,
-                                dep_kind="temporal",
-                                tensor_name=None,
-                            )
-                        )
-                        reachability.add_edge(current_uid, next_uid)
-                current_uid = next_uid
+            reachability.add_edge(src_uid, dst_uid)

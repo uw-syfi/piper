@@ -23,8 +23,16 @@ from .simulator import (
 
 
 _P2P_KINDS = frozenset({"SEND_COMM", "RECV_COMM"})
-_COLLECTIVE_KINDS = frozenset(
-    {"ALL_GATHER_COMM", "REDUCE_COMM", "REDUCE_SCATTER_COMM"}
+_TRANSACTION_COMM_KINDS = frozenset(
+    {
+        "A2A_COMM",
+        "ALL_GATHER_COMM",
+        "ALL_REDUCE_COMM",
+        "M_TO_N_COMM",
+        "N_TO_M_COMM",
+        "REDUCE_COMM",
+        "REDUCE_SCATTER_COMM",
+    }
 )
 
 
@@ -206,7 +214,7 @@ def _per_pp_dags(plan_or_dags: Any) -> list[Any]:
 def _feature_id(pp_index: int, node: Any) -> str:
     if node.node_kind in _P2P_KINDS:
         return f"comm:p2p:{_comm_id(node)}"
-    if node.node_kind in _COLLECTIVE_KINDS:
+    if node.node_kind in _TRANSACTION_COMM_KINDS:
         return f"comm:{node.node_kind.lower()}:{_comm_id(node)}"
     return f"node:pp{pp_index}:{node.uid}"
 
@@ -351,13 +359,13 @@ def _shared_profile_iteration_ids(plan_or_dags: Any) -> tuple[int, ...]:
             return ()
         mode, error = next(iter(errors.items()))
         raise AttributionValidationError(
-            f"cannot attribute median replay: {mode} raw samples are invalid: "
+            f"cannot attribute mean replay: {mode} raw samples are invalid: "
             f"{error}"
         ) from error
     if errors:
         mode, error = next(iter(errors.items()))
         raise AttributionValidationError(
-            f"cannot attribute median replay: {mode} raw samples are invalid: "
+            f"cannot attribute mean replay: {mode} raw samples are invalid: "
             f"{error}"
         ) from error
     normal_ids = ids_by_mode[NORMAL_PROFILE_MODE]
@@ -377,7 +385,7 @@ def _simulate_step_objective(
     sample_iteration_ids: tuple[int, ...],
     strict: bool,
 ) -> float:
-    """Evaluate the same median step estimator reported by the comparison."""
+    """Evaluate the same mean step estimator reported by the comparison."""
 
     if not sample_iteration_ids:
         return simulate_training_step(
@@ -386,7 +394,7 @@ def _simulate_step_objective(
             strict=strict,
         ).step_time_us
     return float(
-        statistics.median(
+        statistics.fmean(
             simulate_training_step(
                 plan_or_dags,
                 profile_mode=profile_mode,
@@ -529,7 +537,7 @@ def attribute_profile_mode_savings(
         permutations=permutations,
         seed=seed,
         exposure_threshold_us=exposure_threshold_us,
-        step_time_estimator=("median" if sample_iteration_ids else "point"),
+        step_time_estimator=("mean" if sample_iteration_ids else "point"),
         sample_iteration_ids=sample_iteration_ids,
         features=tuple(rows),
     )

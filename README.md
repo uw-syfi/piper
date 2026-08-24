@@ -32,6 +32,83 @@ The directive rewrites insert point-to-point pipeline communication, DP collecti
 The runtime decomposes the global DAG into per-device execution plans and runs them on Ray actors.
 Each actor manages local CUDA streams, process groups/communicators, model-state buffers, and intermediate tensors.
 
+### Training-step simulation
+
+Piper can profile finalized TrainingDAG nodes and replay their logical stream
+schedule in a CUDA-free event simulator. The profiler collects two compatible
+timing datasets:
+
+* `interference_free` serializes non-P2P work onto one CUDA stream to measure
+  node durations without same-device compute or memory contention.
+* `normal` preserves the actual logical CUDA streams and records contended
+  durations plus iteration-aligned GPU start offsets. Normal replay uses those
+  offsets as release constraints, preserving launch gaps that dependency edges
+  and durations alone cannot reconstruct.
+
+Pipeline SEND/RECV operations are never forced onto the serialized stream.
+Both modes retain separate `pp_lo_hi` and `pp_hi_lo` NCCL groups and CUDA
+streams, allowing opposite directions to make progress concurrently and
+avoiding profiler-induced P2P deadlock.
+
+Every DP worker participating in a training program must call the profiling
+API. The merged artifact contains rank-specific node durations and a slim copy
+of the finalized DAGs:
+
+```python
+from src.piper import piper_profile_dags, simulate_profiled_modes
+from src.profiling import ProfileConfig
+
+plan = piper_profile_dags(
+    loss_fn,
+    ProfileConfig(),  # 5 warmups; exactly 30 measured iterations per mode
+    profile_modes=("interference_free", "normal"),
+    output_path="out/step_time_profiles.json",
+)
+comparison = simulate_profiled_modes(plan, actual_step_samples_s=hardware_samples)
+print(comparison.interference_free_statistics)
+print(comparison.normal_statistics)
+print(comparison.normal_prediction_error)
+```
+
+A saved artifact can be simulated without GPUs or Ray:
+
+```bash
+python scripts/simulate_step_times.py \
+  out/step_time_profiles.json \
+  --mode both \
+  --actual-step-time-s 0.0645 \
+  --output out/interference_free_simulation.json
+```
+
+To rank profiled nodes by their normal-to-interference-free median duration:
+
+```bash
+python scripts/export_node_profile_ratios.py \
+  out/step_time_profiles.json \
+  --output out/node_profile_time_ratios.csv
+```
+
+The exporter pools each node's raw samples across its profiled global-rank
+entries, omits non-executing bookkeeping nodes with no samples in either mode,
+and sorts the CSV by descending duration ratio.
+
+The simulator preserves stream FIFO, data/temporal dependencies, P2P and
+collective rendezvous, but has no shared SM, memory-bandwidth, or network-link
+capacity clock. Independent streams therefore progress at their profiled solo
+rates. Because a communication endpoint's CUDA-event timing may include time
+waiting for peers, a collapsed rendezvous uses the minimum endpoint estimate
+as its optimistic service time after all participants become ready; the
+timeline still reports every endpoint's raw profiled duration.
+
+The normal hardware baseline uses exactly `--iters` measured iterations and
+each profile mode uses exactly `--profile-iters` measured iterations (both
+default to 30). Confidence intervals and their relative errors are descriptive;
+they never change the iteration count. The harness reports the sample count,
+estimator, mean, median, standard deviation, 95% CI, and relative CI error for
+actual time, throughput, simulated normal time, simulated interference-free
+time, instrumented normal-profile time, and peak memory. It also reports simulated
+normal prediction error against the measured median.
+
 ## Installation
 
 Requires Python 3.10+ on Linux with CUDA GPUs.
@@ -69,6 +146,11 @@ python examples/test_harness.py \
 The base schedule `pp4_dp2_ep2_v_placement.json` describes a PP x DP x EP placement with four annotated pipeline regions mapped onto two physical pipeline ranks in a V layout.
 Regions `PP=0` and `PP=3` run on device group `[0, 2]`, while `PP=1` and `PP=2` run on device group `[1, 3]`.
 Within each device group, Piper replicates non-expert regions for DP and shards expert regions for EP.
+`replicate` and `shard` filters must select disjoint model regions; applying
+both ownership modes to the same region is rejected. A `place` directive may
+select either kind of region. For an EP schedule, use an absence filter such as
+`{"PP": 0, "EP": "-"}` to replicate only the dense portion of a pipeline
+stage and `{"PP": 0, "EP": "*"}` to shard its expert regions.
 This example expects four visible CUDA devices.
 The harness appends DualPipeV `split` and `order` directives for two physical pipeline ranks and four microbatches.
 
@@ -150,6 +232,15 @@ These functions are trace-preserved tensor identities. They let Piper insert
 uneven all-to-all communication without inferring tensor roles from shapes,
 dtypes, or model-specific operator patterns. Each EP region requires exactly
 one marker of each kind.
+
+The model author is responsible for the semantic relationship between these
+markers: dispatch rows must be packed into consecutive blocks described by the
+route counts, and the combine payload must restore every received row to its
+original source-major, local-route position. Piper validates graph
+dependencies, tensor schemas, counts, and row totals, but it cannot determine
+from tensor values whether a row was assigned to the correct route or restored
+to the correct identity. Routed model implementations should therefore include
+correctness tests with identifiable rows.
 
 The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
 For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.

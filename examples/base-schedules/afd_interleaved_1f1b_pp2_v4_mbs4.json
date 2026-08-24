@@ -1,0 +1,943 @@
+[
+  {
+    "op": "place",
+    "filter": {
+      "PP": 0,
+      "ATTN": "-",
+      "FFN": "-"
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "ATTN": 0
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "ATTN": 2
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "ATTN": 4
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "PP": 3,
+      "ATTN": "-",
+      "FFN": "-"
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "FFN": 0
+    },
+    "devices": [
+      1,
+      5
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "FFN": 2
+    },
+    "devices": [
+      1,
+      5
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "ATTN": 1
+    },
+    "devices": [
+      2,
+      6,
+      9,
+      11
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "ATTN": 3
+    },
+    "devices": [
+      2,
+      6,
+      9,
+      11
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "FFN": 1
+    },
+    "devices": [
+      3,
+      7
+    ]
+  },
+  {
+    "op": "place",
+    "filter": {
+      "FFN": 3
+    },
+    "devices": [
+      3,
+      7
+    ]
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "PP": 0,
+      "ATTN": "-",
+      "FFN": "-"
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "ATTN": 0
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "ATTN": 2
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "ATTN": 4
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "PP": 3,
+      "ATTN": "-",
+      "FFN": "-"
+    },
+    "devices": [
+      0,
+      4,
+      8,
+      10
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "ATTN": 1
+    },
+    "devices": [
+      2,
+      6,
+      9,
+      11
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "ATTN": 3
+    },
+    "devices": [
+      2,
+      6,
+      9,
+      11
+    ],
+    "reduce_stream": "dp_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "FFN": 0
+    },
+    "devices": [
+      1,
+      5
+    ],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "FFN": 2
+    },
+    "devices": [
+      1,
+      5
+    ],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "FFN": 1
+    },
+    "devices": [
+      3,
+      7
+    ],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "shard",
+    "filter": {
+      "FFN": 3
+    },
+    "devices": [
+      3,
+      7
+    ],
+    "stream": "ep_stream"
+  },
+  {
+    "op": "split",
+    "filter": {},
+    "dim_name": "MB",
+    "num_microbatches": 4
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 3,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 4,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 2,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 0,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "PP": 0,
+          "ATTN": "-",
+          "FFN": "-",
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "FFN": 0,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 2,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 0,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "ATTN": 1,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 3,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "ATTN": 1,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  },
+  {
+    "op": "order",
+    "filters": [
+      [
+        {
+          "FFN": 1,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 0,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 1,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 2,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 3,
+          "PASS": "F"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 3,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 0,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 1,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 2,
+          "PASS": "B"
+        }
+      ],
+      [
+        {
+          "FFN": 1,
+          "MB": 3,
+          "PASS": "B"
+        }
+      ]
+    ]
+  }
+]

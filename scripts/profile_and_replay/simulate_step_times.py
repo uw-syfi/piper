@@ -57,6 +57,52 @@ def _result_dict(result) -> dict:
     }
 
 
+def _comparison_dict(comparison) -> dict:
+    """Serialize the no-resampling profile-mode comparison summary."""
+
+    return {
+        "interference_free": _result_dict(comparison.interference_free),
+        "normal": _result_dict(comparison.normal),
+        "statistics_us": {
+            "interference_free": comparison.interference_free_statistics.to_dict(),
+            "normal": comparison.normal_statistics.to_dict(),
+            "actual": (
+                None
+                if comparison.actual_statistics is None
+                else comparison.actual_statistics.to_dict()
+            ),
+            "instrumented_normal_profile": (
+                None
+                if comparison.instrumented_normal_statistics is None
+                else comparison.instrumented_normal_statistics.to_dict()
+            ),
+        },
+        "normal_prediction_error_pct": (
+            None
+            if comparison.normal_prediction_error is None
+            else comparison.normal_prediction_error.signed_pct
+        ),
+        "normal_absolute_error_pct": (
+            None
+            if comparison.normal_prediction_error is None
+            else comparison.normal_prediction_error.absolute_pct
+        ),
+        "predicted_interference_reduction_pct": (
+            comparison.predicted_interference_reduction_pct
+        ),
+        "dependency_replay_interference_reduction_pct": (
+            comparison.dependency_replay_interference_reduction_pct
+        ),
+        "dependency_replay_absolute_savings_us": (
+            comparison.dependency_replay_absolute_savings_us
+        ),
+        "dependency_replay_savings_statistics": (
+            comparison.dependency_replay_savings_statistics.to_dict()
+        ),
+        "profile_event_overhead_pct": comparison.profile_event_overhead_pct,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replay normal and interference-free Piper step-time profiles"
@@ -101,47 +147,7 @@ def main() -> None:
             or None,
             strict=not args.no_strict,
         )
-        payload = {
-            "interference_free": _result_dict(comparison.interference_free),
-            "normal": _result_dict(comparison.normal),
-            "statistics_us": {
-                "interference_free": comparison.interference_free_statistics.to_dict(),
-                "normal": comparison.normal_statistics.to_dict(),
-                "actual": (
-                    None
-                    if comparison.actual_statistics is None
-                    else comparison.actual_statistics.to_dict()
-                ),
-                "instrumented_normal_profile": (
-                    None
-                    if comparison.instrumented_normal_statistics is None
-                    else comparison.instrumented_normal_statistics.to_dict()
-                ),
-            },
-            "normal_prediction_error_pct": (
-                None
-                if comparison.normal_prediction_error is None
-                else comparison.normal_prediction_error.signed_pct
-            ),
-            "normal_absolute_error_pct": (
-                None
-                if comparison.normal_prediction_error is None
-                else comparison.normal_prediction_error.absolute_pct
-            ),
-            "predicted_interference_reduction_pct": (
-                comparison.predicted_interference_reduction_pct
-            ),
-            "dependency_replay_interference_reduction_pct": (
-                comparison.dependency_replay_interference_reduction_pct
-            ),
-            "dependency_replay_interference_reduction_samples_pct": list(
-                comparison.dependency_replay_interference_reduction_samples_pct
-            ),
-            "dependency_replay_interference_reduction_statistics": (
-                comparison.dependency_replay_interference_reduction_statistics.to_dict()
-            ),
-            "profile_event_overhead_pct": comparison.profile_event_overhead_pct,
-        }
+        payload = _comparison_dict(comparison)
     else:
         payload = _result_dict(
             simulate_training_step(

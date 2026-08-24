@@ -8,6 +8,19 @@ from typing import Any, Mapping, Sequence
 from .profiling import NORMAL_PROFILE_MODE, estimate_profile_time
 
 
+_ROUTED_RENDEZVOUS_KINDS = frozenset(
+    {"A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"}
+)
+_RENDEZVOUS_COLLECTIVE_KINDS = frozenset(
+    {
+        "REDUCE_COMM",
+        "ALL_REDUCE_COMM",
+        "ALL_GATHER_COMM",
+        "REDUCE_SCATTER_COMM",
+    }
+) | _ROUTED_RENDEZVOUS_KINDS
+
+
 class ProfileAndSimulateValidationError(ValueError):
     """Raised when a mandatory profile-and-simulate invariant fails."""
 
@@ -31,9 +44,21 @@ def validate_kineto_profile_results(
     checked_nodes = 0
     checked_occurrences = 0
     checked_launches = 0
-    if not bool(activity_equivalence.get("exact_match", False)):
+    accepted_capture_loss = bool(
+        activity_equivalence.get("capture_loss_within_tolerance", False)
+        and activity_equivalence.get("accepted", False)
+    )
+    activity_identity_accepted = bool(
+        activity_equivalence.get(
+            "accepted", activity_equivalence.get("exact_match", False)
+        )
+    )
+    collective_activity_presence: dict[
+        tuple[str, str, str, int], list[tuple[int, str, bool]]
+    ] = {}
+    if not activity_identity_accepted:
         errors.append(
-            "normal/IF GPU activity identity differs for "
+            "normal/IF launch or GPU activity identity differs or is not accepted for "
             f"{activity_equivalence.get('mismatched_node_ranges', 0)} "
             "node-range occurrences"
         )
@@ -57,7 +82,7 @@ def validate_kineto_profile_results(
             launch_count = int(audit.get("launch_count", 0))
             matched = int(audit.get("matched_launch_count", 0))
             checked_launches += launch_count
-            if unmatched or matched != launch_count:
+            if (unmatched or matched != launch_count) and not accepted_capture_loss:
                 errors.append(
                     f"mode={result.profile_mode} rank={result.global_rank} "
                     f"uid={uid}: launch coverage {matched}/{launch_count}, "
@@ -83,7 +108,33 @@ def validate_kineto_profile_results(
                     f"ranges={range_count}"
                 )
             source = audit.get("simulator_duration_source")
+            node_kind = str(audit.get("node_kind", ""))
+            comm_id = audit.get("comm_id")
+            if node_kind in _RENDEZVOUS_COLLECTIVE_KINDS and comm_id is None:
+                errors.append(
+                    f"mode={result.profile_mode} rank={result.global_rank} "
+                    f"uid={uid}: collective audit has no comm_id"
+                )
             for occurrence_index, occurrence in enumerate(occurrences):
+                if (
+                    node_kind in _RENDEZVOUS_COLLECTIVE_KINDS
+                    and comm_id is not None
+                ):
+                    collective_activity_presence.setdefault(
+                        (
+                            str(result.profile_mode),
+                            node_kind,
+                            str(comm_id),
+                            occurrence_index,
+                        ),
+                        [],
+                    ).append(
+                        (
+                            int(result.global_rank),
+                            str(uid),
+                            int(occurrence.get("activity_count", 0)) > 0,
+                        )
+                    )
                 activity_sum = float(
                     occurrence.get("activity_time_sum_us", 0.0)
                 )
@@ -159,6 +210,17 @@ def validate_kineto_profile_results(
                     "sample estimator"
                 )
 
+    for (mode, node_kind, comm_id, occurrence), endpoints in sorted(
+        collective_activity_presence.items()
+    ):
+        activity_states = {has_activity for _rank, _uid, has_activity in endpoints}
+        if len(activity_states) > 1 and node_kind not in _ROUTED_RENDEZVOUS_KINDS:
+            errors.append(
+                f"mode={mode} {node_kind} comm_id={comm_id!r} "
+                f"occurrence={occurrence}: collective endpoints mix zero and "
+                f"nonzero GPU activity: {endpoints!r}"
+            )
+
     report = {
         "name": "kineto_activity_and_timing",
         "passed": not errors,
@@ -168,6 +230,34 @@ def validate_kineto_profile_results(
         "checked_launches": checked_launches,
         "exact_activity_match": bool(
             activity_equivalence.get("exact_match", False)
+        ),
+        "accepted_capture_loss": accepted_capture_loss,
+        "capture_loss_only": bool(
+            activity_equivalence.get("capture_loss_only", False)
+        ),
+        "capture_loss_rate": float(
+            activity_equivalence.get("capture_loss_rate", 0.0)
+        ),
+        "capture_loss_threshold": float(
+            activity_equivalence.get("capture_loss_threshold", 0.0)
+        ),
+        "expected_gpu_activity_records": int(
+            activity_equivalence.get("expected_gpu_activity_records", 0)
+        ),
+        "missing_gpu_activity_records": int(
+            activity_equivalence.get("missing_gpu_activity_records", 0)
+        ),
+        "cpu_launch_loss_rate": float(
+            activity_equivalence.get("cpu_launch_loss_rate", 0.0)
+        ),
+        "cpu_launch_loss_threshold": float(
+            activity_equivalence.get("cpu_launch_loss_threshold", 0.0)
+        ),
+        "expected_cpu_launch_records": int(
+            activity_equivalence.get("expected_cpu_launch_records", 0)
+        ),
+        "missing_cpu_launch_records": int(
+            activity_equivalence.get("missing_cpu_launch_records", 0)
         ),
         "mismatched_node_ranges": int(
             activity_equivalence.get("mismatched_node_ranges", 0)

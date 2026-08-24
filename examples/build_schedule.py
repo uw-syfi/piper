@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Mapping, Sequence
 
 Pass = Literal["F", "B", "BI", "BW"]
 
@@ -325,6 +325,236 @@ def build_dualpipev_schedule(n_ranks: int, n_mbs: int) -> list[dict]:
             drain_w()
 
     return [_order_directive_from_slots(row) for row in rows]
+
+
+@dataclass(frozen=True)
+class _AFPipeRegion:
+    """One ordered model region in the disaggregated A/F pipeline."""
+
+    tag: dict[str, int]
+    order_filter: dict[str, int | str]
+    devices: tuple[int, ...]
+
+
+def build_afpipe_baseline_schedule(
+    place_directives: Sequence[Mapping],
+    n_mbs: int,
+    n_layers: int,
+    *,
+    expected_actor_groups: int | None = None,
+) -> list[dict]:
+    """Build a safe actor-local AF-Pipe baseline order.
+
+    The logical forward path is::
+
+        input, ATTN0, FFN0, ..., ATTN_L, output
+
+    where ``ATTN_L`` is the dense tail after the final expert block.  Adjacent
+    regions placed on the same device set form one local pipeline chunk.  Each
+    chunk runs all of its microbatches in the forward direction, then chunks
+    are visited in reverse for backward.  This deliberately conservative
+    baseline provides a valid, non-overlapping order and connects all chunks
+    owned by an actor group.  More aggressive AF-Pipe 1F1B policies can replace
+    the ordering without changing placement or communication lowering.
+
+    ``place_directives`` is used as the source of truth for actor ownership;
+    neither ATTN nor FFN group counts are inferred from GPU ordinals.
+    """
+    _validate_positive("n_mbs", n_mbs)
+    _validate_positive("n_layers", n_layers)
+    if expected_actor_groups is not None:
+        _validate_positive("expected_actor_groups", expected_actor_groups)
+
+    places = [directive for directive in place_directives if directive.get("op") == "place"]
+    if not places:
+        raise ValueError("afpipe requires at least one place directive")
+
+    n_pp_stages = _num_pp_stages(places)
+
+    def make_region(
+        tag: dict[str, int],
+        order_filter: dict[str, int | str],
+    ) -> _AFPipeRegion:
+        return _AFPipeRegion(
+            tag=tag,
+            order_filter=order_filter,
+            devices=_resolve_region_devices(tag, places),
+        )
+
+    regions: list[_AFPipeRegion] = [
+        make_region(
+            {"PP": 0},
+            {"PP": 0, "ATTN": "-", "FFN": "-"},
+        )
+    ]
+    for layer in range(n_layers):
+        pp = _layer_pp_stage(layer, n_layers, n_pp_stages)
+        regions.append(make_region({"PP": pp, "ATTN": layer}, {"ATTN": layer}))
+        regions.append(make_region({"PP": pp, "FFN": layer}, {"FFN": layer}))
+
+    final_pp = _layer_pp_stage(n_layers - 1, n_layers, n_pp_stages)
+    regions.append(
+        make_region(
+            {"PP": final_pp, "ATTN": n_layers},
+            {"ATTN": n_layers},
+        )
+    )
+    regions.append(
+        make_region(
+            {"PP": n_pp_stages - 1},
+            {
+                "PP": n_pp_stages - 1,
+                "ATTN": "-",
+                "FFN": "-",
+            },
+        )
+    )
+
+    # Co-located consecutive regions are one local pipeline chunk.  The same
+    # actor group may own multiple non-consecutive chunks.
+    chunks: list[list[_AFPipeRegion]] = []
+    for region in regions:
+        if chunks and chunks[-1][-1].devices == region.devices:
+            chunks[-1].append(region)
+        else:
+            chunks.append([region])
+
+    actor_order: list[tuple[int, ...]] = []
+    rows: dict[tuple[int, ...], list[dict[str, int | str]]] = {}
+    for region in regions:
+        if region.devices not in rows:
+            actor_order.append(region.devices)
+            rows[region.devices] = []
+
+    if expected_actor_groups is not None and len(rows) != expected_actor_groups:
+        raise ValueError(
+            "AF-Pipe placement actor-group count does not match --ranks: "
+            f"placement has {len(rows)} distinct device sets {actor_order}, "
+            f"but --ranks={expected_actor_groups}"
+        )
+
+    def append_op(region: _AFPipeRegion, mb: int, pass_: Pass) -> None:
+        rows[region.devices].append(
+            {**region.order_filter, "MB": mb, "PASS": pass_}
+        )
+
+    for chunk in chunks:
+        for mb in range(n_mbs):
+            for region in chunk:
+                append_op(region, mb, "F")
+
+    for chunk in reversed(chunks):
+        for mb in range(n_mbs):
+            for region in reversed(chunk):
+                append_op(region, mb, "B")
+
+    return [
+        {"op": "order", "filters": [[flt] for flt in rows[devices]]}
+        for devices in actor_order
+    ]
+
+
+def infer_afpipe_num_layers(
+    place_directives: Sequence[Mapping],
+    *,
+    fallback: int | None = None,
+) -> int:
+    """Infer the AFD layer count from exact placement filters when possible.
+
+    AFD emits ``FFN0 .. FFN_(L-1)`` and ``ATTN0 .. ATTN_L``.  Wildcard-only
+    placements do not encode ``L`` and therefore require ``fallback``.
+    """
+    exact_attn: list[int] = []
+    exact_ffn: list[int] = []
+    for directive in place_directives:
+        if directive.get("op") != "place":
+            continue
+        spec = directive.get("filter")
+        if not isinstance(spec, Mapping):
+            continue
+        if isinstance(spec.get("ATTN"), int):
+            exact_attn.append(int(spec["ATTN"]))
+        if isinstance(spec.get("FFN"), int):
+            exact_ffn.append(int(spec["FFN"]))
+
+    candidates: list[int] = []
+    if exact_attn:
+        candidates.append(max(exact_attn))
+    if exact_ffn:
+        candidates.append(max(exact_ffn) + 1)
+    if candidates and any(candidate != candidates[0] for candidate in candidates):
+        raise ValueError(
+            "AF-Pipe placement encodes inconsistent layer counts: "
+            f"ATTN indices={sorted(set(exact_attn))}, "
+            f"FFN indices={sorted(set(exact_ffn))}"
+        )
+    if candidates:
+        _validate_positive("inferred n_layers", candidates[0])
+        return candidates[0]
+    if fallback is None:
+        raise ValueError(
+            "cannot infer AF-Pipe layer count from wildcard placement; "
+            "provide n_layers"
+        )
+    _validate_positive("fallback n_layers", fallback)
+    return fallback
+
+
+def _num_pp_stages(place_directives: Sequence[Mapping]) -> int:
+    pp_indices: set[int] = set()
+    for directive in place_directives:
+        spec = directive.get("filter")
+        if isinstance(spec, Mapping) and isinstance(spec.get("PP"), int):
+            pp_indices.add(int(spec["PP"]))
+    if not pp_indices:
+        raise ValueError("AF-Pipe placement must contain exact PP endpoint filters")
+    if min(pp_indices) != 0:
+        raise ValueError(f"AF-Pipe PP indices must start at 0, got {sorted(pp_indices)}")
+    return max(pp_indices) + 1
+
+
+def _layer_pp_stage(layer: int, n_layers: int, n_pp_stages: int) -> int:
+    for stage in range(n_pp_stages):
+        if stage * n_layers // n_pp_stages <= layer < (stage + 1) * n_layers // n_pp_stages:
+            return stage
+    raise ValueError(
+        f"layer {layer} is not owned by any of {n_pp_stages} PP stages "
+        f"for a {n_layers}-layer model"
+    )
+
+
+def _resolve_region_devices(
+    tag: Mapping[str, int],
+    place_directives: Sequence[Mapping],
+) -> tuple[int, ...]:
+    matches: list[tuple[int, ...]] = []
+    for directive in place_directives:
+        spec = directive.get("filter")
+        if not isinstance(spec, Mapping) or not _matches_place_filter(tag, spec):
+            continue
+        devices = directive.get("devices", directive.get("device"))
+        if not isinstance(devices, list) or not devices:
+            raise ValueError(f"place directive requires non-empty devices: {directive}")
+        matches.append(tuple(sorted(int(device) for device in devices)))
+    if len(matches) != 1:
+        raise ValueError(
+            f"AF-Pipe region {dict(tag)} must match exactly one place directive, "
+            f"matched {len(matches)} device sets: {matches}"
+        )
+    return matches[0]
+
+
+def _matches_place_filter(tag: Mapping[str, int], spec: Mapping) -> bool:
+    for key, expected in spec.items():
+        if expected == "*":
+            if key not in tag:
+                return False
+        elif expected == "-":
+            if key in tag:
+                return False
+        elif tag.get(key) != expected:
+            return False
+    return True
 
 
 def _validate_positive(name: str, value: int) -> None:

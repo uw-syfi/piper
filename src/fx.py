@@ -84,6 +84,27 @@ def _is_op_overload(obj):
     )
 
 
+def _serialize_torch_op(path, target):
+    """Serialize an operator and, for custom ops, its registration module.
+
+    A custom ``torch.library`` operator does not exist in a fresh actor process
+    until the Python module that defines it has been imported.  Carry that
+    module generically instead of teaching Piper about individual model ops.
+    """
+    payload = {"kind": "torch_op", "path": path}
+    try:
+        from torch._library.custom_ops import _maybe_get_opdef
+
+        opdef = _maybe_get_opdef(target)
+    except (ImportError, AttributeError, TypeError):
+        opdef = None
+    init_fn = getattr(opdef, "_init_fn", None)
+    registration_module = getattr(init_fn, "__module__", None)
+    if registration_module:
+        payload["registration_module"] = registration_module
+    return payload
+
+
 def _serialize_target(t):
     if isinstance(t, str):
         return {"kind": "string", "value": t}
@@ -91,7 +112,7 @@ def _serialize_target(t):
     target_str = str(t)
     if target_str.startswith("torch.ops."):
         path = target_str[len("torch.ops."):]
-        return {"kind": "torch_op", "path": path}
+        return _serialize_torch_op(path, t)
 
     if getattr(t, "__module__", "") == "torch._VariableFunctionsClass":
         public_name = t.__name__
@@ -100,7 +121,7 @@ def _serialize_target(t):
         raise ValueError(f"No public torch alias for {t}")
 
     if _is_op_overload(t) or getattr(t, "__module__", "").startswith("torch._ops"):
-        return {"kind": "torch_op", "path": str(t)}
+        return _serialize_torch_op(str(t), t)
 
     if inspect.isfunction(t) or inspect.isbuiltin(t):
         mod = inspect.getmodule(t)
@@ -111,12 +132,12 @@ def _serialize_target(t):
                 target_str = str(t)
                 if target_str.startswith("torch.ops."):
                     path = target_str[len("torch.ops."):]
-                    return {"kind": "torch_op", "path": path}
+                    return _serialize_torch_op(path, t)
                 module_parts = mod_name.split(".")
                 if len(module_parts) >= 3:
                     namespace = module_parts[2]
                     path = f"{namespace}.{t.__name__}"
-                    return {"kind": "torch_op", "path": path}
+                    return _serialize_torch_op(path, t)
 
         if t.__name__ == "apply":
             qualname = getattr(t, "__qualname__", "")
@@ -212,14 +233,9 @@ def _deserialize_target(payload):
     if kind == "torch_op":
         obj = torch.ops
         path = payload["path"]
-        if path == "piper_artifact.bmm_experts":
-            # The Qwen artifact model defines this model-specific custom op.
-            for module_name in ("models.qwen3", "examples.models.qwen3"):
-                try:
-                    importlib.import_module(module_name)
-                    break
-                except ImportError:
-                    pass
+        registration_module = payload.get("registration_module")
+        if registration_module:
+            importlib.import_module(registration_module)
         try:
             for part in path.split("."):
                 obj = getattr(obj, part)
@@ -353,6 +369,8 @@ class AnnotationSegment:
     param_idxs: list[int]
     graphargs: list[Any]
     placeholders: list[fx.Node]
+    runtime_input_values: list[dict[str, Any]]
+    runtime_output_values: list[dict[str, Any]]
     a2a_boundary_after: dict[str, Any] | None = None
 
 
@@ -408,6 +426,22 @@ def _iter_arg_nodes(arg: Any) -> list[fx.Node]:
 
 def _example_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
+
+
+def _is_symbolic_scalar(value: Any) -> bool:
+    return isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool))
+
+
+def _symbolic_expression_key(value: Any) -> tuple[type, Any] | None:
+    if not _is_symbolic_scalar(value):
+        return None
+    expr = getattr(getattr(value, "node", None), "expr", None)
+    if expr is None:
+        return None
+    # SymPy expressions are immutable/hashable. Structural equality identifies
+    # two occurrences of the same captured ShapeEnv value without parsing
+    # names or depending on a printed representation.
+    return type(value), expr
 
 
 def _placeholder_is_runtime_input(node: fx.Node) -> bool:
@@ -502,7 +536,7 @@ def _tag_from_stack(stack: tuple[dict[str, int], ...]) -> dict[str, int]:
     return tag
 
 
-def _ep_boundary_role(node: fx.Node) -> str | None:
+def _routed_boundary_role(node: fx.Node) -> str | None:
     custom = node.meta.get("custom")
     if not isinstance(custom, dict):
         return None
@@ -511,20 +545,20 @@ def _ep_boundary_role(node: fx.Node) -> str | None:
         return None
     if role not in _EP_BOUNDARY_ROLES:
         raise ValueError(
-            f"FX node {node.name!r} has invalid Piper EP boundary role {role!r}"
+            f"FX node {node.name!r} has invalid Piper routed boundary role {role!r}"
         )
     if (
         node.op != "call_function"
         or node.target is not torch.ops.aten.alias.default
     ):
         raise ValueError(
-            f"Piper EP boundary role {role!r} must annotate an aten.alias node; "
+            f"Piper routed boundary role {role!r} must annotate an aten.alias node; "
             f"got node {node.name!r} with op={node.op!r}, target={node.target!r}"
         )
     return role
 
 
-def _require_ep_boundary_roles(
+def _require_routed_boundary_roles(
     nodes: list[fx.Node],
     required_roles: tuple[str, ...],
     *,
@@ -533,7 +567,7 @@ def _require_ep_boundary_roles(
 ) -> dict[str, int]:
     marked: dict[str, list[tuple[int, str]]] = {}
     for idx, node in enumerate(nodes):
-        role = _ep_boundary_role(node)
+        role = _routed_boundary_role(node)
         if role is not None:
             marked.setdefault(role, []).append((idx, node.name))
 
@@ -545,7 +579,7 @@ def _require_ep_boundary_roles(
     }
     if unexpected:
         raise ValueError(
-            f"EP boundary {from_tag}->{to_tag} has marker roles in the wrong "
+            f"Routed boundary {from_tag}->{to_tag} has marker roles in the wrong "
             f"location: {unexpected}"
         )
 
@@ -554,121 +588,286 @@ def _require_ep_boundary_roles(
         matches = marked.get(role, [])
         if len(matches) != 1:
             raise ValueError(
-                f"EP boundary {from_tag}->{to_tag} requires exactly one "
+                f"Routed boundary {from_tag}->{to_tag} requires exactly one "
                 f"{_EP_BOUNDARY_APIS[role]}(...) tensor, found {len(matches)}"
             )
         indices[role] = matches[0][0]
     return indices
 
 
-def _externalize_torchtitan_expert_dispatch(
-    gm: fx.GraphModule,
-    *,
-    routed_input_idx: int,
-    routing_counts_idx: int,
-) -> None:
-    """Make a split expert graph consume TorchTitan-dispatched tensors.
-
-    The unsharded model capture includes ``indices_padding_wrapper`` inside
-    ``GroupedExperts``. TorchTitan EP normally disables that wrapper because
-    ``ExpertParallel._token_dispatch`` has already permuted and padded the
-    local expert groups. Piper keeps dispatch as an explicit DAG node, so
-    remove the captured duplicate wrapper and leave the default grouped GEMM.
-
-    This is the split-graph equivalent of TorchTitan's DTensor EP branch:
-    counts drive grouped-MM offsets directly and the expert result flows
-    directly to the external combine node.
-    """
-
-    graph = gm.graph
-    placeholders = [node for node in graph.nodes if node.op == "placeholder"]
-    if (
-        routed_input_idx >= len(placeholders)
-        or routing_counts_idx >= len(placeholders)
-    ):
+def _validate_routed_marker_tensor(node: fx.Node, role: str) -> torch.Tensor:
+    """Validate the placement-independent tensor contract of a route marker."""
+    value = _example_value(node)
+    api_name = _EP_BOUNDARY_APIS[role]
+    if not isinstance(value, torch.Tensor):
         raise ValueError(
-            "EP boundary indices do not match expert graph placeholders: "
-            f"routed_input_idx={routed_input_idx}, "
-            f"routing_counts_idx={routing_counts_idx}, "
-            f"num_placeholders={len(placeholders)}"
+            f"{api_name}(...) on FX node {node.name!r} is missing tensor "
+            "example metadata; routed marker schemas must be known while "
+            "building the annotated graph"
         )
 
-    routed_input = placeholders[routed_input_idx]
-    routing_counts = placeholders[routing_counts_idx]
-    grouped_mms = [
-        node
-        for node in graph.nodes
-        if node.op == "call_function" and node.target is torch._grouped_mm
-    ]
-    if not grouped_mms:
-        # The optional for-loop implementation has no grouped-mm padding path.
-        return
-    if len(grouped_mms) != 3:
-        raise ValueError(
-            "Expected TorchTitan SwiGLU experts to contain three grouped MM "
-            f"operations, found {len(grouped_mms)}"
-        )
-
-    offsets = grouped_mms[0].kwargs.get("offs")
-    input_cast = grouped_mms[0].args[0]
-    if (
-        not isinstance(offsets, fx.Node)
-        or offsets.op != "call_function"
-        or offsets.target is not torch.cumsum
-        or not isinstance(input_cast, fx.Node)
-        or input_cast.op != "call_method"
-        or not input_cast.args
-        or not isinstance(input_cast.args[0], fx.Node)
-    ):
-        raise ValueError("Unrecognized TorchTitan grouped-expert FX graph")
-
-    padded_input = input_cast.args[0]
-    padded_input.replace_all_uses_with(routed_input)
-    offsets.args = (routing_counts, *offsets.args[1:])
-
-    final_grouped_mm = grouped_mms[-1]
-    expert_outputs = [
-        user
-        for user in final_grouped_mm.users
-        if user.op == "call_method" and user.target == "type_as"
-    ]
-    combine_markers = [
-        node
-        for node in graph.nodes
-        if node.op == "call_function"
-        and node.target is torch.ops.aten.alias.default
-        and _ep_boundary_role(node) == EP_COMBINE_PAYLOAD
-    ]
-    if (
-        len(expert_outputs) != 1
-        or len(combine_markers) != 1
-        or not combine_markers[0].args
-        or not isinstance(combine_markers[0].args[0], fx.Node)
-    ):
-        raise ValueError(
-            "Could not connect TorchTitan grouped-expert output to "
-            "mark_combine_payload: "
-            f"grouped={len(expert_outputs)}, markers={len(combine_markers)}"
-        )
-    marked_output = combine_markers[0].args[0]
-    marked_output.replace_all_uses_with(expert_outputs[0])
-
-    # The captured Triton mutation is intentionally gone: the external
-    # dispatcher runs TorchTitan's generate_permute_indices kernel in its own
-    # strict compiled frame.
-    for node in list(graph.nodes):
-        if (
-            node.op == "call_function"
-            and (
-                "triton_kernel_wrapper_mutation" in str(node.target)
-                or node.target is operator.setitem
-                or node.target is torch._C._set_grad_enabled
+    if role == EP_DISPATCH_COUNTS:
+        if value.ndim != 2:
+            raise ValueError(
+                f"{api_name}(...) requires a 2-D "
+                "[source_blocks, local_routes] count tensor, got "
+                f"shape={tuple(value.shape)} on FX node {node.name!r}"
             )
+        if (
+            value.dtype == torch.bool
+            or value.dtype.is_floating_point
+            or value.dtype.is_complex
         ):
-            graph.erase_node(node)
-    graph.eliminate_dead_code()
-    graph.lint()
-    gm.recompile()
+            raise ValueError(
+                f"{api_name}(...) requires an integer count tensor, got "
+                f"dtype={value.dtype} on FX node {node.name!r}"
+            )
+        if value.requires_grad:
+            raise ValueError(
+                f"{api_name}(...) requires non-differentiable route counts, "
+                f"but FX node {node.name!r} has requires_grad=True"
+            )
+        shape = _concrete_tensor_shape(value)
+        if shape is None or shape[1] <= 0:
+            raise ValueError(
+                f"{api_name}(...) requires a statically known, positive route-axis "
+                f"width, got shape={tuple(value.shape)} on FX node {node.name!r}"
+            )
+        # Dynamo normally records FakeTensor metadata, which intentionally has
+        # no data. Shape propagation and hand-built FX graphs may retain a
+        # concrete tensor; reject negative counts as early as possible there.
+        if value.device.type != "meta" and not hasattr(value, "fake_mode"):
+            try:
+                has_negative = bool(torch.any(value < 0).item())
+            except (RuntimeError, TypeError):
+                has_negative = False
+            if has_negative:
+                raise ValueError(
+                    f"{api_name}(...) requires nonnegative route counts on FX "
+                    f"node {node.name!r}"
+                )
+    else:
+        if value.ndim != 2:
+            raise ValueError(
+                f"{api_name}(...) requires a 2-D [tokens, hidden] payload "
+                f"tensor, got shape={tuple(value.shape)} on FX node "
+                f"{node.name!r}"
+            )
+    return value
+
+
+def _concrete_tensor_shape(value: torch.Tensor) -> tuple[int, ...] | None:
+    """Return a shape only when comparing it cannot create symbolic guards."""
+    shape = tuple(value.shape)
+    if not all(type(dim) is int for dim in shape):
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _routed_tensor_schema(value: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": _concrete_tensor_shape(value),
+        "rank": int(value.ndim),
+        "dtype": str(value.dtype),
+        "requires_grad": bool(value.requires_grad),
+    }
+
+
+def _runtime_value_descriptor(
+    node: fx.Node,
+    *,
+    source_segment_id: int | None,
+) -> dict[str, Any]:
+    """Describe one runtime FX value without relying on generated ABI names."""
+    value = _example_value(node)
+    descriptor: dict[str, Any] = {
+        "value_id": node.name,
+        "source_segment_id": source_segment_id,
+        "is_tensor": isinstance(value, torch.Tensor),
+    }
+    if isinstance(value, torch.Tensor):
+        descriptor["schema"] = _routed_tensor_schema(value)
+    else:
+        descriptor["schema"] = {"python_type": type(value).__name__}
+    return descriptor
+
+
+def _is_fx_ancestor(ancestor: fx.Node, descendant: fx.Node) -> bool:
+    pending = list(descendant.all_input_nodes)
+    seen: set[fx.Node] = set()
+    while pending:
+        node = pending.pop()
+        if node is ancestor:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        pending.extend(node.all_input_nodes)
+    return False
+
+
+def _validate_routed_region_interfaces(
+    *,
+    nodes: list[fx.Node],
+    seg_cross_in: list[list[fx.Node]],
+    segments: list[AnnotationSegment],
+    routed_segment_ids: set[int],
+    node_seg: dict[fx.Node, int],
+) -> None:
+    """Validate the route-marker grammar before placement/DAG lowering.
+
+    A routed region has one immediately adjacent dispatch boundary and one
+    immediately adjacent combine boundary. Its payload/count ranks and graph
+    dependency are fixed by the routed collective runtime.
+
+    These constraints follow solely from FX annotation and marker placement,
+    so reporting them here is both earlier and independent of schedule tags.
+    Buffer-layout constraints used only by cross-group communication are
+    deliberately validated later, once placement is known.
+    """
+    marker_boundaries: dict[fx.Node, list[int]] = defaultdict(list)
+    for boundary_idx, crossing_nodes in enumerate(seg_cross_in[1:]):
+        for node in crossing_nodes:
+            if _routed_boundary_role(node) is not None:
+                marker_boundaries[node].append(boundary_idx)
+
+    marker_nodes = [node for node in nodes if _routed_boundary_role(node) is not None]
+    for node in marker_nodes:
+        boundary_ids = marker_boundaries.get(node, [])
+        role = _routed_boundary_role(node)
+        assert role is not None
+        if len(boundary_ids) != 1:
+            raise ValueError(
+                f"{_EP_BOUNDARY_APIS[role]}(...) on FX node {node.name!r} must "
+                "cross exactly one adjacent annotation boundary, but crosses "
+                f"{len(boundary_ids)} boundaries"
+            )
+        _validate_routed_marker_tensor(node, role)
+
+    for seg in sorted(routed_segment_ids):
+        incoming = segments[seg - 1].a2a_boundary_after
+        outgoing = segments[seg].a2a_boundary_after
+        assert isinstance(incoming, dict) and isinstance(outgoing, dict)
+        route = (
+            f"{incoming.get('from_tag')}->{segments[seg].tag}->"
+            f"{outgoing.get('to_tag')}"
+        )
+        inputs = seg_cross_in[seg]
+        outputs = seg_cross_in[seg + 1]
+        dispatch_idx = incoming.get("tensor_idx")
+        counts_idx = incoming.get("routing_counts_idx")
+        combine_idx = outgoing.get("tensor_idx")
+        assert isinstance(dispatch_idx, int) and not isinstance(dispatch_idx, bool)
+        assert isinstance(counts_idx, int) and not isinstance(counts_idx, bool)
+        assert isinstance(combine_idx, int) and not isinstance(combine_idx, bool)
+        dispatch_node = inputs[dispatch_idx]
+        counts_node = inputs[counts_idx]
+        combine_node = outputs[combine_idx]
+        dispatch_value = _validate_routed_marker_tensor(
+            dispatch_node, EP_DISPATCH_PAYLOAD
+        )
+        counts_value = _validate_routed_marker_tensor(
+            counts_node, EP_DISPATCH_COUNTS
+        )
+        combine_value = _validate_routed_marker_tensor(
+            combine_node, EP_COMBINE_PAYLOAD
+        )
+
+        incoming["payload_schema"] = _routed_tensor_schema(dispatch_value)
+        incoming["routing_counts_schema"] = _routed_tensor_schema(counts_value)
+        outgoing["payload_schema"] = _routed_tensor_schema(combine_value)
+        if not _is_fx_ancestor(dispatch_node, combine_node):
+            raise ValueError(
+                f"Routed region {route} must compute its combine payload from "
+                f"its dispatch payload; FX node {dispatch_node.name!r} is not "
+                f"an ancestor of {combine_node.name!r}"
+            )
+        if not _is_fx_ancestor(counts_node, combine_node):
+            raise ValueError(
+                f"Routed region {route} must compute its combine payload from "
+                f"its route counts; FX node {counts_node.name!r} is not an "
+                f"ancestor of {combine_node.name!r}"
+            )
+
+        # Bypassing values may cross either physical boundary, but the routed
+        # segment itself has a deliberately closed dynamic activation ABI.
+        # Parameters, buffers, and constants are lifted separately and do not
+        # appear in these crossing-value lists.
+        consumed_inputs = {
+            node
+            for node in inputs
+            if any(node_seg.get(user) == seg for user in node.users)
+        }
+        expected_inputs = {dispatch_node, counts_node}
+        if consumed_inputs != expected_inputs:
+            unexpected = sorted(
+                node.name for node in consumed_inputs - expected_inputs
+            )
+            missing = sorted(node.name for node in expected_inputs - consumed_inputs)
+            raise ValueError(
+                f"Routed region {route} must have exactly "
+                "mark_dispatch_payload(...) and mark_dispatch_counts(...) as "
+                "its dynamic activation inputs; "
+                f"unexpected={unexpected}, missing={missing}"
+            )
+
+        produced_outputs = {
+            node for node in outputs if node_seg.get(node) == seg
+        }
+        expected_outputs = {combine_node}
+        if produced_outputs != expected_outputs:
+            unexpected = sorted(
+                node.name for node in produced_outputs - expected_outputs
+            )
+            missing = sorted(node.name for node in expected_outputs - produced_outputs)
+            raise ValueError(
+                f"Routed region {route} must have exactly "
+                "mark_combine_payload(...) as its dynamic activation output; "
+                f"unexpected={unexpected}, missing={missing}"
+            )
+
+        dispatch_shape = _concrete_tensor_shape(dispatch_value)
+        counts_shape = _concrete_tensor_shape(counts_value)
+        combine_shape = _concrete_tensor_shape(combine_value)
+        if (
+            dispatch_shape is not None
+            and combine_shape is not None
+            and dispatch_shape != combine_shape
+        ):
+            raise ValueError(
+                f"Routed region {route} must preserve the concrete payload "
+                "shape across dispatch/combine, got "
+                f"{dispatch_shape} and {combine_shape}"
+            )
+        if dispatch_value.dtype != combine_value.dtype:
+            raise ValueError(
+                f"Routed region {route} must preserve payload dtype across "
+                f"dispatch/combine, got {dispatch_value.dtype} and "
+                f"{combine_value.dtype}"
+            )
+        if dispatch_value.requires_grad and not combine_value.requires_grad:
+            raise ValueError(
+                f"Routed region {route} has a differentiable dispatch payload "
+                "but a non-differentiable combine payload"
+            )
+
+        # Value-dependent checks are possible only for concrete FX metadata.
+        if (
+            counts_shape is not None
+            and dispatch_shape is not None
+            and counts_value.device.type != "meta"
+            and not hasattr(counts_value, "fake_mode")
+        ):
+            try:
+                count_sum = int(counts_value.sum().item())
+            except (RuntimeError, TypeError):
+                count_sum = None
+            if count_sum is not None and count_sum != dispatch_shape[0]:
+                raise ValueError(
+                    f"Routed region {route} requires dispatch payload rows to "
+                    "equal the sum of route counts, got "
+                    f"rows={dispatch_shape[0]}, count_sum={count_sum}"
+                )
 
 
 def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
@@ -680,7 +879,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
     ``{annotation_name: auto_index}``.
     """
     nodes = list(gm.graph.nodes)
-    compute_nodes = [
+    operation_nodes = [
         node for node in nodes
         if node.op not in ("placeholder", "get_attr", "output")
     ]
@@ -688,9 +887,24 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
     node_stacks: dict[fx.Node, tuple[dict[str, int], ...]] = {}
     for node in nodes:
         stack = _validate_and_get_annotation_stack(node)
-        if node in compute_nodes:
+        if node in operation_nodes:
             node_stacks[node] = stack
-            _ep_boundary_role(node)
+            _routed_boundary_role(node)
+
+    # Dynamo emits shape-only scalar helpers outside fx.traceback annotation
+    # scopes when an input dimension is marked dynamic.  They are not model
+    # computation and must not become an extra routed ABI input: each split
+    # subgraph rematerializes the needed expression from one of its tensor
+    # placeholders below.
+    symbolic_shape_nodes = {
+        node
+        for node in operation_nodes
+        if not node_stacks.get(node)
+        and _is_symbolic_scalar(_example_value(node))
+    }
+    compute_nodes = [
+        node for node in operation_nodes if node not in symbolic_shape_nodes
+    ]
 
     annotated_compute = [node for node in compute_nodes if node_stacks.get(node)]
     if not annotated_compute:
@@ -752,10 +966,49 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
     for node in nodes:
         if node not in value_seg:
             continue
+        if _is_symbolic_scalar(_example_value(node)):
+            # Shape scalars are rematerialized from a tensor placeholder in
+            # each consumer segment; they are not part of the dynamic routed
+            # activation ABI.
+            continue
         seg = value_seg[node]
         max_seg = node_max_user_seg[node]
         for target_seg in range(seg + 1, max_seg + 1):
             seg_cross_in[target_seg].append(node)
+
+    # Preserve the real FX producer/consumer relation instead of threading a
+    # live value through every intervening segment ABI.  Values used by the
+    # immediately adjacent segment stay first, which keeps routed marker slots
+    # aligned on both sides of an adjacent boundary; longer bypasses follow in
+    # stable FX order and become explicit non-adjacent DAG dependencies.
+    node_order = {node: index for index, node in enumerate(nodes)}
+    consumer_segs_by_value: dict[fx.Node, set[int]] = defaultdict(set)
+    for node, source_seg in value_seg.items():
+        if _is_symbolic_scalar(_example_value(node)):
+            continue
+        for user in node.users:
+            consumer_seg = _consumer_seg(user)
+            if consumer_seg is not None and consumer_seg > source_seg:
+                consumer_segs_by_value[node].add(consumer_seg)
+
+    seg_direct_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    seg_direct_out: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for node, consumer_segs in consumer_segs_by_value.items():
+        source_seg = value_seg[node]
+        if consumer_segs:
+            seg_direct_out[source_seg].append(node)
+        for consumer_seg in consumer_segs:
+            seg_direct_in[consumer_seg].append(node)
+    for seg in range(n_segs):
+        seg_direct_in[seg].sort(
+            key=lambda node: (-value_seg[node], node_order[node])
+        )
+        seg_direct_out[seg].sort(
+            key=lambda node: (
+                min(consumer_segs_by_value[node]),
+                node_order[node],
+            )
+        )
 
     segments: list[AnnotationSegment] = []
     output_node = next((node for node in nodes if node.op == "output"), None)
@@ -789,13 +1042,13 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 if node in runtime_placeholders:
                     _add_placeholder(node, node.name, is_runtime_input=True)
         else:
-            for node in seg_cross_in[seg]:
+            for node in seg_direct_in[seg]:
                 _add_placeholder(node, f"_xseg_{node.name}", is_runtime_input=True)
 
         seg_compute_nodes = [
             node for node in nodes
             if node.op not in ("placeholder", "get_attr", "output")
-            and node_seg[node] == seg
+            and node_seg.get(node) == seg
         ]
         needed_grapharg_placeholders: set[fx.Node] = set()
         needed_getattrs: set[fx.Node] = set()
@@ -815,6 +1068,8 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
 
         for node in nodes:
             if node in needed_grapharg_placeholders:
+                if _is_symbolic_scalar(_example_value(node)):
+                    continue
                 _add_placeholder(node, node.name, is_runtime_input=False)
 
         for node in nodes:
@@ -824,7 +1079,49 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 new_ga.meta.update(node.meta)
                 remap[node] = new_ga
 
+        def _rematerialize_symbolic(node: fx.Node) -> fx.Node:
+            if node in remap:
+                return remap[node]
+            value_key = _symbolic_expression_key(_example_value(node))
+            if value_key is not None:
+                candidates = list(remap.items())
+                candidates.sort(
+                    key=lambda item: (
+                        0
+                        if _routed_boundary_role(item[0])
+                        in {EP_DISPATCH_PAYLOAD, EP_COMBINE_PAYLOAD}
+                        else 1
+                    )
+                )
+                for original, copied in candidates:
+                    example = _example_value(original)
+                    if not isinstance(example, torch.Tensor):
+                        continue
+                    for dim, size in enumerate(example.shape):
+                        if _symbolic_expression_key(size) == value_key:
+                            size_node = sub_g.call_method("size", (copied, dim))
+                            size_node.meta.update(node.meta)
+                            remap[node] = size_node
+                            return size_node
+
+            if value_key is not None and node.op != "placeholder":
+                for dep in node.all_input_nodes:
+                    if dep not in remap:
+                        _rematerialize_symbolic(dep)
+                copied = sub_g.node_copy(node, arg_transform=lambda x: remap[x])
+                remap[node] = copied
+                return copied
+            raise KeyError(node)
+
+        def _ensure_dependency(node: fx.Node) -> None:
+            if node in remap or node_seg.get(node) == seg:
+                return
+            if _is_symbolic_scalar(_example_value(node)):
+                _rematerialize_symbolic(node)
+
         for node in seg_compute_nodes:
+            for dep in [*node.all_input_nodes, *_iter_arg_nodes(node.kwargs)]:
+                _ensure_dependency(dep)
             missing = [dep.name for dep in node.all_input_nodes if dep not in remap and node_seg.get(dep) != seg]
             if missing:
                 raise ValueError(
@@ -837,10 +1134,12 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             if output_node is None:
                 sub_g.output(())
             else:
+                for dep in _iter_arg_nodes(output_node.args):
+                    _ensure_dependency(dep)
                 sub_g.output(fx.map_arg(output_node.args[0], lambda x: remap[x]))
             boundary_after = None
         else:
-            out_nodes = [remap[node] for node in seg_cross_in[seg + 1]]
+            out_nodes = [remap[node] for node in seg_direct_out[seg]]
             sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
             from_tag = _tag_from_stack(segment_stacks[seg])
             to_tag = _tag_from_stack(segment_stacks[seg + 1])
@@ -850,30 +1149,47 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 "from_tag": from_tag,
                 "to_tag": to_tag,
             }
-            enters_ep = "EP" not in from_tag and "EP" in to_tag
-            exits_ep = "EP" in from_tag and "EP" not in to_tag
-            crossing_nodes = seg_cross_in[seg + 1]
-            if enters_ep:
-                indices = _require_ep_boundary_roles(
+            crossing_nodes = seg_direct_out[seg]
+            marker_roles = {
+                role
+                for node in crossing_nodes
+                for role in [_routed_boundary_role(node)]
+                if role is not None
+            }
+            dispatch_roles = {
+                EP_DISPATCH_PAYLOAD,
+                EP_DISPATCH_COUNTS,
+            }
+            has_dispatch = bool(marker_roles & dispatch_roles)
+            has_combine = EP_COMBINE_PAYLOAD in marker_roles
+            if has_dispatch and has_combine:
+                raise ValueError(
+                    f"Routed boundary {from_tag}->{to_tag} mixes dispatch and "
+                    f"combine markers: {sorted(marker_roles)}"
+                )
+            if has_dispatch:
+                indices = _require_routed_boundary_roles(
                     crossing_nodes,
                     (EP_DISPATCH_PAYLOAD, EP_DISPATCH_COUNTS),
                     from_tag=from_tag,
                     to_tag=to_tag,
                 )
+                boundary_after["routed_boundary"] = "dispatch"
                 boundary_after["tensor_idx"] = indices[EP_DISPATCH_PAYLOAD]
                 boundary_after["routing_counts_idx"] = indices[
                     EP_DISPATCH_COUNTS
                 ]
-            elif exits_ep:
-                indices = _require_ep_boundary_roles(
+            elif has_combine:
+                indices = _require_routed_boundary_roles(
                     crossing_nodes,
                     (EP_COMBINE_PAYLOAD,),
                     from_tag=from_tag,
                     to_tag=to_tag,
                 )
+                boundary_after["routed_boundary"] = "combine"
                 boundary_after["tensor_idx"] = indices[EP_COMBINE_PAYLOAD]
             else:
-                _require_ep_boundary_roles(
+                _require_routed_boundary_roles(
                     crossing_nodes,
                     (),
                     from_tag=from_tag,
@@ -894,27 +1210,57 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 param_idxs=new_param_idxs,
                 graphargs=new_graphargs,
                 placeholders=placeholders,
+                runtime_input_values=[
+                    _runtime_value_descriptor(
+                        node,
+                        source_segment_id=(
+                            None if seg == 0 else value_seg[node]
+                        ),
+                    )
+                    for node in (
+                        [
+                            node
+                            for node in nodes
+                            if node in runtime_placeholders
+                        ]
+                        if seg == 0
+                        else seg_direct_in[seg]
+                    )
+                ],
+                runtime_output_values=[
+                    _runtime_value_descriptor(node, source_segment_id=seg)
+                    for node in seg_direct_out[seg]
+                ],
                 a2a_boundary_after=boundary_after,
             )
         )
 
-    for seg, segment in enumerate(segments):
-        if "EP" not in segment.tag:
-            continue
-        if seg == 0 or seg == len(segments) - 1:
-            raise ValueError(
-                f"EP segment {segment.tag} must have both dispatch and combine "
-                "boundaries"
-            )
-        incoming = segments[seg - 1].a2a_boundary_after
-        if not isinstance(incoming, dict):
-            raise ValueError(f"EP segment {segment.tag} is missing its dispatch boundary")
-        routed_input_idx = incoming["tensor_idx"]
-        routing_counts_idx = incoming["routing_counts_idx"]
-        _externalize_torchtitan_expert_dispatch(
-            segment.gm,
-            routed_input_idx=int(routed_input_idx),
-            routing_counts_idx=int(routing_counts_idx),
+    dispatch_targets = {
+        seg + 1
+        for seg, segment in enumerate(segments[:-1])
+        if isinstance(segment.a2a_boundary_after, dict)
+        and segment.a2a_boundary_after.get("routed_boundary") == "dispatch"
+    }
+    combine_sources = {
+        seg
+        for seg, segment in enumerate(segments[:-1])
+        if isinstance(segment.a2a_boundary_after, dict)
+        and segment.a2a_boundary_after.get("routed_boundary") == "combine"
+    }
+    if dispatch_targets != combine_sources:
+        raise ValueError(
+            "Every routed region must have adjacent dispatch and combine "
+            "boundaries marked by mark_dispatch_payload(...), "
+            "mark_dispatch_counts(...), and mark_combine_payload(...); dispatch targets="
+            f"{sorted(dispatch_targets)}, combine sources={sorted(combine_sources)}"
         )
+
+    _validate_routed_region_interfaces(
+        nodes=nodes,
+        seg_cross_in=seg_direct_in,
+        segments=segments,
+        routed_segment_ids=dispatch_targets,
+        node_seg=node_seg,
+    )
 
     return gm, segments

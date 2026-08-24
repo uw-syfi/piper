@@ -1,6 +1,7 @@
 __pycache__/
 
 .venv
+cpu-venv/
 piper.egg-info/
 out/
 .vscode/

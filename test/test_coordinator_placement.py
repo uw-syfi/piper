@@ -1,6 +1,14 @@
+import json
+import os
+
 import pytest
 
-from src.coordinator import _build_piper_placement_plan, _driver_gpu_fraction
+from src.coordinator import (
+    PiperProgramCoordinator,
+    _build_actor_group_placement_plan,
+    create_piper_placement_group,
+    run_actor_group_program,
+)
 
 
 def _ray_node(
@@ -36,11 +44,9 @@ def _target_gb200_nodes() -> list[dict]:
     ]
 
 
-def test_pp_outer_dp8_keeps_each_inner_group_in_one_gb200_domain():
-    plan = _build_piper_placement_plan(
-        pp_degree=2,
-        dp_degree=8,
-        pp_outer=True,
+def test_equal_width_replicated_stages_keep_each_group_in_one_gb200_domain():
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[tuple(range(0, 16, 2)), tuple(range(1, 16, 2))],
         ray_nodes=_target_gb200_nodes(),
     )
 
@@ -62,11 +68,11 @@ def test_pp_outer_dp8_keeps_each_inner_group_in_one_gb200_domain():
         (1, 3, 5, 7),
         (9, 11, 13, 15),
     ]
-    assert [bundle.driver_dp_ranks for bundle in plan.bundles] == [
-        (0, 2),
-        (4, 6),
-        (1, 3),
-        (5, 7),
+    assert [bundle.program_driver_ids for bundle in plan.bundles] == [
+        (0,),
+        (),
+        (),
+        (),
     ]
     assert plan.actor_bundle_indices == (
         0,
@@ -86,30 +92,31 @@ def test_pp_outer_dp8_keeps_each_inner_group_in_one_gb200_domain():
         1,
         3,
     )
-    assert plan.driver_bundle_indices == (0, 2, 0, 2, 1, 3, 1, 3)
+    assert plan.driver_bundle_indices == (0,)
     assert all(bundle.resources["GPU"] == 4.0 for bundle in plan.bundles)
-    assert all(bundle.resources["CPU"] == 6.0 for bundle in plan.bundles)
+    assert [bundle.resources["CPU"] for bundle in plan.bundles] == [
+        5.0,
+        4.0,
+        4.0,
+        4.0,
+    ]
     for bundle in plan.bundles:
         assert bundle.resources[f"node:{bundle.node_address}"] == 0.001
 
 
-def test_inner_groups_that_fit_are_kept_on_individual_nodes():
-    plan = _build_piper_placement_plan(
-        pp_degree=2,
-        dp_degree=4,
-        pp_outer=False,
+def test_equal_width_actor_groups_that_fit_are_kept_on_individual_nodes():
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[(0, 2, 4, 6), (1, 3, 5, 7)],
         ray_nodes=_target_gb200_nodes(),
     )
 
-    assert len(plan.bundles) == 4
-    assert len({bundle.hostname for bundle in plan.bundles}) == 4
+    assert len(plan.bundles) == 2
+    assert len({bundle.hostname for bundle in plan.bundles}) == 2
     assert [bundle.actor_global_ranks for bundle in plan.bundles] == [
-        (0, 1),
-        (2, 3),
-        (4, 5),
-        (6, 7),
+        (0, 2, 4, 6),
+        (1, 3, 5, 7),
     ]
-    assert plan.driver_bundle_indices == (0, 1, 2, 3)
+    assert plan.driver_bundle_indices == (0,)
 
 
 def test_non_gb200_cross_node_group_does_not_apply_domain_reasoning():
@@ -117,10 +124,8 @@ def test_non_gb200_cross_node_group_does_not_apply_domain_reasoning():
         _ray_node("worker-a", "10.0.0.1", gb200=False),
         _ray_node("worker-b", "10.0.0.2", gb200=False),
     ]
-    plan = _build_piper_placement_plan(
-        pp_degree=1,
-        dp_degree=6,
-        pp_outer=True,
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[tuple(range(6))],
         ray_nodes=nodes,
     )
 
@@ -132,12 +137,6 @@ def test_non_gb200_cross_node_group_does_not_apply_domain_reasoning():
     assert all(bundle.nvlink_domain is None for bundle in plan.bundles)
 
 
-def test_pp_outer_no_pipeline_driver_does_not_fragment_actor_gpus():
-    assert _driver_gpu_fraction(pp_outer=True, pp_degree=1) == 0.05
-    assert _driver_gpu_fraction(pp_outer=True, pp_degree=2) == 0.1
-    assert _driver_gpu_fraction(pp_outer=False, pp_degree=1) == 0.1
-
-
 def test_gb200_group_fails_instead_of_crossing_nvlink_domains():
     nodes = [
         _ray_node("nvl72d001-T01", "10.0.0.1"),
@@ -146,19 +145,15 @@ def test_gb200_group_fails_instead_of_crossing_nvlink_domains():
     ]
 
     with pytest.raises(ValueError, match="one GB200 NVLink domain"):
-        _build_piper_placement_plan(
-            pp_degree=1,
-            dp_degree=12,
-            pp_outer=True,
+        _build_actor_group_placement_plan(
+            actor_groups=[tuple(range(12))],
             ray_nodes=nodes,
         )
 
 
 def test_placement_group_node_validation_checks_every_bundle():
-    plan = _build_piper_placement_plan(
-        pp_degree=2,
-        dp_degree=8,
-        pp_outer=True,
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[tuple(range(0, 16, 2)), tuple(range(1, 16, 2))],
         ray_nodes=_target_gb200_nodes(),
     )
     actual = {
@@ -171,3 +166,108 @@ def test_placement_group_node_validation_checks_every_bundle():
     actual["bundles_to_node_id"][2] = "wrong-node"
     with pytest.raises(RuntimeError, match="bundle 2"):
         plan.validate_bundle_nodes(actual)
+
+
+def test_unequal_actor_groups_are_placed_from_exact_memberships():
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[(0, 2, 4, 5), (1, 3)],
+        ray_nodes=_target_gb200_nodes(),
+    )
+
+    assert plan.pp_degree == 2
+    assert plan.actor_groups == ((0, 2, 4, 5), (1, 3))
+    assert [bundle.actor_global_ranks for bundle in plan.bundles] == [
+        (0, 2, 4, 5),
+        (1, 3),
+    ]
+    assert plan.actor_bundle_indices == (0, 1, 0, 1, 0, 0)
+    assert plan.driver_bundle_indices == (0,)
+    assert plan.actor_global_rank_bundle_index(3) == 1
+
+
+def test_actor_group_placement_keeps_each_group_in_one_gb200_domain():
+    plan = _build_actor_group_placement_plan(
+        actor_groups=[tuple(range(6)), tuple(range(6, 12))],
+        ray_nodes=_target_gb200_nodes(),
+    )
+
+    assert [bundle.actor_global_ranks for bundle in plan.bundles] == [
+        (0, 1, 2, 3),
+        (4, 5),
+        (6, 7, 8, 9),
+        (10, 11),
+    ]
+    assert [bundle.nvlink_domain for bundle in plan.bundles] == [
+        "nvl72d052",
+        "nvl72d052",
+        "nvl72d057",
+        "nvl72d057",
+    ]
+
+
+def test_equal_width_schedule_always_uses_explicit_actor_groups(
+    tmp_path,
+    monkeypatch,
+):
+    schedule_path = tmp_path / "replicated_pipeline.json"
+    schedule_path.write_text(
+        json.dumps(
+            [
+                {"op": "place", "filter": {"PP": 0}, "devices": [0, 2]},
+                {"op": "place", "filter": {"PP": 1}, "devices": [1, 3]},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    nodes = _target_gb200_nodes()
+    monkeypatch.setattr("src.coordinator.ray.nodes", lambda: nodes)
+    monkeypatch.setattr(
+        "src.coordinator.placement_group",
+        lambda bundles, strategy: (bundles, strategy),
+    )
+
+    inner = create_piper_placement_group(str(schedule_path), pp_outer=False)
+    outer = create_piper_placement_group(str(schedule_path), pp_outer=True)
+
+    assert inner.plan.actor_groups == ((0, 2), (1, 3))
+    assert outer.plan.actor_groups == inner.plan.actor_groups
+    assert outer.plan.actor_bundle_indices == inner.plan.actor_bundle_indices
+    assert inner.plan.driver_bundle_indices == (0,)
+    assert not hasattr(inner.plan, "dp_degree")
+
+
+def test_program_coordinator_derives_only_actor_group_topology(tmp_path):
+    schedule_path = tmp_path / "replicated_pipeline.json"
+    schedule_path.write_text(
+        json.dumps(
+            [
+                {"op": "place", "filter": {"PP": 0}, "devices": [0, 2]},
+                {"op": "place", "filter": {"PP": 1}, "devices": [1, 3]},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    coordinator_class = PiperProgramCoordinator.__ray_metadata__.modified_class
+
+    coordinator = coordinator_class(schedule_directives_file=str(schedule_path))
+
+    assert coordinator.actor_groups == [[0, 2], [1, 3]]
+    assert coordinator.world_size == 4
+    assert not hasattr(coordinator, "dp_degree")
+
+
+def test_program_driver_removes_retired_dp_environment(monkeypatch):
+    monkeypatch.setenv("PIPER_DP_RANK", "7")
+    monkeypatch.setenv("PIPER_DP_DEGREE", "8")
+
+    observed = run_actor_group_program._function(
+        [[0, 2], [1, 3]],
+        4,
+        lambda: dict(os.environ),
+    )
+
+    assert "PIPER_DP_RANK" not in observed
+    assert "PIPER_DP_DEGREE" not in observed
+    assert json.loads(observed["PIPER_ACTOR_GROUPS"]) == [[0, 2], [1, 3]]
+    assert observed["PIPER_PP_DEGREE"] == "2"
+    assert observed["PIPER_WORLD_SIZE"] == "4"

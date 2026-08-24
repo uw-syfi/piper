@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.attribution import attribute_profile_mode_savings
-from src.dag import TrainingDAG, TrainingDAGNode
+from src.dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
 from src.profiling import NodeProfile
 
 
@@ -32,10 +32,12 @@ def _node(
     )
 
 
-def _dag(*nodes: TrainingDAGNode) -> TrainingDAG:
+def _dag(*nodes: TrainingDAGNode, edges=()) -> TrainingDAG:
     dag = TrainingDAG()
     for node in nodes:
         dag.add_node(node)
+    for source, destination in edges:
+        dag.add_edge(TrainingDAGEdge(source, destination, "temporal"))
     return dag
 
 
@@ -45,6 +47,7 @@ def test_sequential_savings_are_fully_exposed_and_additive() -> None:
             _dag(
                 _node("a", normal_us=10.0, interference_free_us=4.0, stream="s"),
                 _node("b", normal_us=8.0, interference_free_us=6.0, stream="s"),
+                edges=(("a", "b"),),
             )
         ],
         permutations=4,
@@ -100,6 +103,7 @@ def test_signed_exposed_deltas_include_negative_counterfactual_marginals() -> No
             _dag(
                 _node("faster", normal_us=10.0, interference_free_us=4.0, stream="s"),
                 _node("slower", normal_us=2.0, interference_free_us=5.0, stream="s"),
+                edges=(("faster", "slower"),),
             )
         ],
         permutations=2,
@@ -112,26 +116,107 @@ def test_signed_exposed_deltas_include_negative_counterfactual_marginals() -> No
     assert result.exposed_savings_validation_residual_us == pytest.approx(0.0)
 
 
-def test_attribution_uses_the_reported_median_of_replay_samples() -> None:
+def test_attribution_uses_the_reported_mean_of_replay_samples() -> None:
     a = _node("a", normal_us=0.0, interference_free_us=0.0, stream="a")
     b = _node("b", normal_us=0.0, interference_free_us=0.0, stream="b")
     a.profile_times_by_mode = {
-        "normal": {0: NodeProfile.from_samples((10.0, 1.0))},
-        "interference_free": {0: NodeProfile.from_samples((4.0, 1.0))},
+        "normal": {0: NodeProfile.from_samples((10.0, 1.0, 1.0))},
+        "interference_free": {0: NodeProfile.from_samples((4.0, 1.0, 1.0))},
     }
     b.profile_times_by_mode = {
-        "normal": {0: NodeProfile.from_samples((1.0, 10.0))},
-        "interference_free": {0: NodeProfile.from_samples((1.0, 4.0))},
+        "normal": {0: NodeProfile.from_samples((1.0, 10.0, 1.0))},
+        "interference_free": {0: NodeProfile.from_samples((1.0, 4.0, 1.0))},
     }
 
     result = attribute_profile_mode_savings(
         [_dag(a, b)], permutations=2, exposure_threshold_us=0.0
     )
 
-    # Replaying each aligned iteration yields (10, 10) -> (4, 4).  Replaying
-    # only the per-node median estimates would incorrectly yield 5.5 -> 2.5.
-    assert result.step_time_estimator == "median"
-    assert result.sample_iteration_ids == (0, 1)
-    assert result.normal_step_time_us == pytest.approx(10.0)
-    assert result.interference_free_step_time_us == pytest.approx(4.0)
-    assert result.net_exposed_step_savings_us == pytest.approx(6.0)
+    # Replaying each aligned iteration yields (10, 10, 1) -> (4, 4, 1), whose
+    # means are 7 and 3. Replaying only per-node means would yield 4 -> 2.
+    assert result.step_time_estimator == "mean"
+    assert result.sample_iteration_ids == (0, 1, 2)
+    assert result.normal_step_time_us == pytest.approx(7.0)
+    assert result.interference_free_step_time_us == pytest.approx(3.0)
+    assert result.net_exposed_step_savings_us == pytest.approx(4.0)
+
+
+def test_symmetric_routed_transaction_switches_profile_modes_atomically() -> None:
+    participants = [0, 1]
+    common_meta = {
+        "comm_id": "dispatch.mb0",
+        "participants": participants,
+        "source_devices": [0],
+        "destination_devices": [1],
+    }
+    source = TrainingDAGNode(
+        uid="dispatch.source",
+        node_kind="M_TO_N_COMM",
+        compute_subkind=None,
+        tag={},
+        device=[0],
+        stream="ep_stream",
+        node_meta={**common_meta, "role": "source"},
+        profile_times_by_mode={
+            "normal": {
+                0: NodeProfile.from_samples(
+                    (2.0,), start_offset_samples_us=(20.0,)
+                )
+            },
+            "interference_free": {
+                0: NodeProfile.from_samples(
+                    # The endpoint starts 10 us before the observed group
+                    # rendezvous and retains a 2 us aggregate tail.
+                    (12.0,), start_offset_samples_us=(0.0,)
+                )
+            },
+        },
+    )
+    destination = TrainingDAGNode(
+        uid="dispatch.destination",
+        node_kind="M_TO_N_COMM",
+        compute_subkind=None,
+        tag={},
+        device=[1],
+        stream="ep_stream",
+        node_meta={**common_meta, "role": "destination"},
+        profile_times_by_mode={
+            "normal": {
+                1: NodeProfile.from_samples(
+                    (15.0,), start_offset_samples_us=(10.0,)
+                )
+            },
+            "interference_free": {
+                1: NodeProfile.from_samples(
+                    (3.0,), start_offset_samples_us=(10.0,)
+                )
+            },
+        },
+    )
+    plan = SimpleNamespace(
+        per_pp_dags=[_dag(source), _dag(destination)],
+        topology={},
+        profile_metadata={
+            "timeline_alignment": {
+                "modes": {
+                    mode: {
+                        "samples": 1,
+                        "max_pairwise_uncertainty_us": 0.0,
+                    }
+                    for mode in ("normal", "interference_free")
+                }
+            }
+        },
+    )
+
+    result = attribute_profile_mode_savings(plan, permutations=2)
+
+    assert result.normal_step_time_us == pytest.approx(5.0)
+    assert result.interference_free_step_time_us == pytest.approx(3.0)
+    assert result.total_step_savings_us == pytest.approx(2.0)
+    routed_feature = next(
+        item for item in result.features
+        if item.feature.feature_id == "comm:m_to_n_comm:dispatch.mb0"
+    )
+    assert routed_feature.feature.binding_count == 2
+    assert routed_feature.attributed_savings_us == pytest.approx(2.0)

@@ -69,6 +69,7 @@ class BucketState:
     input_idxs: list[int] = field(default_factory=list)
     param_idxs: list[int] = field(default_factory=list)
     param_names: list[str] = field(default_factory=list)
+    route_sharded_param_specs: dict[int, dict[str, Any]] = field(default_factory=dict)
     optimizer: Any = None
     trainable_param_idxs: list[int] = field(default_factory=list)
     activation_checkpoint_subgraph_count: int = 1
@@ -129,17 +130,23 @@ class StageStore:
 class RuntimeState:
     """Actor-local distributed runtime environment."""
 
+    global_rank: int
     pp_rank: int
-    dp_rank: int
-    dp_degree: int
     pp_degree: int
     world_size: int
     no_nvtx: bool = False
     device: str = "cuda"
-    dp_group: Any = None
-    ep_group: Any = None
+    actor_group_sync_group: Any = None
+    actor_group_routed_group: Any = None
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
+    actor_group_id: int = 0
+    actor_group_local_rank: int = 0
+    actor_group_devices: tuple[int, ...] = ()
+    actor_groups: tuple[tuple[int, ...], ...] = ()
+    process_groups_by_participants: dict[tuple[Any, ...], Any] = field(
+        default_factory=dict
+    )
     streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
     directional_p2p_streams: dict[str, torch.cuda.Stream] = field(
         default_factory=dict
@@ -147,12 +154,260 @@ class RuntimeState:
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
 
+    def __post_init__(self) -> None:
+        self.validate_actor_group_metadata(context="RuntimeState")
+
+    def validate_actor_group_metadata(self, *, context: str) -> None:
+        """Raise when the actor's explicit schedule topology is incomplete.
+
+        ActorGroups are the sole authority for replica width, local shard
+        ownership, and pipeline peer mapping.  Silently falling back to the
+        former rectangular DP arithmetic would make ZeRO buffers appear valid
+        while assigning the wrong slices to ranks.
+        """
+        groups = tuple(tuple(int(rank) for rank in group) for group in self.actor_groups)
+        if not groups:
+            raise ValueError(f"{context}: actor_groups must not be empty")
+        if any(not group for group in groups):
+            raise ValueError(f"{context}: ActorGroups must not be empty: {groups}")
+        flattened = [rank for group in groups for rank in group]
+        if len(flattened) != len(set(flattened)):
+            raise ValueError(
+                f"{context}: global ranks must belong to exactly one ActorGroup: "
+                f"{groups}"
+            )
+        if sorted(flattened) != list(range(self.world_size)):
+            raise ValueError(
+                f"{context}: ActorGroups must cover global ranks [0, "
+                f"{self.world_size}), got {sorted(flattened)}"
+            )
+        if self.pp_degree != len(groups):
+            raise ValueError(
+                f"{context}: pp_degree={self.pp_degree} does not match "
+                f"ActorGroup count={len(groups)}"
+            )
+        if self.actor_group_id < 0 or self.actor_group_id >= len(groups):
+            raise ValueError(
+                f"{context}: actor_group_id={self.actor_group_id} is outside "
+                f"[0, {len(groups)})"
+            )
+        own_group = groups[self.actor_group_id]
+        if tuple(self.actor_group_devices) != own_group:
+            raise ValueError(
+                f"{context}: actor_group_devices={self.actor_group_devices} do "
+                f"not match actor_groups[{self.actor_group_id}]={own_group}"
+            )
+        if self.pp_rank != self.actor_group_id:
+            raise ValueError(
+                f"{context}: pp_rank={self.pp_rank} must identify the actor's "
+                f"ActorGroup {self.actor_group_id}"
+            )
+        if (
+            self.actor_group_local_rank < 0
+            or self.actor_group_local_rank >= len(own_group)
+        ):
+            raise ValueError(
+                f"{context}: actor_group_local_rank={self.actor_group_local_rank} "
+                f"is outside [0, {len(own_group)})"
+            )
+        expected_rank = own_group[self.actor_group_local_rank]
+        if self.global_rank != expected_rank:
+            raise ValueError(
+                f"{context}: global_rank={self.global_rank} does not match "
+                f"actor_group_devices[{self.actor_group_local_rank}]={expected_rank}"
+            )
+
     @property
-    def global_rank(self) -> int:
-        return self.pp_rank + self.dp_rank * self.pp_degree
+    def actor_group_size(self) -> int:
+        self.validate_actor_group_metadata(context="actor_group_size")
+        return len(self.actor_group_devices)
+
+    @property
+    def is_actor_group_representative(self) -> bool:
+        self.validate_actor_group_metadata(context="is_actor_group_representative")
+        return self.actor_group_local_rank == 0
+
+    def process_group_for_participants(
+        self,
+        participants: Any,
+        channel: str | None = None,
+    ) -> Any:
+        """Return the communicator created for an exact rank participant set."""
+        participant_key = tuple(sorted(int(rank) for rank in participants))
+        if len(participant_key) != len(set(participant_key)):
+            raise ValueError(
+                f"collective participants contain duplicate ranks: {participant_key}"
+            )
+        if channel not in {
+            None,
+            "routed_layout",
+            "m_to_n",
+            "n_to_m",
+            "pp_lo_hi",
+            "pp_hi_lo",
+            "dense_state_lo_hi",
+            "dense_state_hi_lo",
+        }:
+            raise ValueError(
+                "collective channel must be None or a routed/P2P direction, "
+                f"got {channel!r}"
+            )
+        key = (
+            participant_key
+            if channel is None
+            else (participant_key, channel)
+        )
+        try:
+            return self.process_groups_by_participants[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"No process group was created for participants={participant_key}, "
+                f"channel={channel!r}; available="
+                f"{list(self.process_groups_by_participants)}"
+            ) from exc
+
+    def required_process_group_participants(self) -> tuple[tuple[int, ...], ...]:
+        """Participant sets known before DAG load, in collective creation order."""
+        groups = tuple(
+            tuple(sorted(int(rank) for rank in group))
+            for group in self.actor_groups
+        )
+        return tuple(sorted(set(groups)))
+
+    def required_routed_process_group_participants(
+        self,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Pairwise ActorGroup unions needing directional routed channels."""
+        groups = tuple(
+            tuple(sorted(int(rank) for rank in group))
+            for group in self.actor_groups
+        )
+        participant_sets = set()
+        for left_idx, left in enumerate(groups):
+            for right in groups[left_idx + 1 :]:
+                participant_sets.add(tuple(sorted((*left, *right))))
+        return tuple(sorted(participant_sets))
+
+    def process_group_creation_specs(
+        self,
+    ) -> tuple[tuple[tuple[int, ...], str | None], ...]:
+        """Deterministic schedule topology communicator creation sequence."""
+        specs = [
+            (participants, None)
+            for participants in self.required_process_group_participants()
+        ]
+        specs.extend(
+            (participants, channel)
+            for participants in self.required_routed_process_group_participants()
+            for channel in ("routed_layout", "m_to_n", "n_to_m")
+        )
+        specs.extend(self.required_p2p_process_group_specs())
+        return tuple(specs)
+
+    def required_p2p_process_group_specs(
+        self,
+    ) -> tuple[tuple[tuple[int, ...], str], ...]:
+        """Aligned rank-pair communicators for equal-width ActorGroups."""
+        groups = tuple(sorted(
+            tuple(sorted(int(rank) for rank in group))
+            for group in self.actor_groups
+        ))
+        specs = []
+        for left_idx, left in enumerate(groups):
+            for right in groups[left_idx + 1 :]:
+                if len(left) != len(right):
+                    continue
+                for left_rank, right_rank in zip(left, right):
+                    participants = tuple(sorted((left_rank, right_rank)))
+                    for channel in (
+                        "pp_lo_hi",
+                        "pp_hi_lo",
+                        "dense_state_lo_hi",
+                        "dense_state_hi_lo",
+                    ):
+                        specs.append((participants, channel))
+        return tuple(specs)
 
     def pipeline_peer_global_rank(self, pp_rank: int) -> int:
-        return pp_rank + self.dp_rank * self.pp_degree
+        self.validate_actor_group_metadata(context="pipeline peer lookup")
+        groups = tuple(
+            tuple(int(rank) for rank in group) for group in self.actor_groups
+        )
+        peer_group_index = int(pp_rank)
+        if peer_group_index < 0 or peer_group_index >= len(groups):
+            raise ValueError(
+                f"peer ActorGroup index {peer_group_index} is outside "
+                f"[0, {len(groups)})"
+            )
+        own_group = tuple(self.actor_group_devices)
+        peer_group = groups[peer_group_index]
+        if len(own_group) != len(peer_group):
+            raise ValueError(
+                "direct SEND/RECV requires equal-width ActorGroups, got "
+                f"source={own_group}, destination={peer_group}"
+            )
+        return int(peer_group[self.actor_group_local_rank])
+
+    def p2p_process_group_for_task(self, task: Any) -> Any:
+        """Return the aligned rank-pair communicator for a SEND/RECV task."""
+        peer_pp_rank = getattr(task, "peer_pp_rank", None)
+        if peer_pp_rank is None:
+            peer_pp_rank = (getattr(task, "node_meta", {}) or {}).get(
+                "peer_pp_rank"
+            )
+        if peer_pp_rank is None:
+            raise ValueError(
+                f"P2P task {getattr(task, 'uid', '<unknown>')} is missing peer_pp_rank"
+            )
+        peer_global_rank = self.pipeline_peer_global_rank(int(peer_pp_rank))
+        channel = self.p2p_channel_for_task(task, peer_global_rank=peer_global_rank)
+        return self.process_group_for_participants(
+            (self.global_rank, peer_global_rank),
+            channel=channel,
+        )
+
+    def p2p_channel_for_task(
+        self,
+        task: Any,
+        *,
+        peer_global_rank: int | None = None,
+    ) -> str:
+        """Resolve one logical P2P direction consistently on both endpoints."""
+        node_kind = getattr(task, "node_kind", None)
+        if node_kind not in {"SEND_COMM", "RECV_COMM"}:
+            raise ValueError(
+                "p2p_channel_for_task requires SEND_COMM or RECV_COMM, "
+                f"got node_kind={node_kind!r}"
+            )
+        declared = (getattr(task, "node_meta", {}) or {}).get(
+            "comm_group_kind"
+        )
+        if declared in {
+            "pp_lo_hi",
+            "pp_hi_lo",
+            "dense_state_lo_hi",
+            "dense_state_hi_lo",
+        }:
+            return str(declared)
+        if peer_global_rank is None:
+            peer_pp_rank = getattr(task, "peer_pp_rank", None)
+            if peer_pp_rank is None:
+                peer_pp_rank = (getattr(task, "node_meta", {}) or {}).get(
+                    "peer_pp_rank"
+                )
+            if peer_pp_rank is None:
+                raise ValueError(
+                    f"P2P task {getattr(task, 'uid', '<unknown>')} is missing "
+                    "peer_pp_rank"
+                )
+            peer_global_rank = self.pipeline_peer_global_rank(int(peer_pp_rank))
+        if node_kind == "SEND_COMM":
+            return (
+                "pp_lo_hi" if peer_global_rank > self.global_rank else "pp_hi_lo"
+            )
+        return (
+            "pp_hi_lo" if peer_global_rank > self.global_rank else "pp_lo_hi"
+        )
 
     def stream_id(self, node_or_stream: Any) -> str:
         if isinstance(node_or_stream, str):
@@ -204,6 +459,8 @@ class RuntimeState:
         self.directional_p2p_streams = {
             "pp_lo_hi": torch.cuda.Stream(device=self.device),
             "pp_hi_lo": torch.cuda.Stream(device=self.device),
+            "dense_state_lo_hi": torch.cuda.Stream(device=self.device),
+            "dense_state_hi_lo": torch.cuda.Stream(device=self.device),
         }
 
     def directional_p2p_stream_for_task(self, task: Any) -> torch.cuda.Stream:
@@ -219,20 +476,10 @@ class RuntimeState:
             )
 
         peer_global_rank = self.pipeline_peer_global_rank(int(peer_pp_rank))
-        node_kind = getattr(task, "node_kind", None)
-        if node_kind == "SEND_COMM":
-            group_kind = (
-                "pp_lo_hi" if peer_global_rank > self.global_rank else "pp_hi_lo"
-            )
-        elif node_kind == "RECV_COMM":
-            group_kind = (
-                "pp_hi_lo" if peer_global_rank > self.global_rank else "pp_lo_hi"
-            )
-        else:
-            raise ValueError(
-                "directional_p2p_stream_for_task requires SEND_COMM or RECV_COMM, "
-                f"got node_kind={node_kind!r}"
-            )
+        group_kind = self.p2p_channel_for_task(
+            task,
+            peer_global_rank=peer_global_rank,
+        )
         return self.directional_p2p_streams[group_kind]
 
     def execution_stream_for_task(
@@ -258,8 +505,8 @@ class RuntimeState:
         assignment.  Interference-free execution is serialized separately by
         :class:`DagExecutor`, using a CUDA-event handoff between nodes.
 
-        P2P is deliberately identical to ordinary execution in both modes:
-        sends and receives use the dedicated lo->hi and hi->lo streams.
+        Directional P2P communication is identical to ordinary execution in
+        both modes. Routed collectives preserve their DAG-declared stream.
         """
 
         normalize_profile_mode(profile_mode)
@@ -289,6 +536,28 @@ class ParamStorage:
     )
     pending_param_frees: dict[Any, Future] = field(default_factory=dict)
     pending_grad_frees: dict[Any, Future] = field(default_factory=dict)
+
+    def _actor_group_size(self, *, ubid: Any, operation: str) -> int:
+        self.runtime.validate_actor_group_metadata(
+            context=f"{operation} for ZeRO bucket {ubid!r}"
+        )
+        size = self.runtime.actor_group_size
+        if size <= 0:
+            raise ValueError(
+                f"{operation} for ZeRO bucket {ubid!r}: ActorGroup size must "
+                f"be positive, got {size}"
+            )
+        return size
+
+    def _actor_group_sync_group(self, *, ubid: Any, operation: str) -> Any:
+        size = self._actor_group_size(ubid=ubid, operation=operation)
+        group = self.runtime.actor_group_sync_group
+        if size > 1 and group is None:
+            raise RuntimeError(
+                f"{operation} for ZeRO bucket {ubid!r}: ActorGroup "
+                "synchronization communicator was not initialized"
+            )
+        return group
 
     def clear_param_grads(self) -> None:
         for bucket in self.stages.buckets.values():
@@ -328,7 +597,13 @@ class ParamStorage:
         ubid: Any | None,
         stream: torch.cuda.Stream,
     ) -> None:
-        if ubid is None or ubid not in self.stages.zero_managed_ubids or self.runtime.dp_degree <= 1:
+        if ubid is None or ubid not in self.stages.zero_managed_ubids:
+            return
+        actor_group_size = self._actor_group_size(
+            ubid=ubid,
+            operation="accumulate parameter gradients",
+        )
+        if actor_group_size <= 1:
             return
         if ubid in self.stages.grad_sharded_ubids:
             self.wait_pending_free(self.pending_grad_frees, ubid)
@@ -344,7 +619,7 @@ class ParamStorage:
                     return
                 _shard_start, shard_size, _orig_numel = shard_info
                 flat_grads = torch.zeros(
-                    shard_size * self.runtime.dp_degree,
+                    shard_size * actor_group_size,
                     dtype=self.grad_buffer_dtype,
                     device=self.runtime.device,
                 )
@@ -462,10 +737,14 @@ class ParamStorage:
             f"alloc_full_grads: missing param_shard_info for ubid={ubid}"
         )
         shard_size = shard_info[1]
+        actor_group_size = self._actor_group_size(
+            ubid=ubid,
+            operation="allocate full gradients",
+        )
         with torch.cuda.stream(stream):
             if bucket.flat_grads is None:
                 bucket.flat_grads = torch.zeros(
-                    shard_size * self.runtime.dp_degree,
+                    shard_size * actor_group_size,
                     dtype=self.grad_buffer_dtype,
                     device=self.runtime.device,
                 )
@@ -512,12 +791,16 @@ class ParamStorage:
             "DAG is constructing a redundant ALL_GATHER"
         )
         with torch.cuda.stream(stream):
+            sync_group = self._actor_group_sync_group(
+                ubid=ubid,
+                operation="all-gather parameters",
+            )
             self.logger.debug(
                 f"[all_gather_begin] rank={self.runtime.global_rank} ubid={ubid}: "
                 f"flat_numel={flat_params.numel()} flat_storage={flat_params.untyped_storage().size()} "
                 f"shard_numel={shard_in.numel()} shard_storage={shard_in.untyped_storage().size()}"
             )
-            dist.all_gather_into_tensor(flat_params, shard_in, group=self.runtime.dp_group)
+            dist.all_gather_into_tensor(flat_params, shard_in, group=sync_group)
             bucket.full_params_fresh = True
             self.logger.debug(
                 f"[all_gather_end] rank={self.runtime.global_rank} ubid={ubid}: "
@@ -567,9 +850,13 @@ class ParamStorage:
                     f"ZeRO-2 bucket {ubid} is missing full or sharded parameters"
                 )
             with torch.cuda.stream(stream):
+                sync_group = self._actor_group_sync_group(
+                    ubid=ubid,
+                    operation="rebuild ZeRO-2 parameters",
+                )
                 gathered = torch.empty_like(flat_params)
                 dist.all_gather_into_tensor(
-                    gathered, shard_param, group=self.runtime.dp_group
+                    gathered, shard_param, group=sync_group
                 )
                 flat_params.copy_(gathered)
 

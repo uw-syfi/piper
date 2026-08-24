@@ -6,8 +6,8 @@
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "stream": "pp_stream"
@@ -19,8 +19,8 @@
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "stream": "pp_stream"
@@ -32,8 +32,8 @@
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "stream": "pp_stream"
@@ -45,8 +45,8 @@
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "stream": "pp_stream"
@@ -54,12 +54,13 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 0
+      "PP": 0,
+      "EP": "-"
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "reduce_stream": "dp_stream"
@@ -67,12 +68,13 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 1
+      "PP": 1,
+      "EP": "-"
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "reduce_stream": "dp_stream"
@@ -80,12 +82,13 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 2
+      "PP": 2,
+      "EP": "-"
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "reduce_stream": "dp_stream"
@@ -93,12 +96,13 @@
   {
     "op": "replicate",
     "filter": {
-      "PP": 3
+      "PP": 3,
+      "EP": "-"
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "reduce_stream": "dp_stream"
@@ -111,8 +115,8 @@
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "stream": "ep_stream"
@@ -125,8 +129,8 @@
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "stream": "ep_stream"
@@ -139,8 +143,8 @@
     },
     "devices": [
       1,
-      5,
       2,
+      5,
       6
     ],
     "stream": "ep_stream"
@@ -153,8 +157,8 @@
     },
     "devices": [
       0,
-      4,
       3,
+      4,
       7
     ],
     "stream": "ep_stream"

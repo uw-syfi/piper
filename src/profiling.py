@@ -1,7 +1,7 @@
 """Durable multi-mode node profiling records for stream simulation.
 
 This module intentionally contains no CUDA or Ray code.  Actors produce
-``ActorProfileResult`` shards, the coordinator merges those shards into the
+``ActorProfileResult`` records, the coordinator merges those records into the
 finalized DAGs, and the simulator consumes the resulting
 ``ProfiledTrainingPlan``.  Keeping the interchange types here prevents live FX,
 CUDA event, and executor state from leaking into saved profile artifacts.
@@ -318,13 +318,12 @@ class ProfileConfig:
 
 @dataclass(frozen=True)
 class ActorProfileResult:
-    """Detached profile shard returned by one global-rank actor."""
+    """Detached profile result returned by one global-rank actor."""
 
     graph_fingerprint: str
     global_rank: int
     node_profiles: dict[str, NodeProfile]
     profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE
-    dp_rank: int = 0
     pp_rank: int = 0
     device_metadata: dict[str, Any] = field(default_factory=dict)
     prologue_profile: NodeProfile | None = None
@@ -342,7 +341,6 @@ class ActorProfileResult:
             "graph_fingerprint": self.graph_fingerprint,
             "global_rank": int(self.global_rank),
             "profile_mode": self.profile_mode,
-            "dp_rank": int(self.dp_rank),
             "pp_rank": int(self.pp_rank),
             "device_metadata": _json_safe_value(self.device_metadata),
             "timeline_origin_samples_us": list(self.timeline_origin_samples_us),
@@ -364,7 +362,6 @@ class ActorProfileResult:
             graph_fingerprint=str(value["graph_fingerprint"]),
             global_rank=int(value["global_rank"]),
             profile_mode=str(value["profile_mode"]),
-            dp_rank=int(value.get("dp_rank", 0)),
             pp_rank=int(value.get("pp_rank", 0)),
             device_metadata=dict(value.get("device_metadata", {})),
             timeline_origin_samples_us=tuple(
@@ -865,24 +862,39 @@ def merge_actor_profiles(
     profile_configs: Mapping[str, ProfileConfig] | None = None,
     topology: Mapping[str, Any] | None = None,
 ) -> ProfiledTrainingPlan:
-    """Validate actor shards and attach rank-specific profiles to DAG nodes.
+    """Validate actor results and attach rank-specific profiles to DAG nodes.
 
-    The operation mutates ``per_pp_dags`` only after a shard has passed its
-    rank, fingerprint, and node-coverage checks.  Missing profile shards are
+    The operation mutates ``per_pp_dags`` only after a result has passed its
+    rank, fingerprint, and node-coverage checks.  Missing actor results are
     intentionally not filled with zero durations.
     """
 
     dags = list(per_pp_dags)
     results = list(results)
 
-    # Normalize every actor's CUDA-event offsets to the earliest calibrated
-    # CUDA origin in the same mode/iteration.  The epoch itself is irrelevant;
+    # Normalize every actor's timestamp offsets to the earliest calibrated
+    # origin in the same mode/iteration.  The epoch itself is irrelevant;
     # only cross-actor differences survive in the durable profile.
     results_by_mode: dict[str, list[ActorProfileResult]] = {}
     for result in results:
         results_by_mode.setdefault(
             normalize_profile_mode(result.profile_mode), []
         ).append(result)
+    raw_actor_groups = (topology or {}).get("actor_groups", ())
+    if raw_actor_groups:
+        expected_ranks = {
+            int(rank)
+            for group in raw_actor_groups
+            for rank in group.get("devices", ())
+        }
+        for mode, mode_results in sorted(results_by_mode.items()):
+            actual_ranks = {int(result.global_rank) for result in mode_results}
+            if actual_ranks != expected_ranks:
+                raise ValueError(
+                    f"profile mode {mode!r} does not cover the ActorGroup "
+                    f"topology: missing={sorted(expected_ranks - actual_ranks)}, "
+                    f"unknown={sorted(actual_ranks - expected_ranks)}"
+                )
     aligned_bases_by_mode: dict[str, tuple[float, ...]] = {}
     alignment_metadata: dict[str, Any] = {}
     for mode, mode_results in sorted(results_by_mode.items()):
@@ -904,12 +916,52 @@ def merge_actor_profiles(
         sample_count = next(iter(sample_counts))
         if sample_count <= 0:
             continue
+        mode_sample_ids: tuple[int, ...] | None = None
         for result in mode_results:
+            origins = result.timeline_origin_samples_us
+            if any(not math.isfinite(float(value)) for value in origins):
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "invalid timeline-origin samples"
+                )
             uncertainties = result.timeline_origin_uncertainty_samples_us
-            if uncertainties and len(uncertainties) != sample_count:
+            if len(uncertainties) != sample_count:
                 raise ValueError(
                     f"profile mode {mode!r} rank {result.global_rank} has "
                     "mismatched origin and uncertainty sample counts"
+                )
+            if any(
+                not math.isfinite(float(value)) or float(value) < 0.0
+                for value in uncertainties
+            ):
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "invalid timeline-origin uncertainty samples"
+                )
+            result_sample_ids = {
+                tuple(int(value) for value in profile.sample_iteration_ids)
+                for profile in result.node_profiles.values()
+                if profile.executed
+            }
+            if len(result_sample_ids) != 1:
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    "inconsistent node sample iteration IDs"
+                )
+            sample_ids = next(iter(result_sample_ids))
+            if len(sample_ids) != sample_count:
+                raise ValueError(
+                    f"profile mode {mode!r} rank {result.global_rank} has "
+                    f"sample IDs={len(sample_ids)} and calibrated origins="
+                    f"{sample_count}"
+                )
+            if mode_sample_ids is None:
+                mode_sample_ids = sample_ids
+            elif sample_ids != mode_sample_ids:
+                raise ValueError(
+                    f"profile mode {mode!r} has mismatched actor sample "
+                    f"iteration IDs: expected={mode_sample_ids!r}, "
+                    f"rank {result.global_rank}={sample_ids!r}"
                 )
         bases = tuple(
             min(
@@ -924,11 +976,26 @@ def merge_actor_profiles(
             for result in mode_results
             for value in result.timeline_origin_uncertainty_samples_us
         ]
+        pairwise_uncertainties = []
+        for index in range(sample_count):
+            per_actor = sorted(
+                (
+                    float(result.timeline_origin_uncertainty_samples_us[index])
+                    for result in mode_results
+                ),
+                reverse=True,
+            )
+            pairwise_uncertainties.append(sum(per_actor[:2]))
         alignment_metadata[mode] = {
             "actors": len(mode_results),
             "samples": sample_count,
             "max_origin_uncertainty_us": (
                 max(uncertainty_values) if uncertainty_values else None
+            ),
+            "max_pairwise_uncertainty_us": (
+                max(pairwise_uncertainties)
+                if pairwise_uncertainties
+                else None
             ),
         }
 
@@ -957,20 +1024,20 @@ def merge_actor_profiles(
                 global_offsets, profile.estimator
             ),
         )
-    seen_shards: set[tuple[str, int]] = set()
+    seen_results: set[tuple[str, int]] = set()
     device_metadata: dict[str, dict[str, Any]] = {}
     for result in sorted(
         results, key=lambda item: (item.profile_mode, item.global_rank)
     ):
         mode = normalize_profile_mode(result.profile_mode)
         rank = int(result.global_rank)
-        shard_key = (mode, rank)
-        if shard_key in seen_shards:
+        result_key = (mode, rank)
+        if result_key in seen_results:
             raise ValueError(
                 "duplicate actor profile result for "
                 f"profile_mode={mode}, global_rank={rank}"
             )
-        seen_shards.add(shard_key)
+        seen_results.add(result_key)
         dag = _dag_for_actor_rank(dags, result)
         expected_fingerprint = finalized_dag_fingerprint(dag)
         if result.graph_fingerprint != expected_fingerprint:
@@ -1023,8 +1090,8 @@ def merge_actor_profiles(
     profile_metadata: dict[str, Any] = {"actors": device_metadata}
     if alignment_metadata:
         profile_metadata["timeline_alignment"] = {
-            "method": "ray_ntp_midpoint_plus_cuda_anchor",
-            "origin": "earliest_actor_cuda_prologue_per_mode_iteration",
+            "method": "driver_actor_midpoint_plus_kineto_iteration_anchor",
+            "origin": "earliest_actor_kineto_anchor_per_mode_iteration",
             "modes": alignment_metadata,
         }
 

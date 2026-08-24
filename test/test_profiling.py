@@ -100,6 +100,25 @@ def test_profile_config_uses_fixed_iteration_count() -> None:
     assert config.repeat_iters == 30
 
 
+def test_actor_profile_result_has_no_legacy_dp_metadata() -> None:
+    result = ActorProfileResult(
+        graph_fingerprint="fingerprint",
+        global_rank=7,
+        pp_rank=2,
+        node_profiles={},
+    )
+
+    encoded = result.to_dict()
+    assert "dp_rank" not in encoded
+
+    # Older transient payloads may contain extra metadata.  It must not be
+    # restored into the ActorGroup-native result type.
+    encoded["dp_rank"] = 3
+    restored = ActorProfileResult.from_dict(encoded)
+    assert restored == result
+    assert not hasattr(restored, "dp_rank")
+
+
 def test_finalized_fingerprint_is_order_and_profile_invariant() -> None:
     dag = _two_node_dag()
     expected = finalized_dag_fingerprint(dag)
@@ -223,8 +242,44 @@ def test_merge_actor_profiles_aligns_cuda_offsets_across_actor_clocks() -> None:
     assert profiles[0].start_offset_samples_us == pytest.approx((5.0,))
     assert profiles[2].start_offset_samples_us == pytest.approx((17.0,))
     alignment = plan.profile_metadata["timeline_alignment"]
-    assert alignment["method"] == "ray_ntp_midpoint_plus_cuda_anchor"
+    assert (
+        alignment["method"]
+        == "driver_actor_midpoint_plus_kineto_iteration_anchor"
+    )
     assert alignment["modes"][NORMAL_PROFILE_MODE]["max_origin_uncertainty_us"] == 2.0
+    assert alignment["modes"][NORMAL_PROFILE_MODE]["max_pairwise_uncertainty_us"] == 4.0
+    restored = ProfiledTrainingPlan.from_dict(plan.to_dict())
+    restored_profiles = get_node_profile_times(
+        restored.per_pp_dags[0].nodes["a"], NORMAL_PROFILE_MODE
+    )
+    assert restored_profiles[2].start_offset_samples_us == pytest.approx((17.0,))
+    assert restored.profile_metadata["timeline_alignment"] == alignment
+
+
+def test_merge_actor_profiles_rejects_misaligned_iteration_ids() -> None:
+    dag = _two_node_dag(device=[0, 2])
+    fingerprint = finalized_dag_fingerprint(dag)
+
+    def result(rank: int, sample_id: int) -> ActorProfileResult:
+        return ActorProfileResult(
+            graph_fingerprint=fingerprint,
+            global_rank=rank,
+            pp_rank=0,
+            profile_mode=NORMAL_PROFILE_MODE,
+            node_profiles={
+                uid: NodeProfile.from_samples(
+                    (1.0,),
+                    sample_iteration_ids=(sample_id,),
+                    start_offset_samples_us=(0.0,),
+                )
+                for uid in dag.nodes
+            },
+            timeline_origin_samples_us=(1000.0,),
+            timeline_origin_uncertainty_samples_us=(1.0,),
+        )
+
+    with pytest.raises(ValueError, match="mismatched actor sample iteration IDs"):
+        merge_actor_profiles([dag], [result(0, 3), result(2, 4)])
 
 
 def test_merge_actor_profiles_fails_closed_on_missing_node_or_fingerprint() -> None:
@@ -253,6 +308,29 @@ def test_merge_actor_profiles_fails_closed_on_missing_node_or_fingerprint() -> N
                     },
                 )
             ],
+        )
+
+
+def test_merge_actor_profiles_requires_every_actor_group_rank() -> None:
+    dag = _two_node_dag(device=[0, 2])
+    fingerprint = finalized_dag_fingerprint(dag)
+    result = ActorProfileResult(
+        graph_fingerprint=fingerprint,
+        global_rank=0,
+        node_profiles={
+            uid: NodeProfile.from_samples((1.0,)) for uid in dag.nodes
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"missing=\[2\]"):
+        merge_actor_profiles(
+            [dag],
+            [result],
+            topology={
+                "actor_groups": [
+                    {"id": 0, "devices": [0, 2], "size": 2},
+                ]
+            },
         )
 
 
