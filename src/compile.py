@@ -250,8 +250,6 @@ def piper_setup(
             for actor in piper_metadata.actors.values()
         ])
 
-    # Standby support: register this dp_rank's actor handles so the
-    # coordinator can fence survivors (abort_comms) during promotion.
     if int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0:
         from .coordinator import _PROMOTION_SIGNAL_ACTOR
 

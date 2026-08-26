@@ -7,7 +7,7 @@ import os
 
 from src.compile import piper_setup
 from src.coordinator import _PROMOTION_SIGNAL_ACTOR
-from src.piper import piper_exec_dag, PiperFencedError
+from src.piper import piper_exec_dag, PiperResume
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
 
@@ -43,24 +43,34 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
     }
 
 
-def _run_standby(dp_rank):
-    """Park until the coordinator promotes this standby or shuts it down.
+def _run_standby(dp_rank, args, loss_fn):
+    """Park until promoted or shut down; on promotion, receive the survivor's
+    state and train the remaining iterations as the failed rank's replacement.
 
     dp_rank: this standby's dp_rank (>= dp_degree).
+    args: parsed harness arguments.
+    loss_fn: loss used by piper_exec_dag.
     """
     sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
+    actor = piper_metadata.actors[0] # pp_degree == 1
+    ray.get(actor.prepare_standby_state.remote())
     logger.info(f"standby dp_rank {dp_rank}: initialized and parked; "
                 "waiting for promotion or shutdown")
     cmd = ray.get(sig.wait_for_cmd.remote())
     if cmd.get("op") == "promote":
-        res = ray.get(
-            piper_metadata.actors[0].join_standby_group.remote(cmd["new_ranks"]),
+        ray.get(
+            actor.join_standby_group.remote(cmd["new_ranks"]),
             timeout=180,
         )
         logger.info(f"standby dp_rank {dp_rank}: joined NCCL group "
-                    f"{cmd['new_ranks']} (sanity allreduce={res})")
-        # Phase 1 stops here; Phase 2 receives weights and resumes training.
-        print("ready to receive weights", flush=True)
+                    f"{cmd['new_ranks']}")
+        next_iter = ray.get(actor.wait_state_loaded.remote(), timeout=600)
+        total = args.warmup + args.iters
+        logger.info(f"standby dp_rank {dp_rank}: state loaded; running "
+                    f"iterations {next_iter}..{total - 1} as replacement")
+        for _ in range(total - next_iter):
+            piper_exec_dag(loss_fn)
+        logger.info(f"standby dp_rank {dp_rank}: replacement training finished")
     else:
         logger.info(f"standby dp_rank {dp_rank}: shutdown received; exiting")
     return None
@@ -112,40 +122,50 @@ def main(args, pg):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     dp_degree = int(os.environ["PIPER_DP_DEGREE"])
     if dp_rank >= dp_degree:
-        return _run_standby(dp_rank)
+        return _run_standby(dp_rank, args, loss_fn)
 
     # No step_timeout during warmup; afterward 5x the last warmup step
     # (~steady step time), floored at 5s.
     logger.info(f"Running {args.warmup} warmup iterations")
     last_warmup_time = None
-    for _ in range(args.warmup):
-        t0 = time.perf_counter()
-        piper_exec_dag(loss_fn)
-        last_warmup_time = time.perf_counter() - t0
-        if args.iteration_sleep > 0:
-            time.sleep(args.iteration_sleep)
-    step_timeout = (
-        max(5.0, 5 * last_warmup_time) if last_warmup_time is not None else None
-    )
-
-    logger.info(f"Running {args.iters} timed iterations")
-    ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+    step_timeout = None
     iter_times = []
-    fenced = False
-    try:
-        for _ in range(args.iters):
-            start = time.perf_counter()
-            piper_exec_dag(loss_fn, log_stats=True, step_timeout=step_timeout)
-            end = time.perf_counter()
-            iter_times.append(end - start)
-            if args.iteration_sleep > 0:
-                time.sleep(args.iteration_sleep)
-    except PiperFencedError as exc:
-        # Promotion fenced this rank mid-step; Phase 1 ends the run cleanly
-        # with the iterations completed so far.
-        fenced = True
-        logger.info(f"run fenced during promotion after "
-                    f"{len(iter_times)} timed iterations: {exc}")
+    total = args.warmup + args.iters
+    it = 0
+    while it < total:
+        try:
+            if it < args.warmup:
+                t0 = time.perf_counter()
+                piper_exec_dag(loss_fn)
+                last_warmup_time = time.perf_counter() - t0
+                if args.iteration_sleep > 0:
+                    time.sleep(args.iteration_sleep)
+                it += 1
+                if it == args.warmup:
+                    step_timeout = (
+                        max(5.0, 5 * last_warmup_time)
+                        if last_warmup_time is not None
+                        else None
+                    )
+                    logger.info(f"Running {args.iters} timed iterations")
+                    ray.get([
+                        actor.reset_peak_memory.remote()
+                        for actor in actors.values()
+                    ])
+            else:
+                start = time.perf_counter()
+                piper_exec_dag(loss_fn, log_stats=True, step_timeout=step_timeout)
+                end = time.perf_counter()
+                iter_times.append(end - start)
+                if args.iteration_sleep > 0:
+                    time.sleep(args.iteration_sleep)
+                it += 1
+        except PiperResume as exc:
+            # Promotion recovery replaced the failed peer; redo the
+            # interrupted iteration in lockstep with the promoted standby.
+            logger.info(f"resuming after promotion at iteration "
+                        f"{exc.next_iter} (was at {it})")
+            it = exc.next_iter
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
@@ -153,7 +173,7 @@ def main(args, pg):
 
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
 
-    if args.pytorch_profiler and not fenced:
+    if args.pytorch_profiler:
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
             "out", "pytorch_profiles"
         )

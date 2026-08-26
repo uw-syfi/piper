@@ -491,9 +491,7 @@ class DagExecutor:
     # 0-based iteration counter, set by PiperActor.run_dag each call.
     # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
     _iter_count: int = 0
-    # Commit marker: _upd_begun = weights may be mutating for this iteration;
-    # _last_committed = optimizer update fully applied (recovery redoes +1).
-    _upd_begun: int = -1
+    # Commit marker: optimizer update fully applied (recovery redoes +1).
     _last_committed: int = -1
     # Set (before the comm abort) by PiperActor.abort_comms: an aborted
     # collective releases kernels with garbage, so a fenced step must not commit.
@@ -1017,7 +1015,6 @@ class DagExecutor:
 
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
-        self._upd_begun = self._iter_count
         if self.params.has_zero_shard_optimizers():
             if self._fenced:
                 raise RuntimeError(
