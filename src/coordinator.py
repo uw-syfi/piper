@@ -7,40 +7,8 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .state import create_logger, LOG_LEVEL
+from . import state as piper_state
 from .schedule import load_schedule_info
-
-_PROMOTION_SIGNAL_ACTOR = "piper_promotion_signal"
-
-
-@ray.remote(num_cpus=0)
-class PromotionSignal:
-    """Named actor: promotion command channel + per-dp_rank actor registry.
-
-    cmd: None until set; then {"op": "promote", "failed": int, "source": int,
-    "new_ranks": [int, int]} or {"op": "shutdown"}.
-    """
-
-    def __init__(self):
-        self._cmd = None
-        self._event = asyncio.Event()
-        self._actors = {}
-
-    def register_actors(self, dp_rank, handles):
-        self._actors[dp_rank] = handles
-
-    def get_actors(self, dp_rank):
-        return self._actors.get(dp_rank)
-
-    def set(self, cmd):
-        self._cmd = cmd
-        self._event.set()
-
-    def get(self):
-        return self._cmd
-
-    async def wait_for_cmd(self):
-        await self._event.wait()
-        return self._cmd
 
 
 # Coordinator needs GPUs when using profiling to infer stage boundaries
@@ -48,7 +16,10 @@ class PromotionSignal:
 
 # Use manual stage annotations- more stable
 @ray.remote(num_gpus=0.1)
-def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callable, *args, num_standby=0, **kwargs):
+def run_dp_rank(
+    dp_rank, dp_degree, pp_degree, world_size, training_func: Callable, *args,
+    num_standby=0, coordinator=None, **kwargs,
+):
     logger = create_logger("coordinator", LOG_LEVEL)
     logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
 
@@ -58,12 +29,21 @@ def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callab
     os.environ["PIPER_WORLD_SIZE"] = str(world_size)
     os.environ["PIPER_NUM_STANDBY"] = str(num_standby)
     os.environ["TORCH_LOGS"] = "+graph_breaks"
+    # Via the module: Ray ships this function by value, so a directly
+    # referenced `piper_metadata` would be a pickled copy, not the singleton.
+    piper_state.piper_metadata.coordinator = coordinator
     return training_func(*args, **kwargs)
 
 
 @ray.remote
 class PiperProgramCoordinator:
-    """Central Actor that Coordinates all the DP replicas of a single pipeline"""
+    """Central actor that coordinates all the DP replicas of a single
+    pipeline: spawns and supervises the dp_rank driver tasks, and serves as
+    the promotion command channel and per-dp_rank actor registry.
+
+    cmd: None until set; then {"op": "promote", "failed": int, "source": int,
+    "new_ranks": [int, int]} or {"op": "shutdown"}.
+    """
 
     def __init__(
         self,
@@ -88,7 +68,33 @@ class PiperProgramCoordinator:
         # pp_rank). In that mode DP drivers are spread across the pp bundles.
         self.pp_outer = pp_outer
 
-    def run_program(self, training_func: Callable, pg, *args, **kwargs):
+        # Promotion command channel + per-dp_rank actor registry.
+        self._cmd = None
+        self._cmd_event = asyncio.Event()
+        self._actors = {}
+
+    # ---- driver-facing API ----
+
+    def register_actors(self, dp_rank, handles):
+        self._actors[dp_rank] = handles
+
+    def get_actors(self, dp_rank):
+        return self._actors.get(dp_rank)
+
+    def get_cmd(self):
+        return self._cmd
+
+    async def wait_for_cmd(self):
+        await self._cmd_event.wait()
+        return self._cmd
+
+    def _set_cmd(self, cmd):
+        self._cmd = cmd
+        self._cmd_event.set()
+
+    # ---- supervision ----
+
+    async def run_program(self, training_func: Callable, pg, *args, **kwargs):
         from .compile import _RANK0_ADDR_ACTOR, _COMPILED_DATA_ACTOR
         logger = create_logger("coordinator", LOG_LEVEL)
         try:
@@ -108,16 +114,7 @@ class PiperProgramCoordinator:
             logger.exception("Failed to kill stale Ray actor named %s", _COMPILED_DATA_ACTOR)
             raise
 
-        sig = None
-        if self.num_standby > 0:
-            try:
-                ray.kill(ray.get_actor(_PROMOTION_SIGNAL_ACTOR))
-            except ValueError:
-                pass
-            sig = PromotionSignal.options(
-                name=_PROMOTION_SIGNAL_ACTOR, num_cpus=0
-            ).remote()
-            ray.get(sig.get.remote())  # ensure the name is resolvable before drivers start
+        self_handle = ray.get_runtime_context().current_actor
 
         n_ranks = self.dp_degree + self.num_standby
         refs = [
@@ -136,17 +133,19 @@ class PiperProgramCoordinator:
                 training_func,
                 *args,
                 num_standby=self.num_standby,
+                coordinator=self_handle,
                 **kwargs,
             )
             for dp_rank in range(n_ranks)
         ]
-        ref_to_rank = {ref: dp_rank for dp_rank, ref in enumerate(refs)}
-        trainer_pending = set(refs[: self.dp_degree])
-        standby_refs = set(refs[self.dp_degree:])
+        tasks = [asyncio.ensure_future(ref) for ref in refs]
+        task_to_rank = {task: dp_rank for dp_rank, task in enumerate(tasks)}
+        trainer_pending = set(tasks[: self.dp_degree])
+        standby_tasks = set(tasks[self.dp_degree:])
 
         # React to whichever dp_rank task finishes or fails first. Standby
         # tasks are excluded from failure accounting.
-        pending = list(refs)
+        pending = set(tasks)
         results = []
         failures = 0
         promoted = False
@@ -154,7 +153,7 @@ class PiperProgramCoordinator:
         alive_standby = list(range(self.dp_degree, n_ranks))
         while pending:
             if (
-                sig is not None
+                self.num_standby > 0
                 and not promoted
                 and not shutdown_sent
                 and not trainer_pending
@@ -162,14 +161,19 @@ class PiperProgramCoordinator:
                 # All trainer tasks resolved without promotion: release the
                 # parked standby so the job can terminate.
                 logger.info("all trainer tasks resolved; sending shutdown to standby")
-                ray.get(sig.set.remote({"op": "shutdown"}))
+                self._set_cmd({"op": "shutdown"})
                 shutdown_sent = True
-            done, pending = ray.wait(pending, num_returns=1)
-            rank = ref_to_rank[done[0]]
-            trainer_pending.discard(done[0])
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            # One task per iteration, as with ray.wait(num_returns=1).
+            task = done.pop()
+            pending |= done
+            rank = task_to_rank[task]
+            trainer_pending.discard(task)
             try:
-                res = ray.get(done[0])
-                if done[0] in standby_refs:
+                res = task.result()
+                if task in standby_tasks:
                     # Case 1 (no failure): standby was shut down, returns None,
                     # no metrics to record — drop is correct.
                     # TODO(phase-2), case 2 (promoted): the standby trained as a
@@ -178,7 +182,7 @@ class PiperProgramCoordinator:
                 else:
                     results.append(res)
             except Exception:
-                if done[0] in standby_refs:
+                if task in standby_tasks:
                     logger.exception(
                         f"standby dp_rank {rank} task failed; failover disabled"
                     )
@@ -190,20 +194,20 @@ class PiperProgramCoordinator:
                     f"a dp_rank task failed ({failures}/{self.dp_degree})"
                 )
                 if (
-                    sig is not None
+                    self.num_standby > 0
                     and alive_standby
                     and not promoted
                     and failures < self.dp_degree # at least one trainer survives
                 ):
                     promoted = True
-                    self._promote(sig, logger, failed_rank=rank,
-                                  standby_rank=alive_standby[0])
+                    await self._promote(logger, failed_rank=rank,
+                                        standby_rank=alive_standby[0])
                     continue
                 # No standby available for this failure: fail fast.
                 raise
         return results
 
-    def _promote(self, sig, logger, failed_rank: int, standby_rank: int):
+    async def _promote(self, logger, failed_rank: int, standby_rank: int):
         """Promote a standby to replace a failed trainer rank.
 
         failed_rank: dp_rank whose task failed.
@@ -222,13 +226,19 @@ class PiperProgramCoordinator:
             "new_ranks": new_ranks,
         }
         logger.info(f"promoting standby {standby_rank} for failed rank {failed_rank}: {cmd}")
-        # Order matters: the signal must be readable BEFORE any abort lands,
+        # Order matters: the command must be readable BEFORE any abort lands,
         # so fenced drivers can distinguish the abort from a genuine failure.
-        ray.get(sig.set.remote(cmd))
+        self._set_cmd(cmd)
         for rank in survivors:
-            handles = ray.get(sig.get_actors.remote(rank))
+            handles = self._actors.get(rank)
+            if not handles:
+                logger.warning(
+                    f"survivor dp_rank {rank} has no registered actors; "
+                    "cannot fence it"
+                )
+                continue
             for handle in handles:
-                ray.get(handle.abort_comms.remote(), timeout=60)
+                await asyncio.wait_for(handle.abort_comms.remote(), timeout=60)
 
 
 def create_piper_placement_group(

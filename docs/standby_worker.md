@@ -10,11 +10,11 @@ receive weights"). Weight transfer and resume are Phase 2.
  coordinator            driver dp0            driver dp1           driver dp2 (standby)
  ───────────            ──────────            ──────────           ────────────────────
  spawn drivers ───────► piper_setup           piper_setup          piper_setup (full init)
- create PromotionSignal   register actors ──►   register actors ──►  register actors
+ cmd channel + registry   register actors ──►   register actors ──►  register actors
       │                 train loop            train loop           PARK on wait_for_cmd
       │                 FWD BWD ═ALL-REDUCE═ FWD BWD ✗ fault              ⋮
- ray.wait sees dp1's task fail ◄─────────────── task fails                ⋮
-      │ sig.set({promote, failed:1,                                       ⋮
+ asyncio.wait sees dp1's task fail ◄─────────── task fails                ⋮
+      │ set_cmd({promote, failed:1,                                       ⋮
       │          source:0, new_ranks:[0,2]}) ────────────────────► wakes  │
       │ abort_comms ──► fence flag → abort                                │
       │                 dp+ep → abort_done                                │
@@ -27,6 +27,12 @@ receive weights"). Weight transfer and resume are Phase 2.
       │                 return partial metrics       │             return
  all refs resolved → return results → exit 0
 ```
+
+The coordinator is an asyncio actor: `run_program` awaits the driver tasks,
+so `register_actors` / `get_cmd` / `wait_for_cmd` (the promotion command
+channel and per-dp_rank actor registry, formerly a separate `PromotionSignal`
+named actor) are served concurrently on the same event loop. Drivers reach it
+via the handle in `piper_metadata.coordinator`.
 
 No failure: coordinator sends `{op: shutdown}` after trainers finish; the
 standby wakes, exits; results.csv identical to a no-standby run.

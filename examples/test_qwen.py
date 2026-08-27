@@ -6,7 +6,6 @@ import time
 import os
 
 from src.compile import piper_setup
-from src.coordinator import _PROMOTION_SIGNAL_ACTOR
 from src.piper import piper_exec_dag, PiperResume
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
@@ -51,12 +50,12 @@ def _run_standby(dp_rank, args, loss_fn):
     args: parsed harness arguments.
     loss_fn: loss used by piper_exec_dag.
     """
-    sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
+    coordinator = piper_metadata.coordinator
     actor = piper_metadata.actors[0] # pp_degree == 1
     ray.get(actor.prepare_standby_state.remote())
     logger.info(f"standby dp_rank {dp_rank}: initialized and parked; "
                 "waiting for promotion or shutdown")
-    cmd = ray.get(sig.wait_for_cmd.remote())
+    cmd = ray.get(coordinator.wait_for_cmd.remote())
     if cmd.get("op") == "promote":
         ray.get(
             actor.join_standby_group.remote(cmd["new_ranks"]),

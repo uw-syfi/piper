@@ -9,7 +9,7 @@ watchdog (~10–30 min). No recovery yet — standby promotion is the next miles
 ```
 harness (test_harness.py)
   └─ PiperProgramCoordinator.run_program          [src/coordinator.py]
-       ray.wait on dp_rank tasks (completion order)
+       async actor; awaits dp_rank tasks (completion order)
        ├─ 1st task failure → log "a dp_rank task failed (k/n)"
        │    └─ no standby configured → raise (fail fast) → job exits
        └─ driver, per dp_rank (test_qwen.main)

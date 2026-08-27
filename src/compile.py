@@ -251,18 +251,9 @@ def piper_setup(
         ])
 
     if int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0:
-        from .coordinator import _PROMOTION_SIGNAL_ACTOR
-
-        try:
-            sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
-            ray.get(sig.register_actors.remote(
-                dp_rank, list(piper_metadata.actors.values())
-            ))
-        except ValueError:
-            logger.warning(
-                "PIPER_NUM_STANDBY set but promotion-signal actor not found; "
-                "fencing will be unavailable"
-            )
+        ray.get(piper_metadata.coordinator.register_actors.remote(
+            dp_rank, list(piper_metadata.actors.values())
+        ))
 
     if dp_rank == 0:
         # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---

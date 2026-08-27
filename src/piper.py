@@ -231,14 +231,9 @@ class PiperResume(Exception):
 def _promotion_cmd():
     """Return the active promotion command, or None when no standby machinery
     exists (M1 behavior) or no promotion is in progress."""
-    from .coordinator import _PROMOTION_SIGNAL_ACTOR
-
-    try:
-        sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
-    except ValueError:
-        # No signal actor: num_standby == 0, plain M1 behavior.
+    if int(os.environ.get("PIPER_NUM_STANDBY", "0")) <= 0:
         return None
-    return ray.get(sig.get.remote(), timeout=10)
+    return ray.get(piper_metadata.coordinator.get_cmd.remote(), timeout=10)
 
 
 def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None = None) -> list:
@@ -297,11 +292,8 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
                     standby_rank = next(
                         r for r in cmd["new_ranks"] if r != cmd["source"]
                     )
-                    from .coordinator import _PROMOTION_SIGNAL_ACTOR
-
-                    sig = ray.get_actor(_PROMOTION_SIGNAL_ACTOR)
                     standby_actor = ray.get(
-                        sig.get_actors.remote(standby_rank)
+                        piper_metadata.coordinator.get_actors.remote(standby_rank)
                     )[0]
                     state_ref = ray.get(
                         survivor_actor.make_state_ref.remote(), timeout=120
