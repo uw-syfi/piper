@@ -250,6 +250,11 @@ def piper_setup(
             for actor in piper_metadata.actors.values()
         ])
 
+    if int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0:
+        ray.get(piper_metadata.coordinator.register_actors.remote(
+            dp_rank, list(piper_metadata.actors.values())
+        ))
+
     if dp_rank == 0:
         # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---
 

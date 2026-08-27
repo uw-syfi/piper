@@ -1,0 +1,4 @@
+[
+  { "op": "place",     "filter": { "PP": 0 }, "devices": [0, 1] },
+  { "op": "replicate", "filter": { "PP": 0 }, "devices": [0, 1], "reduce_stream": "dp_stream" }
+]

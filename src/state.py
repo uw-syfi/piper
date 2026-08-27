@@ -40,6 +40,7 @@ Piper thread local storage for tracking Piper actors, stages, and microbatches
 
 class PiperMetadata:
     actors = dict()
+    coordinator = None  # Handle of the PiperProgramCoordinator supervising this dp_rank driver
     visualize_dag: bool = False  # Whether to render per-rank DAG PNGs after compilation
     artifact_dir: str = "out"  # Directory for debug artifacts emitted during runs
     training_dag = None  # DAG of annotated model segments and transform-inserted nodes

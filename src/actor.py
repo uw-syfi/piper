@@ -1,4 +1,5 @@
 import ray
+import threading
 import torch
 import os
 import re
@@ -69,6 +70,12 @@ def _create_actors(
                 # "NCCL_P2P_DISABLE": "1",
                 # "NCCL_DEBUG": "INFO",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
+                # Actors don't inherit the driver's os.environ.
+                "PIPER_NUM_STANDBY": os.environ.get("PIPER_NUM_STANDBY", "0"),
+                # Watchdog auto-handling reacts to our intentional abort by
+                # aborting every comm (see _abort_process_group docs).
+                **({"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"}
+                   if int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0 else {}),
             }
         }
         # When pp_outer=True, one bundle corresponds to one pipeline stage and
@@ -78,6 +85,11 @@ def _create_actors(
         bundle_index = pp_rank if pp_outer else dp_rank
         actor = PiperActor.options(
             num_gpus=0.6,
+            # Threaded actor:
+            # - Survivor: abort_comms must run while run_dag is blocked.
+            # - Standby: load_state must run while wait_state_loaded is blocked.
+            max_concurrency=2,
+            enable_tensor_transport=True,
             runtime_env={**nsight_env, **nccl_env},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -159,6 +171,17 @@ class PiperActor:
             self.compute,
             self.logger,
         )
+        # Standby mode: UPD must CPU-sync all-reduces and honor the fence flag
+        # (an aborted collective otherwise commits garbage gradients).
+        self.dag_executor._cpu_sync_allreduce = (
+            int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0
+        )
+        # Set when abort_comms has fully finished; join_standby_group must not
+        # build a new comm while an abort is still in flight in this process.
+        self._abort_done = threading.Event()
+        self._state_loaded = threading.Event()
+        self._resume_iter = None
+        self._promotion_tensors = None
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the coordinator before compilation so _load_stage can fill them in
@@ -265,7 +288,10 @@ class PiperActor:
             self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
     def _join_dp_process_group(self):
-        num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
+        # Standby ranks execute every collective new_group call (required by
+        # default-mode new_group) but are members of no dp/ep group.
+        n_trainers = self.runtime.dp_degree * self.runtime.pp_degree
+        num_dp_groups = n_trainers // self.runtime.dp_degree
         for dp_group_id in range(num_dp_groups):
             group_ranks = [
                 (dp_group_id + num_dp_groups * i) for i in range(self.runtime.dp_degree)
@@ -275,12 +301,13 @@ class PiperActor:
             # the same internal NCCL proxy stream, which prevents true overlap.
             process_group = dist.new_group(ranks=group_ranks, backend="nccl")
             ep_process_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            if self.runtime.global_rank % num_dp_groups == dp_group_id:
+            if self.runtime.global_rank in group_ranks:
                 self.runtime.dp_group = process_group
                 self.runtime.ep_group = ep_process_group
 
     def _join_pp_process_group(self):
-        num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
+        n_trainers = self.runtime.dp_degree * self.runtime.pp_degree
+        num_pp_groups = n_trainers // self.runtime.pp_degree
 
         for pp_group_id in range(num_pp_groups):
             group_ranks = [
@@ -292,6 +319,137 @@ class PiperActor:
             if self.runtime.global_rank in group_ranks:
                 self.runtime.pp_lo_hi = lo_hi_group
                 self.runtime.pp_hi_lo = hi_lo_group
+
+    def abort_comms(self):
+        """Abort this actor's dp/ep NCCL communicators (fencing during promotion)."""
+        from torch.distributed.distributed_c10d import _abort_process_group
+
+        # The fence flag must be visible BEFORE the abort releases any kernel,
+        # so the executor refuses the poisoned iteration's optimizer step.
+        self.dag_executor._fenced = True
+        aborted = []
+        if self.runtime.dp_group is not None:
+            _abort_process_group(self.runtime.dp_group)
+            aborted.append("dp_group")
+        if self.runtime.ep_group is not None:
+            _abort_process_group(self.runtime.ep_group)
+            aborted.append("ep_group")
+        self.logger.info(f"abort_comms: aborted {aborted}")
+        self._abort_done.set()
+        return aborted
+
+    def join_standby_group(self, new_ranks):
+        """Create the survivor+standby dp/ep groups, make them the active
+        training groups, and lift the fence.
+
+        new_ranks: sorted global ranks of the members; only members call this.
+        """
+        new_ranks = list(new_ranks)
+        if self.dag_executor._fenced:
+            # Building a fresh NCCL comm while an abort is in flight in this
+            # process deadlocks; wait for abort_comms to finish.
+            if not self._abort_done.wait(timeout=120):
+                raise RuntimeError("abort_comms did not finish within 120s")
+            torch.cuda.synchronize()
+        self.logger.info(f"join_standby_group: creating groups ranks={new_ranks}")
+        new_dp = dist.new_group(
+            ranks=new_ranks, backend="nccl", use_local_synchronization=True
+        )
+        new_ep = dist.new_group(
+            ranks=new_ranks, backend="nccl", use_local_synchronization=True
+        )
+        # Communicator construction is lazy: the first collective of the
+        # resumed training initializes it.
+        self.runtime.dp_group = new_dp
+        self.runtime.ep_group = new_ep
+        self.dag_executor._fenced = False
+        self.logger.info(f"join_standby_group: joined ranks={new_ranks}")
+        return new_ranks
+
+    def get_last_committed(self):
+        """Last iteration whose optimizer update fully committed (-1 if none)."""
+        return getattr(self.dag_executor, "_last_committed", -1)
+
+    def _promotion_state_tensors(self):
+        """Flat list of param + Adam state tensors transferred at promotion.
+
+        Survivor: the tensors to send. Standby: the buffers to receive
+        into; its missing Adam state is created as zeros.
+        """
+        if self._promotion_tensors is not None:
+            return self._promotion_tensors
+        if self.stages.zero_managed_ubids:
+            raise NotImplementedError(
+                "standby weight transfer supports pure DP only"
+            )
+        tensors = []
+        for _, bucket in self.stages.buckets.items():
+            opt = bucket.optimizer
+            if opt is None:
+                continue
+            for p in bucket.trainable_params():
+                st = opt.state.get(p)
+                if st is None:
+                    # Fused Adam creates state lazily on first step; the
+                    # standby never steps, so materialize matching zeros.
+                    st = {
+                        "step": torch.zeros(
+                            (), dtype=torch.float32, device=p.device
+                        ),
+                        "exp_avg": torch.zeros_like(p),
+                        "exp_avg_sq": torch.zeros_like(p),
+                    }
+                    opt.state[p] = st
+                tensors.extend(
+                    [p.detach(), st["exp_avg"], st["exp_avg_sq"], st["step"]]
+                ) # Flat because set_target_for_ref matches by position.
+        self._promotion_tensors = tensors
+        return tensors
+
+    def prepare_standby_state(self):
+        """Materialize optimizer state and pre-register NIXL buffers while parked."""
+        tensors = self._promotion_state_tensors()
+        try:
+            for t in tensors:
+                ray.experimental.register_nixl_memory(t)
+        except Exception:
+            self.logger.exception(
+                "register_nixl_memory failed; registration will happen at transfer time"
+            )
+        return len(tensors)
+
+    def make_state_ref(self):
+        """Publish params + optimizer state + resume iteration via NIXL RDT.
+
+        Returns a ray.put-created ObjectRef (borrowable, see ray#59644).
+        """
+        state = {
+            "next_iter": self.dag_executor._last_committed + 1,
+            "tensors": self._promotion_state_tensors(),
+        }
+        return ray.put(state, _tensor_transport="nixl")
+
+    def load_state(self, refs):
+        """Receive the survivor's state directly into this actor's buffers.
+
+        refs: single-element list holding the state ObjectRef.
+        """
+        ref, = refs
+        targets = self._promotion_state_tensors()
+        ray.experimental.set_target_for_ref(ref, targets)
+        state = ray.get(ref)
+        next_iter = int(state["next_iter"])
+        self._iter_counter = next_iter
+        self.dag_executor._last_committed = next_iter - 1
+        self._resume_iter = next_iter
+        self._state_loaded.set()
+        return next_iter
+
+    def wait_state_loaded(self):
+        """Block until load_state has landed; returns the iteration to resume at."""
+        if not self._state_loaded.wait(timeout=600):
+            raise RuntimeError("standby state was not loaded within 600s")
+        return self._resume_iter
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
@@ -735,6 +893,8 @@ class PiperActor:
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
+        # Debug-only: expose the iteration counter for E2E fault injection.
+        self.dag_executor._iter_count = iter_idx
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
         self.dag_executor.run(
             self.dag,
