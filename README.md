@@ -1,4 +1,4 @@
-# Piper: A Programmable Distributed Training System
+per: A Programmable Distributed Training System
 
 [![arXiv](https://img.shields.io/badge/arXiv-2606.11169-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.11169)
 
@@ -23,91 +23,21 @@ With lightweight model annotations and a small scheduling language, Piper lets u
 
 Piper has two user-facing inputs:
 
-* An annotated PyTorch model: standard model code with lightweight tags for schedulable regions such as pipeline stages and MoE experts.
+* An annotated PyTorch model: standard model code with lightweight tags for schedulable regions such as pipeline stages and routed computation.
 * A schedule-directive program: instructions that tell the Piper compiler how to shard, replicate, order, and overlap those schedulable regions.
 
 The compiler traces the model with TorchDynamo, splits the graph by Piper annotations, builds a distributed training DAG IR, and applies DAG rewrites according to the schedule directives.
-The directive rewrites insert point-to-point pipeline communication, DP collectives, ZeRO gather/scatter collectives, EP all-to-all communication, temporal edges, device assignments, and logical stream assignments.
+The directive rewrites insert point-to-point pipeline communication,
+DP collectives, ZeRO gather/scatter collectives, routed
+EP all-to-all or M-to-N communication, temporal edges, rank
+assignments, and logical stream assignments.
 
-The runtime decomposes the global DAG into per-device execution plans and runs them on Ray actors.
-Each actor manages local CUDA streams, process groups/communicators, model-state buffers, and intermediate tensors.
 
-### Training-step simulation
-
-Piper can profile finalized TrainingDAG nodes and replay their logical stream
-schedule in a CUDA-free event simulator. The profiler collects two compatible
-timing datasets:
-
-* `interference_free` serializes non-P2P work onto one CUDA stream to measure
-  node durations without same-device compute or memory contention.
-* `normal` preserves the actual logical CUDA streams and records contended
-  durations plus iteration-aligned GPU start offsets. Normal replay uses those
-  offsets as release constraints, preserving launch gaps that dependency edges
-  and durations alone cannot reconstruct.
-
-Pipeline SEND/RECV operations are never forced onto the serialized stream.
-Both modes retain separate `pp_lo_hi` and `pp_hi_lo` NCCL groups and CUDA
-streams, allowing opposite directions to make progress concurrently and
-avoiding profiler-induced P2P deadlock.
-
-Every DP worker participating in a training program must call the profiling
-API. The merged artifact contains rank-specific node durations and a slim copy
-of the finalized DAGs:
-
-```python
-from src.piper import piper_profile_dags, simulate_profiled_modes
-from src.profiling import ProfileConfig
-
-plan = piper_profile_dags(
-    loss_fn,
-    ProfileConfig(),  # 5 warmups; exactly 30 measured iterations per mode
-    profile_modes=("interference_free", "normal"),
-    output_path="out/step_time_profiles.json",
-)
-comparison = simulate_profiled_modes(plan, actual_step_samples_s=hardware_samples)
-print(comparison.interference_free_statistics)
-print(comparison.normal_statistics)
-print(comparison.normal_prediction_error)
-```
-
-A saved artifact can be simulated without GPUs or Ray:
-
-```bash
-python scripts/simulate_step_times.py \
-  out/step_time_profiles.json \
-  --mode both \
-  --actual-step-time-s 0.0645 \
-  --output out/interference_free_simulation.json
-```
-
-To rank profiled nodes by their normal-to-interference-free median duration:
-
-```bash
-python scripts/export_node_profile_ratios.py \
-  out/step_time_profiles.json \
-  --output out/node_profile_time_ratios.csv
-```
-
-The exporter pools each node's raw samples across its profiled global-rank
-entries, omits non-executing bookkeeping nodes with no samples in either mode,
-and sorts the CSV by descending duration ratio.
-
-The simulator preserves stream FIFO, data/temporal dependencies, P2P and
-collective rendezvous, but has no shared SM, memory-bandwidth, or network-link
-capacity clock. Independent streams therefore progress at their profiled solo
-rates. Because a communication endpoint's CUDA-event timing may include time
-waiting for peers, a collapsed rendezvous uses the minimum endpoint estimate
-as its optimistic service time after all participants become ready; the
-timeline still reports every endpoint's raw profiled duration.
-
-The normal hardware baseline uses exactly `--iters` measured iterations and
-each profile mode uses exactly `--profile-iters` measured iterations (both
-default to 30). Confidence intervals and their relative errors are descriptive;
-they never change the iteration count. The harness reports the sample count,
-estimator, mean, median, standard deviation, 95% CI, and relative CI error for
-actual time, throughput, simulated normal time, simulated interference-free
-time, instrumented normal-profile time, and peak memory. It also reports simulated
-normal prediction error against the measured median.
+The runtime decomposes the global DAG into one execution plan per ActorGroup
+(a SPMD group of ranks which execute different DP/EP shards of the same pipeline stage)
+and sends it to every rank in that group. Each actor manages its local
+CUDA streams, process groups/communicators, model-state buffers, and
+intermediate tensors.
 
 ## Installation
 
@@ -143,16 +73,20 @@ python examples/test_harness.py \
   --mbs 4
 ```
 
-The base schedule `pp4_dp2_ep2_v_placement.json` describes a PP x DP x EP placement with four annotated pipeline regions mapped onto two physical pipeline ranks in a V layout.
-Regions `PP=0` and `PP=3` run on device group `[0, 2]`, while `PP=1` and `PP=2` run on device group `[1, 3]`.
-Within each device group, Piper replicates non-expert regions for DP and shards expert regions for EP.
+The legacy-named base schedule `pp4_dp2_ep2_v_placement.json` maps four
+annotated pipeline regions onto two ActorGroups in a V layout. Regions `PP=0`
+and `PP=3` run on the SPMD ranks `[0, 2]`, while `PP=1` and `PP=2` run on
+`[1, 3]`. Within each ActorGroup, Piper replicates the dense regions and
+route-shards the expert regions; the group width is not stored or interpreted
+as a separate replication topology.
 `replicate` and `shard` filters must select disjoint model regions; applying
 both ownership modes to the same region is rejected. A `place` directive may
 select either kind of region. For an EP schedule, use an absence filter such as
 `{"PP": 0, "EP": "-"}` to replicate only the dense portion of a pipeline
 stage and `{"PP": 0, "EP": "*"}` to shard its expert regions.
 This example expects four visible CUDA devices.
-The harness appends DualPipeV `split` and `order` directives for two physical pipeline ranks and four microbatches.
+The harness appends DualPipeV `split` and `order` directives for two
+ActorGroups and four microbatches.
 
 Run the Qwen example with PP x ZeRO-3 1F1B schedule:
 
@@ -165,16 +99,19 @@ python examples/test_harness.py \
   --mbs 4
 ```
 
-The base schedule `pp2_dp2_ep2_zero3.json` describes a PP x DP x EP placement with two pipeline stages, DP degree two, EP sharding, and ZeRO-3-style gradient and parameter sharding.
-Stage `PP=0` runs on device group `[0, 2]`, while `PP=1` runs on device group `[1, 3]`.
+The legacy-named base schedule `pp2_dp2_ep2_zero3.json` maps two pipeline
+stages onto ActorGroups `[0, 2]` and `[1, 3]`. Its dense replicated regions use
+ZeRO-3-style gradient and parameter sharding across their ActorGroup SPMD
+ranks, while its expert regions use route ownership sharding.
 This example also expects four visible CUDA devices.
-The harness appends 1F1B `split` and `order` directives for two pipeline ranks and four microbatches.
+The harness appends 1F1B `split` and `order` directives for two ActorGroups and
+four microbatches.
 Each run creates `out/<timestamp>/` with the complete generated schedule and metrics.
 
 ### Multi-host Ray
 
-Piper does not discover remote hosts automatically. Start a Ray head inside the
-GB200 container on the first host, then join each worker from its own container.
+Piper does not discover remote hosts automatically. Start a Ray head on 
+the first host, then join each worker node.
 Use private IPs reachable over the interface that NCCL will use:
 
 ```bash
@@ -187,18 +124,6 @@ scripts/join_ray_worker.sh \
   --node-ip <worker-private-ip>
 ```
 
-Both scripts use `/opt/piper-venv`, advertise all visible GPUs, stop any stale
-local Ray daemon, disable Ray usage reporting, and use
-`/tmp/piper/ray_tmp`. On multi-NIC hosts, pass the same communication interface
-on both machines with `--network-interface <name>`. Use `--no-stop` to preserve
-an existing local Ray session or `--dry-run` to inspect the resolved command.
-
-Verify the cluster from the head:
-
-```bash
-/opt/piper-venv/bin/ray status --address=<head-private-ip>:6379
-```
-
 Then pass the head address to the harness with
 `--address <head-private-ip> --port 6379`.
 
@@ -207,11 +132,17 @@ Then pass the head address to the harness with
 ### Annotations
 
 `piper.annotate(tag)` is a context manager that attaches Piper metadata to all PyTorch operations traced inside the scope.
-The `tag` is a non-empty string naming a schedulable dimension of the model, such as `PP` for pipeline regions or `EP` for expert regions.
+The `tag` is a non-empty string naming a schedulable dimension of the model, such as `PP` for pipeline regions or `EP` for routed regions.
 For each tag name, Piper assigns integer indices in trace order, so repeated `piper.annotate("PP")` scopes become `PP=0`, `PP=1`, and so on.
 
-An `EP` region must explicitly identify the three tensors used by expert
-dispatch and combine:
+The schedule directives program uses the tag names and indices in filters to select regions of the traced model.
+For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
+See the blog walkthrough section on [annotating a Qwen3 MoE model](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#annotating-a-qwen3-moe-model) for an example and further details.
+
+#### Tensor-routing interface for sharded regions
+
+A region selected by a `shard` directive must explicitly identify the three
+tensors used by routed dispatch and combine: `mark_combine_payload`, `mark_dispatch_counts`, and `mark_dispatch_payload`.
 
 ```python
 from src.piper import (
@@ -229,22 +160,42 @@ with annotate("EP"):
 ```
 
 These functions are trace-preserved tensor identities. They let Piper insert
-uneven all-to-all communication without inferring tensor roles from shapes,
-dtypes, or model-specific operator patterns. Each EP region requires exactly
-one marker of each kind.
+routed communication without requiring specific operators or expert patterns.
+Every routed region must be one
+contiguous annotated segment with exactly one marker of each kind; the two
+dispatch markers must cross its immediately preceding annotation boundary and
+the combine marker must cross its immediately following boundary.
 
-The model author is responsible for the semantic relationship between these
-markers: dispatch rows must be packed into consecutive blocks described by the
-route counts, and the combine payload must restore every received row to its
-original source-major, local-route position. Piper validates graph
-dependencies, tensor schemas, counts, and row totals, but it cannot determine
-from tensor values whether a row was assigned to the correct route or restored
-to the correct identity. Routed model implementations should therefore include
-correctness tests with identifiable rows.
+The routed tensor interface is:
 
-The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
-For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
-See the blog walkthrough section on [annotating a Qwen3 MoE model](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#annotating-a-qwen3-moe-model) for an example and further details.
+* At the source boundary, `dispatch_payload` has shape `[rows, hidden]`. Its rows 
+  are grouped by global route in route-index order, and `dispatch_counts[0, route]` 
+  gives the number of rows in each group.
+* The annotated source-side `dispatch_counts` tensor has shape
+  `[1, num_global_routes]`. It is a nonnegative, non-differentiable integer
+  tensor, and `dispatch_counts[0, route]` is the number of payload rows assigned to 
+  that route.
+* After communication, Piper presents the routed region with `dispatch_counts` shaped
+  `[num_source_ranks, num_local_routes]` and `dispatch_payload` packed in source-major,
+  then local-route-major order. Entry `dispatch_counts[source, route]` gives the number of 
+  payload rows assigned to that source/route pair. Piper does not perform model-specific 
+  regrouping or padding. The sharded region's model code is responsible for, e.g., regrouping
+  `dispatch_payload` by local expert. 
+* `combine_payload` is the only dynamic output. It must contain one result row
+  per received row, in the same source-major/local-route order. The sharded region's 
+  model code is responsible for un-doing any regrouping that it applied to `dispatch_payload`.
+* Both `dispatch_payload` and `dispatch_counts` must be graph ancestors of `combine_payload`, and no
+  other dynamic value may be consumed or produced by the routed region.
+  Parameters, buffers, constants, and derived symbolic sizes are allowed.
+  Values unused by the region may bypass it; if the source and destination regions are on the same
+  ActorGroup, then Piper keeps those values local, otherwise it sends them directly via P2P rather
+  than routing them through the sharded region.
+
+The model author must pack source rows according to `dispatch_counts` and undo
+any model-side row permutation before marking `combine_payload`. Piper checks
+the marker placement, dependencies, tensor schemas, counts, and row totals,
+but cannot prove that rows were assigned to or restored from the correct
+routes -- it is the responsibility of the user to guarantee this. 
 
 ### Schedule Directives Program
 
@@ -255,33 +206,55 @@ The `order` directive uses `filters` to describe a sequence of filter groups.
 A `filter` is a JSON object whose keys are tag names and whose values are the tag indices to match.
 
 Filter keys can refer to annotation tags, new tags added by previous directives, or the compiler-provided `PASS` tag which supports `F` (forward), `B` (backward), `BI` (backward for inputs), and `BW` (backward for weights) for different training step stages.
-Filter values can be tag indices or the special value `"*"` to match any concrete index for the key.
+Filter values can be tag indices, `"*"` to match any concrete index for the
+key, or `"-"` to match only nodes on which that key is absent.
 
 The empty filter `{}` matches the entire DAG IR.
 All key/value pairs in a filter are conjunctive, so `{"PP": 1, "EP": "*"}` matches nodes that are in pipeline region `PP=1` and have any `EP` index.
 
 Supported directives:
 
-* `place` assigns matched compute regions to device groups and names the stream used for inserted PP send/recv communication.
+Before applying individual directives, Piper interprets each distinct
+`place.devices` set as one SPMD ActorGroup. The listed integers are global SPMD-rank
+IDs. Every `replicate` or `shard` device set
+must exactly match a `place` ActorGroup; partially overlapping or nested device
+sets are rejected. The input microbatch is split evenly over the input
+ActorGroup, so its batch dimension must be divisible by that
+ActorGroup's size.
+
+* `place` assigns matched compute regions to an ActorGroup and names the
+  logical stream used for inserted PP send/receive communication (under the hood,
+  opposite P2P directions are mapped onto different directional physical low-to-high and
+  high-to-low streams and communicators to avoid deadlock). If any
+  placement supplies `stream`, all placement directives that supply it must
+  agree.
   * `op`: `"place"`
   * `filter`: Selects the model regions to place.
-  * `devices`: Non-empty list of CUDA device IDs for the placement group.
+  * `devices`: Non-empty list of global SPMD-rank IDs for the ActorGroup.
   * `stream`: Optional logical stream name for inserted point-to-point communication.
-* `replicate` replicates matched regions across devices and inserts DP synchronization.
+* `replicate` materializes the matched region on every SPMD rank in an
+  ActorGroup and averages its gradients once per training step across that group.
   * `op`: `"replicate"`.
   * `filter`: Selects the model regions to replicate.
-  * `devices`: Non-empty list of CUDA device IDs across which the region is replicated.
-  * `reduce_stream`: Optional logical stream name for gradient reduction collective communication.
+  * `devices`: ActorGroup device list, exactly matching a `place` directive.
+  * `reduce_stream`: Optional logical stream name for gradient synchronization collectives.
   * `gather_stream`: Optional logical stream name for ZeRO-3 parameter materialization collective communication.
   * `bucket_size`: Optional parameter bucket size in MB for finer-grained synchronization.
   * `shard_grads`: Optional boolean enabling ZeRO-2-style gradient sharding.
   * `shard_params`: Optional boolean enabling ZeRO-3-style parameter sharding.
-* `shard` shards matched regions across devices and inserts all-to-all communication, typically for expert regions.
+* `shard` assigns equal contiguous route ranges (i.e. expert ranges, in the case of EP) to the
+  SPMD ranks in an ActorGroup and inserts routed communication around the matched region.
+  If the regions surrounding the matched sharded region all belong to the same ActorGroup,
+  the routed communication lowers to ragged all-to-all; if the surrounding regions belong
+  to a different ActorGroup, the routed communication lowers to M-to-N or N-to-M communication. The
+  number of global routes must be divisible by the shard degree, and
+  `devices` must be written in ascending global-rank order.
   * `op`: `"shard"`
   * `filter`: Selects the model regions to shard.
-  * `devices`: Non-empty list of CUDA device IDs across which the region is sharded.
-  * `stream`: Optional logical stream name for inserted all-to-all collective communication.
+  * `devices`: ActorGroup device list, exactly matching a `place` directive.
+  * `stream`: Optional logical stream for inserted routed communication.
 * `split` duplicates the matched DAG by a named microbatch dimension.
+  Currently it only handles duplicating the entire DAG.
   * `op`: `"split"`
   * `filter`: Selects the sub-DAG to duplicate.
   * `dim_name`: Non-empty string naming the new split dimension.
@@ -294,7 +267,7 @@ Supported directives:
   * Multiple filters in the same group permit Piper to interleave those sub-DAGs.
 
 In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/test_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
-For more detail, see the blog walkthrough sections on [PP x DP x EP placement](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#generating-directives-with-schedule-builders).
+For more detail, see the blog walkthrough sections on [replicated-dense and expert-sharded placement](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#generating-directives-with-schedule-builders).
 
 ## Overview of Outputs
 
@@ -306,15 +279,16 @@ out/<timestamp>/
 `-- results.csv
 ```
 
-`results.csv` contains a row for each SPMD rank (e.g., each DP rank), including
-raw-distribution summaries and percentage uncertainty for iteration time,
-training throughput, and per-PP-rank peak memory. With
+`results.csv` contains one row for the training program, including ActorGroup
+count, total SPMD world size, raw-distribution summaries and percentage
+uncertainty for iteration time and training throughput, and peak-memory
+columns for each global SPMD rank. With
 `--profile-and-simulate`, the run directory also contains the reusable
 multi-mode profile JSON and normal/interference-free simulation statistics.
 
 Optional artifact generation flags:
 
-* `--viz` renders the generated pipeline schedule and per-PP-rank DAG IRs under the run directory.
+* `--viz` renders the generated pipeline schedule and per-ActorGroup DAG IRs under the run directory.
 * `--pytorch-profiler --pytorch-profiler-iters <n>` runs extra profiled iterations and writes combined Chrome trace files per SPMD rank; Piper annotates GPU events with DAG IR node labels.
 * `--profile-and-simulate` collects interference-free and normal node profiles,
   replays both, and reports normal-replay prediction error. `--profile-iters`
@@ -338,3 +312,4 @@ If you use Piper in your research, please cite:
       url={https://arxiv.org/abs/2606.11169}, 
 }
 ```
+
