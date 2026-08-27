@@ -57,7 +57,8 @@ python examples/test_harness.py --test-file examples/test_qwen.py \
 
 Expected: `PIPER_FAULT firing`, coordinator logs `a dp_rank task failed (1/2)`
 with the `RuntimeError: injected fault` traceback, job exits nonzero within
-seconds.
+seconds. The driver stdout shows only the traceback; the other lines are in
+the Ray worker logs (`<temp-dir>/session_*/logs/worker-*.out`).
 
 **Stuck mode** — 60 s hang in dp_rank 1 (self-recovers):
 

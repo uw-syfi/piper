@@ -230,7 +230,7 @@ class PiperResume(Exception):
 
 def _promotion_cmd():
     """Return the active promotion command, or None when no standby machinery
-    exists (M1 behavior) or no promotion is in progress."""
+    exists or no promotion is in progress."""
     if int(os.environ.get("PIPER_NUM_STANDBY", "0")) <= 0:
         return None
     return ray.get(piper_metadata.coordinator.get_cmd.remote(), timeout=10)

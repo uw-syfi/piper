@@ -40,9 +40,6 @@ class PiperProgramCoordinator:
     """Central actor that coordinates all the DP replicas of a single
     pipeline: spawns and supervises the dp_rank driver tasks, and serves as
     the promotion command channel and per-dp_rank actor registry.
-
-    cmd: None until set; then {"op": "promote", "failed": int, "source": int,
-    "new_ranks": [int, int]} or {"op": "shutdown"}.
     """
 
     def __init__(
@@ -174,10 +171,8 @@ class PiperProgramCoordinator:
             try:
                 res = task.result()
                 if task in standby_tasks:
-                    # Case 1 (no failure): standby was shut down, returns None,
-                    # no metrics to record — drop is correct.
-                    # TODO(phase-2), case 2 (promoted): the standby trained as a
-                    # replacement and returns real metrics; append to results.
+                    # Standby returns None in both cases: shut down (nothing to record) or
+                    # promoted (TODO: return the replacement's metrics and append to results).
                     logger.info(f"standby dp_rank {rank} task finished")
                 else:
                     results.append(res)
