@@ -6,27 +6,6 @@
 #
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-
 import warnings
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -136,94 +115,6 @@ _QWEN3_30B = Qwen3ConfigSpec(
     max_seq_len=40960,
     rope_theta=1_000_000.0,
 )
-_QWEN3_30B_BASE = replace(_QWEN3_30B, max_seq_len=32768)
-_QWEN3_30B_LONG = replace(
-    _QWEN3_30B,
-    max_seq_len=262144,
-    rope_theta=10_000_000.0,
-)
-_QWEN3_235B = Qwen3ConfigSpec(
-    dim=4096,
-    n_layers=94,
-    n_heads=64,
-    n_kv_heads=4,
-    head_dim=128,
-    hidden_dim=12288,
-    moe_inter_dim=1536,
-    num_experts=128,
-    top_k=8,
-    max_seq_len=40960,
-    rope_theta=1_000_000.0,
-)
-_QWEN3_235B_LONG = replace(
-    _QWEN3_235B,
-    max_seq_len=262144,
-    rope_theta=5_000_000.0,
-)
-_QWEN3_CODER_480B = Qwen3ConfigSpec(
-    dim=6144,
-    n_layers=62,
-    n_heads=96,
-    n_kv_heads=8,
-    head_dim=128,
-    hidden_dim=8192,
-    moe_inter_dim=2560,
-    num_experts=160,
-    top_k=8,
-    max_seq_len=262144,
-    rope_theta=10_000_000.0,
-    load_balance_coeff=0.0,
-)
-_QWEN3_NEXT_80B = Qwen3ConfigSpec(
-    dim=2048,
-    n_layers=8,
-    n_heads=16,
-    n_kv_heads=2,
-    head_dim=256,
-    hidden_dim=5120,
-    moe_inter_dim=512,
-    num_experts=512,
-    top_k=10,
-    max_seq_len=262144,
-    rope_theta=10_000_000.0,
-    num_shared_experts=1,
-    exact_backbone=False,
-)
-_QWEN3_CODER_NEXT = replace(_QWEN3_NEXT_80B, rope_theta=5_000_000.0)
-_QWEN35_35B = Qwen3ConfigSpec(
-    dim=2048,
-    n_layers=8,
-    n_heads=16,
-    n_kv_heads=2,
-    head_dim=256,
-    # Qwen3.5 has no dense intermediate_size. This field is unused by its
-    # all-MoE layer proxy, so use the routed/shared expert width.
-    hidden_dim=512,
-    moe_inter_dim=512,
-    num_experts=256,
-    top_k=8,
-    max_seq_len=262144,
-    rope_theta=10_000_000.0,
-    vocab_size=248320,
-    num_shared_experts=1,
-    exact_backbone=False,
-)
-_QWEN35_122B = Qwen3ConfigSpec(
-    dim=3072,
-    n_layers=8,
-    n_heads=32,
-    n_kv_heads=2,
-    head_dim=256,
-    hidden_dim=1024,
-    moe_inter_dim=1024,
-    num_experts=256,
-    top_k=8,
-    max_seq_len=262144,
-    rope_theta=10_000_000.0,
-    vocab_size=248320,
-    num_shared_experts=1,
-    exact_backbone=False,
-)
 _QWEN35_397B = Qwen3ConfigSpec(
     dim=4096,
     n_layers=8,
@@ -241,70 +132,10 @@ _QWEN35_397B = Qwen3ConfigSpec(
     exact_backbone=False,
 )
 
-# Synthetic H100 NVLink workload whose aggregate training expert GEMMs and
-# dispatch/combine A2A payloads have approximately equal roofline times.  The
-# depth-scaled variants preserve that per-layer ratio exactly.
-_QWEN3_COMM_1TO1 = Qwen3ConfigSpec(
-    vocab_size=4096,
-    dim=256,
-    n_layers=4,
-    n_heads=8,
-    n_kv_heads=4,
-    head_dim=32,
-    hidden_dim=512,
-    max_seq_len=8192,
-    rope_theta=1_000_000.0,
-    moe_inter_dim=864,
-    num_experts=8,
-    top_k=8,
-    route_norm=False,
-    load_balance_coeff=None,
-)
-
-# Synthetic development presets and non-quantized checkpoints from Qwen's
-# official model collections all use this one registry and construction path.
-# Quantized releases reuse these same architecture shapes and are not separate
-# presets.
+# Keep one representative preset per materially different workload used by
+# Piper: small MoE correctness/benchmark cases, dense Qwen, standard and
+# communication-balanced 30B MoE, and the large Qwen3.5 control-plane proxy.
 QWEN3_CONFIG_SPECS = {
-    "comm-1to1-L4": _QWEN3_COMM_1TO1,
-    "Qwen3-30B-A3B-L1": replace(_QWEN3_30B, n_layers=1),
-    "Qwen3-30B-A3B-L2": replace(_QWEN3_30B, n_layers=2),
-    # Preserve Qwen3-30B-A3B's architecture and change only the routed expert
-    # width from 768 to the H100-NVLink 1:1 roofline width of 864.  The local
-    # proxy uses eight layers; the other variants bracket H100 capacity.
-    "Qwen3-30B-A3B-comm1to1-L8": replace(
-        _QWEN3_30B, moe_inter_dim=864
-    ),
-    "Qwen3-30B-A3B-comm1to1-L20": replace(
-        _QWEN3_30B, moe_inter_dim=864, n_layers=20
-    ),
-    "Qwen3-30B-A3B-comm1to1-L22": replace(
-        _QWEN3_30B, moe_inter_dim=864, n_layers=22
-    ),
-    "Qwen3-30B-A3B-comm1to1-L23": replace(
-        _QWEN3_30B, moe_inter_dim=864, n_layers=23
-    ),
-    "Qwen3-30B-A3B-comm1to1-L24": replace(
-        _QWEN3_30B, moe_inter_dim=864, n_layers=24
-    ),
-    # Empirically calibrated from the normal PyTorch trace: the roofline width
-    # of 864 measured about 0.645:1 for the full expert region, so use the
-    # aligned width round(864 / 0.645) = 1344 and re-bracket capacity.
-    "Qwen3-30B-A3B-empirical1to1-L4": replace(
-        _QWEN3_30B, moe_inter_dim=1344, n_layers=4
-    ),
-    "Qwen3-30B-A3B-empirical1to1-L12": replace(
-        _QWEN3_30B, moe_inter_dim=1344, n_layers=12
-    ),
-    "Qwen3-30B-A3B-empirical1to1-L15": replace(
-        _QWEN3_30B, moe_inter_dim=1344, n_layers=15
-    ),
-    "Qwen3-30B-A3B-empirical1to1-L16": replace(
-        _QWEN3_30B, moe_inter_dim=1344, n_layers=16
-    ),
-    "Qwen3-30B-A3B-empirical1to1-L17": replace(
-        _QWEN3_30B, moe_inter_dim=1344, n_layers=17
-    ),
     "9M": Qwen3ConfigSpec(
         vocab_size=2048,
         dim=256,
@@ -351,35 +182,6 @@ QWEN3_CONFIG_SPECS = {
         route_norm=False,
         load_balance_coeff=None,
     ),
-    "48B": Qwen3ConfigSpec(
-        dim=4096,
-        n_layers=4,
-        n_heads=32,
-        n_kv_heads=8,
-        head_dim=128,
-        hidden_dim=14336,
-        max_seq_len=131072,
-        rope_theta=1_000_000.0,
-        moe_inter_dim=14336,
-        num_experts=8,
-        top_k=2,
-        route_norm=False,
-        load_balance_coeff=None,
-    ),
-    "30B-A3B-half": Qwen3ConfigSpec(
-        dim=2048,
-        n_layers=24,
-        n_heads=32,
-        n_kv_heads=4,
-        head_dim=128,
-        hidden_dim=6144,
-        max_seq_len=262144,
-        rope_theta=1_000_000.0,
-        moe_inter_dim=768,
-        num_experts=64,
-        top_k=8,
-        load_balance_coeff=None,
-    ),
     "72B": Qwen3ConfigSpec(
         vocab_size=152064,
         dim=8192,
@@ -393,24 +195,13 @@ QWEN3_CONFIG_SPECS = {
         rope_theta=1_000_000.0,
     ),
     "Qwen3-30B-A3B": _QWEN3_30B,
-    "Qwen3-30B-A3B-Base": _QWEN3_30B_BASE,
-    "Qwen3-30B-A3B-Instruct-2507": _QWEN3_30B_LONG,
-    "Qwen3-30B-A3B-Thinking-2507": _QWEN3_30B_LONG,
-    "Qwen3-235B-A22B": _QWEN3_235B,
-    "Qwen3-235B-A22B-Instruct-2507": _QWEN3_235B_LONG,
-    "Qwen3-235B-A22B-Thinking-2507": _QWEN3_235B_LONG,
-    "Qwen3-Coder-30B-A3B-Instruct": _QWEN3_30B_LONG,
-    "Qwen3-Coder-480B-A35B-Instruct": _QWEN3_CODER_480B,
-    "Qwen3-Next-80B-A3B-Instruct": _QWEN3_NEXT_80B,
-    "Qwen3-Next-80B-A3B-Thinking": _QWEN3_NEXT_80B,
-    "Qwen3-Coder-Next": _QWEN3_CODER_NEXT,
-    "Qwen3-Coder-Next-Base": _QWEN3_CODER_NEXT,
-    "Qwen3.5-35B-A3B": _QWEN35_35B,
-    "Qwen3.5-35B-A3B-Base": _QWEN35_35B,
-    "Qwen3.5-122B-A10B": _QWEN35_122B,
+    # Empirically calibrated from the normal PyTorch trace: the roofline width
+    # of 864 measured about 0.645:1 for the full expert region, so use the
+    # aligned width round(864 / 0.645) = 1344.
+    "Qwen3-30B-A3B-empirical1to1-L4": replace(
+        _QWEN3_30B, moe_inter_dim=1344, n_layers=4
+    ),
     "Qwen3.5-397B-A17B": _QWEN35_397B,
-    "Qwen3.6-35B-A3B": _QWEN35_35B,
-    "Qwen-AgentWorld-35B-A3B": _QWEN35_35B,
 }
 
 QWEN_MODEL_NAMES = tuple(QWEN3_CONFIG_SPECS)
