@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Attribute per-node normal-profile slowdowns using PyTorch CPU/GPU traces.
 
+This is an offline profile-and-replay diagnostic.
+
 The profile ratio artifact contains CUDA-event timings from the normal and
 isolated profiling passes.  The PyTorch traces capture normal
 execution only.  This script correlates every labeled device activity in the

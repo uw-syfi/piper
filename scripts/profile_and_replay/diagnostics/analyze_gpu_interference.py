@@ -7,7 +7,8 @@ is analyzed. The report pools every qualifying event from every GPU and DP
 rank; no per-GPU or low-count statistics are excluded.
 
 Usage:
-    python scripts/analyze_gpu_interference.py PATH/TO/OUTPUT_DIRECTORY
+    python scripts/profile_and_replay/diagnostics/analyze_gpu_interference.py \
+        PATH/TO/OUTPUT_DIRECTORY
 """
 
 from __future__ import annotations

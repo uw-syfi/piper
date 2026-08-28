@@ -141,5 +141,14 @@ python scripts/profile_and_replay/visualize_replay_savings.py \
   NORMAL_INPUT ATTRIBUTION.json --output savings-trace.json
 ```
 
+Additional trace diagnostics live beside these tools:
+
+```bash
+python scripts/profile_and_replay/diagnostics/analyze_gpu_interference.py \
+  OUTPUT_DIRECTORY
+python scripts/profile_and_replay/diagnostics/analyze_node_profile_interference.py \
+  OUTPUT_DIRECTORY
+```
+
 The tools import production profile and replay types from `src/`; they do
 not contain a separate replay implementation.
