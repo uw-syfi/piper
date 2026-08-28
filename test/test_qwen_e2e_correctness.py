@@ -23,14 +23,14 @@ _ROUTED_EXPERT_ATOL = 2e-4
 _AFD_RUNS = (
     (
         "afd_pp2_single_node",
-        "examples/base-schedules/afd_e2e_pp2.json",
+        "test/fixtures/schedules/afd_e2e_pp2.json",
         "afd",
         2,
         2,
     ),
     (
         "afd_pp4_single_node",
-        "examples/base-schedules/afd_e2e_pp4.json",
+        "test/fixtures/schedules/afd_e2e_pp4.json",
         "afd",
         4,
         2,

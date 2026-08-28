@@ -1,7 +1,11 @@
 [
   {
     "op": "place",
-    "filter": {"PP": 0, "ATTN": "-", "FFN": "-"},
+    "filter": {
+      "PP": 0,
+      "ATTN": "-",
+      "FFN": "-"
+    },
     "devices": [0, 1]
   },
   {
