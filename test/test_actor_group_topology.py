@@ -8,7 +8,7 @@ from src.compile import (
 )
 from src.dag import TrainingDAG, TrainingDAGNode
 from src.runtime import RuntimeState
-from src.simulator import _build_rank_layout
+from src.replay import _build_rank_layout
 from src.state import piper_metadata
 
 
@@ -195,7 +195,7 @@ def test_equal_width_actor_groups_define_aligned_direct_p2p_peers() -> None:
     assert runtime.p2p_process_group_for_task(recv) == "reverse"
 
 
-def test_simulator_accepts_unequal_schedule_actor_groups() -> None:
+def test_replay_accepts_unequal_schedule_actor_groups() -> None:
     layout = _build_rank_layout(
         [
             _local_dag("attn", [0, 2, 4, 5]),
@@ -203,7 +203,7 @@ def test_simulator_accepts_unequal_schedule_actor_groups() -> None:
         ],
         _schedule_info() | {"pp_degree": 2, "world_size": 6},
         pp_degree=None,
-        profile_mode="interference_free",
+        profile_mode="isolated",
     )
 
     assert layout.ranks_by_pp == ((0, 2, 4, 5), (1, 3))

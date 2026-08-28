@@ -132,7 +132,7 @@ def make_rows(cases: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
                     "gradient_slowdown_x": gradient_slowdown,
                     "normal_pair_ms": metric_median(world, "normal_pair_ms"),
                     "ideal_pair_ms": metric_median(
-                        world, "ideal_interference_free_pair_ms"
+                        world, "ideal_isolated_pair_ms"
                     ),
                     "pair_interference_removal_speedup_x": metric_median(
                         world, "interference_removal_speedup_ceiling"

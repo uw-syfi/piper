@@ -12,7 +12,7 @@ from src.actor import (
 from src.piper import _select_actor_clock_calibration
 
 
-def test_kineto_simulator_duration_uses_activity_envelope() -> None:
+def test_kineto_replay_duration_uses_activity_envelope() -> None:
     measured = {
         # This is intentionally much shorter than the complete correlated
         # activity, reproducing key_averages() on an outer Piper range.
@@ -36,7 +36,7 @@ def test_kineto_simulator_duration_uses_activity_envelope() -> None:
     ) == (17.0, 19.0)
 
 
-def test_kineto_simulator_duration_defers_incomplete_launch_validation() -> None:
+def test_kineto_replay_duration_defers_incomplete_launch_validation() -> None:
     assert _kineto_correlated_activity_envelope_samples_us(
         {
             "range_count": 1,
@@ -77,6 +77,10 @@ def test_kineto_audit_aligns_activity_and_zero_activity_to_iteration_anchors(
             "args": {"External id": 7, "correlation": 99},
         },
         {
+            "ph": "X", "cat": "user_annotation", "name": "piper_p2p_post",
+            "pid": 1, "tid": 2, "ts": 115.0, "dur": 0.1,
+        },
+        {
             "ph": "X", "cat": "kernel", "name": "kernel",
             "pid": 9, "tid": 10, "ts": 120.0, "dur": 5.0,
             "args": {"External id": 7, "correlation": 99},
@@ -108,6 +112,7 @@ def test_kineto_audit_aligns_activity_and_zero_activity_to_iteration_anchors(
 
     occurrences = audit["COMPUTE:uidnode"]["range_activity_signatures"]
     assert occurrences[0]["activity_start_offset_us"] == pytest.approx(20.0)
+    assert occurrences[0]["p2p_post_offset_us"] == pytest.approx(15.0)
     assert occurrences[0]["activity_timestamp_source"] == "correlated_gpu_activity"
     assert occurrences[0]["cpu_launch_sequence"] == ["kernel"]
     assert occurrences[0]["cpu_launch_count"] == 1
@@ -118,6 +123,7 @@ def test_kineto_audit_aligns_activity_and_zero_activity_to_iteration_anchors(
         {"category": "kernel", "name": "kernel"}
     ]
     assert occurrences[1]["activity_start_offset_us"] == pytest.approx(6.0)
+    assert occurrences[1]["p2p_post_offset_us"] is None
     assert occurrences[1]["activity_timestamp_source"] == "cpu_range_zero_activity"
     assert timeline["timeline_origin_samples_us"] == (1000.0, 1100.0)
     assert timeline["timeline_origin_uncertainty_samples_us"] == (2.0, 3.0)
@@ -304,7 +310,7 @@ def test_profile_run_dag_can_defer_profiler_advance(monkeypatch) -> None:
         device="cuda:0",
     )
     actor._execute_dag = lambda **_kwargs: None
-    actor.profile_prepared_dag_executions = {"interference_free": None}
+    actor.profile_prepared_dag_executions = {"isolated": None}
     actor._cupti_allocator_iteration_stats = []
     synchronizations = []
     monkeypatch.setattr(

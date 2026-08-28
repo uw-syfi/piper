@@ -11,6 +11,9 @@ from torch.autograd.graph import GradientEdge, Node, get_gradient_edge
 from torch.nn import Parameter
 
 
+P2P_POST_PROFILER_MARKER = "piper_p2p_post"
+
+
 def _route_partition_metadata(
     meta: dict[str, Any],
     destination_devices: tuple[int, ...],
@@ -295,6 +298,19 @@ class CommunicationExecutor:
         if tensor.is_cuda:
             tensor.record_stream(stream)
 
+    def _record_p2p_post(self) -> None:
+        """Mark entry to the first P2P call made by one DAG node.
+
+        Entering ``isend``/``irecv`` makes the compound node eligible to match
+        its peer before that API necessarily returns.  The node's aggregate
+        CUDA envelope covers any additional P2P calls it makes.
+        """
+
+        if not getattr(self.runtime, "pytorch_profiler_enabled", False):
+            return
+        with torch.profiler.record_function(P2P_POST_PROFILER_MARKER):
+            pass
+
     def send(
         self,
         send_data: Any,
@@ -311,8 +327,12 @@ class CommunicationExecutor:
                 raise ValueError("ActorGroup P2P send requires its DAG task")
             pp_group = self.runtime.p2p_process_group_for_task(task)
             works = []
-            for tensor in tensors:
+            if not tensors:
+                self._record_p2p_post()
+            for tensor_index, tensor in enumerate(tensors):
                 self._record_p2p_tensor_stream(tensor, stream)
+                if tensor_index == 0:
+                    self._record_p2p_post()
                 work = dist.isend(
                     tensor,
                     dst=global_dst_rank,
@@ -346,8 +366,12 @@ class CommunicationExecutor:
                 raise ValueError("ActorGroup P2P receive requires its DAG task")
             pp_group = self.runtime.p2p_process_group_for_task(task)
             works = []
-            for tensor in buf:
+            if not buf:
+                self._record_p2p_post()
+            for tensor_index, tensor in enumerate(buf):
                 self._record_p2p_tensor_stream(tensor, stream)
+                if tensor_index == 0:
+                    self._record_p2p_post()
                 work = dist.irecv(
                     tensor,
                     src=global_src_rank,
@@ -376,8 +400,12 @@ class CommunicationExecutor:
                 raise ValueError("ActorGroup P2P receive requires its DAG task")
             pp_group = self.runtime.p2p_process_group_for_task(task)
             works = []
-            for tensor in buf:
+            if not buf:
+                self._record_p2p_post()
+            for tensor_index, tensor in enumerate(buf):
                 self._record_p2p_tensor_stream(tensor, stream)
+                if tensor_index == 0:
+                    self._record_p2p_post()
                 work = dist.irecv(
                     tensor,
                     src=global_src_rank,
@@ -399,6 +427,7 @@ class CommunicationExecutor:
         global_dst_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
         pp_group = self.runtime.p2p_process_group_for_task(task)
         if not tensors:
+            self._record_p2p_post()
             return _P2PLaunch(None, (), ())
 
         payloads = []
@@ -415,6 +444,7 @@ class CommunicationExecutor:
         retained_tensors = []
         shape_values = None
         shape_header = None
+        p2p_post_recorded = False
         if flat_shape:
             header_is_cuda = torch.device(self.runtime.device).type == "cuda"
             shape_values = torch.tensor(
@@ -441,6 +471,8 @@ class CommunicationExecutor:
                     non_blocking=shape_header.is_cuda,
                 )
                 self._record_p2p_tensor_stream(shape_header, stream)
+                self._record_p2p_post()
+                p2p_post_recorded = True
                 shape_work = dist.isend(
                     shape_header,
                     dst=global_dst_rank,
@@ -450,17 +482,18 @@ class CommunicationExecutor:
                 works.append(shape_work)
                 retained_tensors.extend((shape_values, shape_header))
 
-            payload_works = dist.batch_isend_irecv(
-                [
-                    dist.P2POp(
-                        dist.isend,
-                        payload,
-                        global_dst_rank,
-                        pp_group,
-                    )
-                    for payload in payloads
-                ]
-            )
+            payload_ops = [
+                dist.P2POp(
+                    dist.isend,
+                    payload,
+                    global_dst_rank,
+                    pp_group,
+                )
+                for payload in payloads
+            ]
+            if not p2p_post_recorded:
+                self._record_p2p_post()
+            payload_works = dist.batch_isend_irecv(payload_ops)
             for work in payload_works:
                 work.wait()
             works.extend(payload_works)
@@ -483,6 +516,7 @@ class CommunicationExecutor:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
         pp_group = self.runtime.p2p_process_group_for_task(task)
         if not schemas:
+            self._record_p2p_post()
             return _P2PLaunch([], (), ())
 
         schema_ranks = []
@@ -509,6 +543,7 @@ class CommunicationExecutor:
         result: list[torch.Tensor] = []
         works = []
         retained_tensors = []
+        p2p_post_recorded = False
         with torch.cuda.stream(stream):
             shape_values: list[int] = []
             shape_header = None
@@ -519,6 +554,8 @@ class CommunicationExecutor:
                     device=self.runtime.device,
                 )
                 self._record_p2p_tensor_stream(shape_header, stream)
+                self._record_p2p_post()
+                p2p_post_recorded = True
                 shape_work = dist.irecv(
                     shape_header,
                     src=global_src_rank,
@@ -557,17 +594,18 @@ class CommunicationExecutor:
                 self._record_p2p_tensor_stream(tensor, stream)
                 result.append(tensor)
 
-            payload_works = dist.batch_isend_irecv(
-                [
-                    dist.P2POp(
-                        dist.irecv,
-                        tensor,
-                        global_src_rank,
-                        pp_group,
-                    )
-                    for tensor in result
-                ]
-            )
+            payload_ops = [
+                dist.P2POp(
+                    dist.irecv,
+                    tensor,
+                    global_src_rank,
+                    pp_group,
+                )
+                for tensor in result
+            ]
+            if not p2p_post_recorded:
+                self._record_p2p_post()
+            payload_works = dist.batch_isend_irecv(payload_ops)
             for work in payload_works:
                 work.wait()
             for schema, tensor in zip(schemas, result):
@@ -2613,7 +2651,7 @@ class DagExecutor:
             node_tag = self._node_tag_str(node)
 
             # Preserve each node's intended physical stream while forcing the
-            # interference-free profiling policy to execute one node at a
+            # isolated profiling policy to execute one node at a
             # time.  This wait is intentionally before the profiling range.
             if (
                 serialize_nodes

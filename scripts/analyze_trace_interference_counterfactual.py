@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reconstruct normal and interference-free Piper steps from PyTorch traces.
+"""Reconstruct normal and isolated Piper steps from PyTorch traces.
 
 The analysis matches logical GPU kernels by ``(PP rank, External id, ordinal)``
 across DP-rank traces.  A communication kernel's normal duration is the minimum
-of its DP samples; all other kernels use the median.  Interference-free controls
+of its DP samples; all other kernels use the median.  Isolated controls
 come from matching kernel signatures which have at least one occurrence with no
 positive-duration overlap with any other GPU kernel.
 
@@ -13,7 +13,7 @@ without a strict isolated control also retain their normal duration.
 
 Per-node durations are rebuilt from representative kernel durations plus the
 node's observed internal kernel-gap budget.  The finalized TrainingDAG is then
-replayed twice with Piper's dependency-aware simulator, allowing downstream
+replayed twice with Piper's dependency-aware replay, allowing downstream
 nodes to start earlier when their upstream dependencies complete sooner.
 """
 
@@ -36,7 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.profiling import (
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     NORMAL_PROFILE_MODE,
     NodeProfile,
     ProfiledTrainingPlan,
@@ -44,7 +44,7 @@ from src.profiling import (
     set_node_profile_times,
     set_prologue_profile_times,
 )
-from src.simulator import SimulationResult, simulate_training_step
+from src.replay import ReplayResult, replay_training_step
 
 
 _TRACE_DP_RE = re.compile(r"dprank(\d+)")
@@ -106,8 +106,8 @@ class LogicalKernelTiming:
     samples_us: tuple[float, ...]
     isolated_dp_ranks: tuple[int, ...]
     normal_us: float
-    interference_free_us: float
-    interference_free_source: str
+    isolated_us: float
+    isolated_source: str
     control_count: int
 
 
@@ -120,11 +120,11 @@ class NodeTiming:
     fallback_kernel_count: int
     internal_gap_us: float
     normal_us: float
-    interference_free_us: float
+    isolated_us: float
 
     @property
     def reduction_us(self) -> float:
-        return self.normal_us - self.interference_free_us
+        return self.normal_us - self.isolated_us
 
     @property
     def reduction_pct(self) -> float:
@@ -473,16 +473,16 @@ def _derive_timings(
         control_signature = control_signature_by_kernel[key]
         controls = isolated_control_normals.get(control_signature, [])
         if node_kind == "ALL_GATHER_COMM":
-            interference_free = normal
+            isolated = normal
             source = "normal_fallback_all_gather"
         elif controls:
-            interference_free = _representative(
+            isolated = _representative(
                 controls,
                 communication=communication,
             )
             source = "strict_isolated_signature_control"
         else:
-            interference_free = normal
+            isolated = normal
             source = "normal_fallback_no_isolated_control"
         kernel_timings[key] = LogicalKernelTiming(
             key=key,
@@ -496,8 +496,8 @@ def _derive_timings(
                 rank for rank in dp_ranks if samples[rank].isolated
             ),
             normal_us=normal,
-            interference_free_us=interference_free,
-            interference_free_source=source,
+            isolated_us=isolated,
+            isolated_source=source,
             control_count=len(controls),
         )
 
@@ -514,7 +514,7 @@ def _derive_timings(
                 fallback_kernel_count=0,
                 internal_gap_us=0.0,
                 normal_us=0.0,
-                interference_free_us=0.0,
+                isolated_us=0.0,
             )
             continue
         gap_samples = gaps_by_node.get(key, {})
@@ -530,13 +530,13 @@ def _derive_timings(
         )
         timings = [kernel_timings[logical_key] for logical_key in logical_keys]
         controlled = sum(
-            timing.interference_free_source
+            timing.isolated_source
             == "strict_isolated_signature_control"
             for timing in timings
         )
         normal = internal_gap + sum(timing.normal_us for timing in timings)
-        interference_free = internal_gap + sum(
-            timing.interference_free_us for timing in timings
+        isolated = internal_gap + sum(
+            timing.isolated_us for timing in timings
         )
         node_timings[key] = NodeTiming(
             key=key,
@@ -546,7 +546,7 @@ def _derive_timings(
             fallback_kernel_count=len(timings) - controlled,
             internal_gap_us=internal_gap,
             normal_us=normal,
-            interference_free_us=interference_free,
+            isolated_us=isolated,
         )
 
     coverage_by_kind: dict[str, dict[str, int | float]] = {}
@@ -565,9 +565,9 @@ def _derive_timings(
         row["kernel_count_with_direct_isolated_dp_occurrence"] += bool(
             timing.isolated_dp_ranks
         )
-        if timing.interference_free_source == "strict_isolated_signature_control":
+        if timing.isolated_source == "strict_isolated_signature_control":
             row["kernel_count_with_signature_control"] += 1
-        elif timing.interference_free_source == "normal_fallback_all_gather":
+        elif timing.isolated_source == "normal_fallback_all_gather":
             row["all_gather_forced_fallback_count"] += 1
         else:
             row["no_control_fallback_count"] += 1
@@ -610,7 +610,7 @@ def _install_trace_profiles(
         # kernel interference rather than a separately profiled setup phase.
         set_prologue_profile_times(
             dag,
-            INTERFERENCE_FREE_PROFILE_MODE,
+            ISOLATED_PROFILE_MODE,
             normal_prologue,
         )
         for uid, node in dag.nodes.items():
@@ -625,8 +625,8 @@ def _install_trace_profiles(
                 timing_source="pytorch_trace_kernel_reconstruction",
                 isolation_scope="normal_cross_dp_representative",
             )
-            interference_free_profile = NodeProfile.from_samples(
-                (timing.interference_free_us,),
+            isolated_profile = NodeProfile.from_samples(
+                (timing.isolated_us,),
                 timing_source="pytorch_trace_strict_isolated_control",
                 isolation_scope="strict_no_other_gpu_kernel_overlap",
             )
@@ -637,12 +637,12 @@ def _install_trace_profiles(
             )
             set_node_profile_times(
                 node,
-                INTERFERENCE_FREE_PROFILE_MODE,
-                {rank: interference_free_profile for rank in ranks},
+                ISOLATED_PROFILE_MODE,
+                {rank: isolated_profile for rank in ranks},
             )
 
 
-def _simulation_summary(result: SimulationResult) -> dict[str, Any]:
+def _replay_summary(result: ReplayResult) -> dict[str, Any]:
     return {
         "step_time_us": result.step_time_us,
         "step_time_s": result.step_time_s,
@@ -668,7 +668,7 @@ def _simulation_summary(result: SimulationResult) -> dict[str, Any]:
 
 
 def _load_reference_sample_medians(plan_path: Path) -> dict[str, Any] | None:
-    """Load the profile-and-simulate medians adjacent to the profiled plan."""
+    """Load the profile-and-replay medians adjacent to the profiled plan."""
     results_path = plan_path.with_name("results.csv")
     if not results_path.exists():
         return None
@@ -677,24 +677,24 @@ def _load_reference_sample_medians(plan_path: Path) -> dict[str, Any] | None:
     if not rows:
         return None
     normal_values = {
-        float(row["simulated_normal_step_time_median_s"])
+        float(row["normal_replay_step_time_median_s"])
         for row in rows
-        if row.get("simulated_normal_step_time_median_s")
+        if row.get("normal_replay_step_time_median_s")
     }
-    interference_free_values = {
-        float(row["simulated_interference_free_step_time_median_s"])
+    isolated_values = {
+        float(row["perfect_overlap_replay_step_time_median_s"])
         for row in rows
-        if row.get("simulated_interference_free_step_time_median_s")
+        if row.get("perfect_overlap_replay_step_time_median_s")
     }
-    if len(normal_values) != 1 or len(interference_free_values) != 1:
+    if len(normal_values) != 1 or len(isolated_values) != 1:
         return None
     normal_us = normal_values.pop() * 1_000_000.0
-    interference_free_us = interference_free_values.pop() * 1_000_000.0
-    reduction_us = normal_us - interference_free_us
+    isolated_us = isolated_values.pop() * 1_000_000.0
+    reduction_us = normal_us - isolated_us
     return {
         "results_csv": str(results_path.resolve()),
         "normal_step_median_us": normal_us,
-        "interference_free_step_median_us": interference_free_us,
+        "isolated_step_median_us": isolated_us,
         "step_reduction_median_us": reduction_us,
         "step_reduction_median_pct": (
             100.0 * reduction_us / normal_us if normal_us else 0.0
@@ -712,7 +712,7 @@ def _write_nodes_csv(path: Path, timings: dict[NodeKey, NodeTiming]) -> None:
         "fallback_kernel_count",
         "internal_gap_us",
         "normal_us",
-        "interference_free_us",
+        "isolated_us",
         "reduction_us",
         "reduction_pct",
     )
@@ -731,7 +731,7 @@ def _write_nodes_csv(path: Path, timings: dict[NodeKey, NodeTiming]) -> None:
                     "fallback_kernel_count": timing.fallback_kernel_count,
                     "internal_gap_us": timing.internal_gap_us,
                     "normal_us": timing.normal_us,
-                    "interference_free_us": timing.interference_free_us,
+                    "isolated_us": timing.isolated_us,
                     "reduction_us": timing.reduction_us,
                     "reduction_pct": timing.reduction_pct,
                 }
@@ -753,9 +753,9 @@ def _write_kernels_csv(
         "samples_us",
         "isolated_dp_ranks",
         "normal_us",
-        "interference_free_us",
+        "isolated_us",
         "reduction_us",
-        "interference_free_source",
+        "isolated_source",
         "control_count",
         "signature",
     )
@@ -776,9 +776,9 @@ def _write_kernels_csv(
                     "samples_us": json.dumps(timing.samples_us),
                     "isolated_dp_ranks": json.dumps(timing.isolated_dp_ranks),
                     "normal_us": timing.normal_us,
-                    "interference_free_us": timing.interference_free_us,
-                    "reduction_us": timing.normal_us - timing.interference_free_us,
-                    "interference_free_source": timing.interference_free_source,
+                    "isolated_us": timing.isolated_us,
+                    "reduction_us": timing.normal_us - timing.isolated_us,
+                    "isolated_source": timing.isolated_source,
                     "control_count": timing.control_count,
                     "signature": json.dumps(timing.signature),
                 }
@@ -805,28 +805,28 @@ def main() -> None:
     traces = [_load_trace(path) for path in trace_paths]
 
     plan = ProfiledTrainingPlan.load_json(plan_path)
-    reference_normal = simulate_training_step(
+    reference_normal = replay_training_step(
         plan,
         profile_mode=NORMAL_PROFILE_MODE,
     )
-    reference_interference_free = simulate_training_step(
+    reference_isolated = replay_training_step(
         plan,
-        profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
+        profile_mode=ISOLATED_PROFILE_MODE,
     )
     kernel_timings, node_timings, matching = _derive_timings(plan, traces)
     _install_trace_profiles(plan, node_timings)
-    reconstructed_normal = simulate_training_step(
+    reconstructed_normal = replay_training_step(
         plan,
         profile_mode=NORMAL_PROFILE_MODE,
     )
-    reconstructed_interference_free = simulate_training_step(
+    reconstructed_isolated = replay_training_step(
         plan,
-        profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
+        profile_mode=ISOLATED_PROFILE_MODE,
     )
 
     reduction_us = (
         reconstructed_normal.step_time_us
-        - reconstructed_interference_free.step_time_us
+        - reconstructed_isolated.step_time_us
     )
     reduction_pct = (
         100.0 * reduction_us / reconstructed_normal.step_time_us
@@ -837,7 +837,7 @@ def main() -> None:
         100.0
         * (
             reference_normal.step_time_us
-            - reference_interference_free.step_time_us
+            - reference_isolated.step_time_us
         )
         / reference_normal.step_time_us
     )
@@ -845,8 +845,8 @@ def main() -> None:
     total_normal_node_work = sum(
         timing.normal_us for timing in node_timings.values()
     )
-    total_interference_free_node_work = sum(
-        timing.interference_free_us for timing in node_timings.values()
+    total_isolated_node_work = sum(
+        timing.isolated_us for timing in node_timings.values()
     )
     top_node_reductions = [
         {
@@ -854,7 +854,7 @@ def main() -> None:
             "node_uid": timing.key.uid,
             "node_kind": timing.node_kind,
             "normal_us": timing.normal_us,
-            "interference_free_us": timing.interference_free_us,
+            "isolated_us": timing.isolated_us,
             "reduction_us": timing.reduction_us,
             "reduction_pct": timing.reduction_pct,
             "kernel_count": timing.kernel_count,
@@ -876,7 +876,7 @@ def main() -> None:
             "logical_kernel_identity": "(PP rank, External id, ordinal)",
             "communication_normal_estimator": "minimum across DP ranks",
             "compute_normal_estimator": "median across DP ranks",
-            "interference_free_control": (
+            "isolated_control": (
                 "same kernel signature with at least one occurrence having no "
                 "positive-duration overlap with any other GPU kernel"
             ),
@@ -896,32 +896,32 @@ def main() -> None:
         },
         "matching": matching,
         "results": {
-            "normal": _simulation_summary(reconstructed_normal),
-            "interference_free": _simulation_summary(
-                reconstructed_interference_free
+            "normal": _replay_summary(reconstructed_normal),
+            "isolated": _replay_summary(
+                reconstructed_isolated
             ),
             "step_reduction_us": reduction_us,
             "step_reduction_pct": reduction_pct,
             "total_normal_node_work_us": total_normal_node_work,
-            "total_interference_free_node_work_us": (
-                total_interference_free_node_work
+            "total_isolated_node_work_us": (
+                total_isolated_node_work
             ),
             "total_node_work_reduction_us": (
-                total_normal_node_work - total_interference_free_node_work
+                total_normal_node_work - total_isolated_node_work
             ),
             "total_node_work_reduction_pct": (
                 100.0
                 * (
                     total_normal_node_work
-                    - total_interference_free_node_work
+                    - total_isolated_node_work
                 )
                 / total_normal_node_work
             ),
         },
-        "reference_profile_and_simulate": {
+        "reference_profile_and_replay": {
             "normal_step_us": reference_normal.step_time_us,
-            "interference_free_step_us": (
-                reference_interference_free.step_time_us
+            "isolated_step_us": (
+                reference_isolated.step_time_us
             ),
             "step_reduction_pct": reference_reduction_pct,
             "raw_sample_medians": reference_sample_medians,
@@ -943,8 +943,8 @@ def main() -> None:
 
     print(f"normal_step_us={reconstructed_normal.step_time_us:.3f}")
     print(
-        "interference_free_step_us="
-        f"{reconstructed_interference_free.step_time_us:.3f}"
+        "isolated_step_us="
+        f"{reconstructed_isolated.step_time_us:.3f}"
     )
     print(f"step_reduction_us={reduction_us:.3f}")
     print(f"step_reduction_pct={reduction_pct:.6f}")

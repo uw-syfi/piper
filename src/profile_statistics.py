@@ -1,7 +1,7 @@
-"""Statistical summaries for profiler and simulator timing samples.
+"""Statistical summaries for profiler and replay timing samples.
 
 The helpers in this module are deliberately dependency-free and deterministic.
-They are shared by the example harness and offline simulator so CSV and JSON
+They are shared by the example harness and offline replay so CSV and JSON
 artifacts use identical definitions of confidence and prediction error.
 """
 
@@ -250,27 +250,27 @@ def summarize_mean_samples(samples: Iterable[float]) -> MeanStatistics:
 
 def summarize_paired_savings(
     normal_samples: Iterable[float],
-    interference_free_samples: Iterable[float],
+    isolated_samples: Iterable[float],
 ) -> PairedSavingsStatistics:
     """Summarize paired absolute savings and ratio-of-means percent savings."""
 
     normal = _validated_samples(normal_samples)
-    interference_free = _validated_samples(interference_free_samples)
-    if len(normal) != len(interference_free):
+    isolated = _validated_samples(isolated_samples)
+    if len(normal) != len(isolated):
         raise ValueError(
-            "normal and interference-free samples must form aligned pairs: "
-            f"normal={len(normal)}, interference_free={len(interference_free)}"
+            "normal and isolated samples must form aligned pairs: "
+            f"normal={len(normal)}, isolated={len(isolated)}"
         )
     sample_count = len(normal)
     normal_mean = float(statistics.fmean(normal))
-    interference_free_mean = float(statistics.fmean(interference_free))
+    isolated_mean = float(statistics.fmean(isolated))
     if normal_mean <= 0.0:
         raise ValueError("normal sample mean must be positive for percent savings")
     absolute_mean = float(
         statistics.fmean(
-            normal_value - interference_free_value
-            for normal_value, interference_free_value in zip(
-                normal, interference_free
+            normal_value - isolated_value
+            for normal_value, isolated_value in zip(
+                normal, isolated
             )
         )
     )
@@ -281,22 +281,22 @@ def summarize_paired_savings(
         ci_high = None
     else:
         normal_variance = float(statistics.variance(normal))
-        interference_free_variance = float(statistics.variance(interference_free))
+        isolated_variance = float(statistics.variance(isolated))
         covariance = sum(
             (normal_value - normal_mean)
-            * (interference_free_value - interference_free_mean)
-            for normal_value, interference_free_value in zip(
-                normal, interference_free
+            * (isolated_value - isolated_mean)
+            for normal_value, isolated_value in zip(
+                normal, isolated
             )
         ) / (sample_count - 1)
-        normal_gradient = 100.0 * interference_free_mean / (normal_mean**2)
-        interference_free_gradient = -100.0 / normal_mean
+        normal_gradient = 100.0 * isolated_mean / (normal_mean**2)
+        isolated_gradient = -100.0 / normal_mean
         estimated_variance = (
             normal_gradient**2 * normal_variance
-            + interference_free_gradient**2 * interference_free_variance
+            + isolated_gradient**2 * isolated_variance
             + 2.0
             * normal_gradient
-            * interference_free_gradient
+            * isolated_gradient
             * covariance
         ) / sample_count
         # Roundoff can make an analytically non-negative quadratic form a tiny
@@ -304,7 +304,7 @@ def summarize_paired_savings(
         tolerance = 1.0e-12 * max(
             1.0,
             normal_gradient**2 * normal_variance,
-            interference_free_gradient**2 * interference_free_variance,
+            isolated_gradient**2 * isolated_variance,
         )
         if estimated_variance < -tolerance:
             raise ArithmeticError(

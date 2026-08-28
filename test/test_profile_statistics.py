@@ -87,12 +87,12 @@ def test_paired_savings_uses_ratio_of_means_and_covariance() -> None:
 
 def test_paired_savings_does_not_average_per_iteration_percentages() -> None:
     normal = (10.0, 100.0, 1000.0)
-    interference_free = (9.0, 50.0, 990.0)
-    summary = summarize_paired_savings(normal, interference_free)
+    isolated = (9.0, 50.0, 990.0)
+    summary = summarize_paired_savings(normal, isolated)
     per_iteration_percentages = tuple(
-        100.0 * (normal_value - interference_free_value) / normal_value
-        for normal_value, interference_free_value in zip(
-            normal, interference_free
+        100.0 * (normal_value - isolated_value) / normal_value
+        for normal_value, isolated_value in zip(
+            normal, isolated
         )
     )
 

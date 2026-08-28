@@ -28,7 +28,7 @@ from src.piper import (
     _validate_p2p_sequences,
     _validate_routed_collective_sequences,
 )
-from src.simulator import simulate_training_step
+from src.replay import replay_training_step
 from src.tasks import TaskType, training_dag_task_type
 
 
@@ -1259,11 +1259,11 @@ def test_p2p_order_prefers_earlier_consumer_over_comm_id() -> None:
     for dag in (destination_dag, source_dag):
         for node in dag.nodes.values():
             node.profile_times_by_mode = {
-                "interference_free": {
+                "isolated": {
                     node.device[0]: SimpleNamespace(estimate_us=1.0)
                 }
             }
-    assert simulate_training_step(
+    assert replay_training_step(
         [destination_dag, source_dag]
     ).step_time_us > 0
 

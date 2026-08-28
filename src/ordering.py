@@ -166,7 +166,7 @@ def assign_dispatch_levels(dag: TrainingDAG) -> None:
 
 
 def _dispatch_order(dag: TrainingDAG) -> list[str]:
-    """Return the static executor/simulator issue order for a finalized DAG."""
+    """Return the static executor/replay issue order for a finalized DAG."""
     stored_levels: dict[str, int] = {}
     for uid, node in dag.nodes.items():
         value = node.node_meta.get("dispatch_level")
@@ -298,7 +298,7 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
 
     Default-stream compute keeps its established downstream-aware ordering.
     Every stream domain is then chained in a deterministic topological order,
-    so the executor and simulator consume the same FIFO without inventing
+    so the executor and replay consume the same FIFO without inventing
     dependencies independently.
     """
     reachability = _ReachabilityIndex(dag)

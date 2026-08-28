@@ -7,8 +7,6 @@ import json
 import tempfile
 import time
 from typing import Any, Sequence
-import gc
-import statistics
 from datetime import timedelta
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
 import torch.distributed as dist
@@ -33,6 +31,7 @@ from .executors import (
     CommunicationExecutor,
     ComputeExecutor,
     DagExecutor,
+    P2P_POST_PROFILER_MARKER,
     PreparedDagExecution,
 )
 from .ordering import _dispatch_order
@@ -40,7 +39,7 @@ from .profiling import (
     ActorProfileResult,
     DEFAULT_NORMAL_SCOPE,
     DEFAULT_ISOLATION_SCOPE,
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     NodeProfile,
     PROFILE_MODES,
     finalized_dag_fingerprint,
@@ -215,6 +214,37 @@ def _kineto_node_attribution_audit(
         )
     for ranges in ranges_by_thread.values():
         ranges.sort()
+
+    p2p_post_markers_by_range: dict[int, list[float]] = defaultdict(list)
+    for event in events:
+        if (
+            event.get("ph") != "X"
+            or event.get("cat") != "user_annotation"
+            or str(event.get("name", "")) != P2P_POST_PROFILER_MARKER
+        ):
+            continue
+        start = event.get("ts")
+        duration = event.get("dur")
+        if not isinstance(start, (int, float)) or not isinstance(
+            duration, (int, float)
+        ):
+            raise RuntimeError("Kineto P2P post marker has no numeric interval")
+        marker_start = float(start)
+        marker_end = marker_start + float(duration)
+        thread = (event.get("pid"), event.get("tid"))
+        enclosing_ranges = [
+            range_key
+            for range_start, range_end, _label, range_key in ranges_by_thread.get(
+                thread, ()
+            )
+            if range_start <= marker_start and marker_end <= range_end
+        ]
+        if len(enclosing_ranges) != 1:
+            raise RuntimeError(
+                "Kineto P2P post marker must belong to exactly one node range, "
+                f"found {enclosing_ranges!r}"
+            )
+        p2p_post_markers_by_range[enclosing_ranges[0]].append(marker_start)
 
     external_id_to_range: dict[Any, int] = {}
     ranges_by_label: dict[str, int] = defaultdict(int)
@@ -487,6 +517,7 @@ def _kineto_node_attribution_audit(
                 activity_start_offset_us = None
                 activity_end_offset_us = None
                 activity_timestamp_source = None
+                p2p_post_offset_us = None
             else:
                 anchor_start = captured_timeline_anchors[
                     timeline_occurrence
@@ -511,6 +542,22 @@ def _kineto_node_attribution_audit(
                     if not target_union
                     else "correlated_gpu_activity"
                 )
+                p2p_post_markers = p2p_post_markers_by_range.get(range_key, ())
+                if len(p2p_post_markers) > 1:
+                    raise RuntimeError(
+                        f"Kineto node range {label!r} contains multiple P2P "
+                        f"first-call markers: {p2p_post_markers!r}"
+                    )
+                p2p_post_offset_us = (
+                    None
+                    if not p2p_post_markers
+                    else float(p2p_post_markers[0]) - anchor_start
+                )
+                if p2p_post_offset_us is not None and p2p_post_offset_us < 0.0:
+                    raise RuntimeError(
+                        f"Kineto P2P post for node range {label!r} precedes its "
+                        f"iteration anchor by {-p2p_post_offset_us:.3f} us"
+                    )
             entries = [
                 {
                     "category": category,
@@ -551,18 +598,19 @@ def _kineto_node_attribution_audit(
                 "activity_start_offset_us": activity_start_offset_us,
                 "activity_end_offset_us": activity_end_offset_us,
                 "activity_timestamp_source": activity_timestamp_source,
+                "p2p_post_offset_us": p2p_post_offset_us,
                 "cpu_launch_count": len(canonical_launches),
                 "matched_cpu_launch_count": matched_launch_count,
                 "cpu_launch_sequence_sha256": hashlib.sha256(
                     launch_sequence_encoded
                 ).hexdigest(),
                 "launch_mapping_unambiguous": launch_mapping_unambiguous,
-                # Consumed centrally for per-launch normal/IF validation, then
+                # Consumed centrally for per-launch normal/isolated validation, then
                 # removed from the durable profile artifact.
                 "cpu_launch_sequence": cpu_launch_sequence,
                 "cpu_launches": canonical_launches,
                 "unmapped_activities": unmapped_activities,
-                # Consumed centrally for the exact IF/normal activity audit,
+                # Consumed centrally for the exact isolated/normal activity audit,
                 # then removed from the durable profile artifact.
                 "activities": entries,
                 "activity_sequence": activity_sequence,
@@ -628,8 +676,8 @@ def _kineto_correlated_activity_envelope_samples_us(
     external/correlation IDs explicitly.  Its per-occurrence first-activity-
     start to last-activity-end envelope captures both the kernels and the
     GPU-side gaps between them, which together determine node completion.
-    P2P nodes are replaced separately by an isolated directional microprofile
-    so their rendezvous waiting is not folded into transfer latency.
+    Communication rendezvous waiting is removed later, using aligned endpoint
+    starts from the same profiling policy.
     """
     occurrences = tuple(measured.get("range_activity_signatures", ()))
     range_count = int(measured.get("range_count", len(occurrences)))
@@ -1096,8 +1144,7 @@ class PiperActor:
         self,
         *,
         estimator: str = "median",
-        profile_mode: str = "interference_free",
-        p2p_baselines_by_comm_id: dict[str, float] | None = None,
+        profile_mode: str = "isolated",
         trace_output_dir: str | None = None,
         trace_ranks: tuple[int, ...] | None = None,
     ) -> ActorProfileResult:
@@ -1139,14 +1186,11 @@ class PiperActor:
                     timing_source="kineto_cupti",
                     isolation_scope=(
                         DEFAULT_ISOLATION_SCOPE
-                        if mode == "interference_free"
+                        if mode == "isolated"
                         else DEFAULT_NORMAL_SCOPE
                     ),
                 )
                 continue
-            baseline_us = (p2p_baselines_by_comm_id or {}).get(
-                str(node.node_meta.get("comm_id", ""))
-            )
             matching = [
                 value for key, value in captured.items()
                 if key.endswith(f":uid{uid}")
@@ -1178,18 +1222,29 @@ class PiperActor:
                     f"and start samples: durations={len(duration_samples_us)}, "
                     f"starts={len(start_offset_samples_us)}"
                 )
+            node_kind = str(getattr(node, "node_kind", ""))
+            p2p_post_offset_samples_us: tuple[float, ...] = ()
+            if node_kind in {"SEND_COMM", "RECV_COMM"}:
+                try:
+                    p2p_post_offset_samples_us = tuple(
+                        float(record["p2p_post_offset_us"])
+                        for record in occurrence_records
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Kineto attribution for P2P node {uid} has no host "
+                        "post offsets"
+                    ) from exc
+                if len(p2p_post_offset_samples_us) != len(
+                    duration_samples_us
+                ):
+                    raise RuntimeError(
+                        f"Kineto attribution for P2P node {uid} has mismatched "
+                        f"duration and post samples: durations="
+                        f"{len(duration_samples_us)}, posts="
+                        f"{len(p2p_post_offset_samples_us)}"
+                    )
             duration_source = "correlated_gpu_activity_envelope"
-            if (
-                baseline_us is not None
-                and getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}
-            ):
-                # Scheduled P2P ranges include rendezvous waiting.  Preserve
-                # the separately measured transfer latency while keeping its
-                # samples aligned with the captured profile iterations.
-                duration_samples_us = tuple(
-                    float(baseline_us) for _ in duration_samples_us
-                )
-                duration_source = "isolated_directional_p2p_microprofile"
             node_attribution_audit[uid] = {
                 key: value for key, value in matching[0].items()
                 if key in {
@@ -1201,21 +1256,17 @@ class PiperActor:
                     "device_time_total_us", "device_time_mean_us",
                 }
             }
-            node_attribution_audit[uid]["node_kind"] = str(
-                getattr(node, "node_kind", "")
-            )
+            node_attribution_audit[uid]["node_kind"] = node_kind
             node_attribution_audit[uid]["comm_id"] = node.node_meta.get(
                 "comm_id"
             )
-            node_attribution_audit[uid]["simulator_duration_source"] = (
+            node_attribution_audit[uid]["replay_duration_source"] = (
                 duration_source
             )
-            node_attribution_audit[uid]["simulator_duration_samples_us"] = list(
+            node_attribution_audit[uid]["replay_duration_samples_us"] = list(
                 duration_samples_us
             )
-            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}:
-                isolation_scope = "normal_directional_p2p"
-            elif mode == "interference_free":
+            if mode == "isolated":
                 isolation_scope = DEFAULT_ISOLATION_SCOPE
             else:
                 isolation_scope = DEFAULT_NORMAL_SCOPE
@@ -1225,6 +1276,7 @@ class PiperActor:
                 timing_source="kineto_cupti",
                 isolation_scope=isolation_scope,
                 start_offset_samples_us=start_offset_samples_us,
+                p2p_post_offset_samples_us=p2p_post_offset_samples_us,
             )
         props = torch.cuda.get_device_properties(self.runtime.device)
         return ActorProfileResult(
@@ -1974,7 +2026,7 @@ class PiperActor:
     def load_training_dag(
         self,
         training_dag: Any,
-        interference_free_order: Sequence[str],
+        isolated_order: Sequence[str],
     ) -> None:
         """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
 
@@ -1988,22 +2040,22 @@ class PiperActor:
         if not hasattr(training_dag, "nodes"):
             raise TypeError("load_training_dag expected object with 'nodes' field")
 
-        if_order = tuple(interference_free_order)
+        isolated_order = tuple(isolated_order)
         if (
-            len(if_order) != len(training_dag.nodes)
-            or len(set(if_order)) != len(if_order)
-            or set(if_order) != set(training_dag.nodes)
+            len(isolated_order) != len(training_dag.nodes)
+            or len(set(isolated_order)) != len(isolated_order)
+            or set(isolated_order) != set(training_dag.nodes)
         ):
             raise ValueError(
-                "interference-free order must contain every TrainingDAG UID "
-                f"exactly once: order={if_order!r}, "
+                "isolated order must contain every TrainingDAG UID "
+                f"exactly once: order={isolated_order!r}, "
                 f"nodes={sorted(training_dag.nodes)!r}"
             )
-        if_index = {uid: index for index, uid in enumerate(if_order)}
+        isolated_index = {uid: index for index, uid in enumerate(isolated_order)}
         for edge in training_dag.edges:
-            if if_index[edge.src_uid] >= if_index[edge.dst_uid]:
+            if isolated_index[edge.src_uid] >= isolated_index[edge.dst_uid]:
                 raise ValueError(
-                    "interference-free order violates TrainingDAG edge "
+                    "isolated order violates TrainingDAG edge "
                     f"{edge.src_uid}->{edge.dst_uid} ({edge.dep_kind})"
                 )
 
@@ -2154,7 +2206,7 @@ class PiperActor:
             stream_override=self.runtime.execution_stream_for_task,
         )
         # Normal profiling uses the ordinary issue order exactly. The
-        # interference-free policy uses the transaction-consistent projection
+        # isolated policy uses the transaction-consistent projection
         # computed once from all ActorGroup DAGs.
         self.profile_prepared_dag_executions = {
             "normal": self.prepared_dag_execution,
@@ -2163,7 +2215,7 @@ class PiperActor:
             self.profile_prepared_dag_executions[profile_mode] = (
                 self.dag_executor.prepare(
                     training_dag,
-                    [training_dag.nodes[uid] for uid in if_order],
+                    [training_dag.nodes[uid] for uid in isolated_order],
                     stream_override=(
                         lambda node, logical_stream, mode=profile_mode: (
                             self._profile_stream_override(
@@ -2225,7 +2277,7 @@ class PiperActor:
         node: Any,
         logical_stream: torch.cuda.Stream,
         *,
-        profile_mode: str = "interference_free",
+        profile_mode: str = "isolated",
     ) -> torch.cuda.Stream:
         return self.runtime.profile_stream_for_task(
             node,
@@ -2239,14 +2291,14 @@ class PiperActor:
         *,
         synchronize_before: bool = True,
         synchronize: bool = False,
-        profile_mode: str = "interference_free",
+        profile_mode: str = "isolated",
         advance_profiler: bool = True,
         capture_allocator_stats: bool = True,
     ) -> None:
-        """Run one timed iteration using interference-free or normal streams.
+        """Run one timed iteration using isolated or normal streams.
 
         Both modes preserve each node's normal logical stream (including the
-        directional P2P streams). ``interference_free`` additionally chains
+        directional P2P streams). ``isolated`` additionally chains
         nodes with CUDA events outside their CUPTI ranges so their work is
         serialized without changing its stream affinity.
         """
@@ -2299,7 +2351,7 @@ class PiperActor:
             self._execute_dag(
                 loss_fn=loss_fn,
                 prepared_execution=self.profile_prepared_dag_executions[mode],
-                serialize_nodes=(mode == INTERFERENCE_FREE_PROFILE_MODE),
+                serialize_nodes=(mode == ISOLATED_PROFILE_MODE),
                 iteration_label=f"profile_{mode}_iter",
             )
         finally:
@@ -2401,7 +2453,7 @@ class PiperActor:
     def capture_profile_training_state(self) -> dict[str, int]:
         """Snapshot mutable training and RNG state for paired policy profiles.
 
-        Normal and interference-free profiles must start from identical model
+        Normal and isolated profiles must start from identical model
         and optimizer state.  This matters especially for MoE models: allowing
         the first policy to update router weights before profiling the second
         policy can change expert token counts and therefore the GPU kernels
@@ -2494,97 +2546,3 @@ class PiperActor:
                 bucket.reduce_scatter_grads.zero_()
             if bucket.shard_param is not None:
                 bucket.shard_param.grad = None
-
-    def p2p_receive_specs(self) -> dict[str, list[tuple[tuple[int, ...], str]]]:
-        """Return the receiver-owned payload metadata keyed by P2P transaction."""
-        if self.dag is None:
-            raise RuntimeError("load_training_dag() must precede P2P profiling")
-        specs: dict[str, list[tuple[tuple[int, ...], str]]] = {}
-        for node in self.dag.nodes.values():
-            if (
-                getattr(node, "node_kind", None) != "RECV_COMM"
-                or node.tag.get("PASS") != "F"
-            ):
-                continue
-            comm_id = str(node.node_meta["comm_id"])
-            bucket = self.stages.bucket(node.node_meta["bucket_key"])
-            specs[comm_id] = [
-                (tuple(shape), str(dtype))
-                for shape, dtype, _ in bucket.forward_input_meta
-            ]
-        return specs
-
-    def profile_p2p_transfer_baselines(
-        self,
-        specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]],
-        *,
-        repeats: int = 5,
-    ) -> dict[str, float]:
-        """Measure matched P2P transfers with both endpoints already posted.
-
-        Every actor takes the same barriers, while only the two endpoints of
-        a transaction issue its directional NCCL operation.  This removes DAG
-        predecessor and pipeline-rendezvous delay from the timed transfer.
-        """
-        if self.dag is None:
-            raise RuntimeError("load_training_dag() must precede P2P profiling")
-        if repeats <= 0:
-            raise ValueError("P2P profiling repeats must be positive")
-        local_nodes = {
-            str(node.node_meta["comm_id"]): node
-            for node in self.dag.nodes.values()
-            if getattr(node, "node_kind", None) in {"SEND_COMM", "RECV_COMM"}
-        }
-        results: dict[str, float] = {}
-        # Every actor enters the world barriers in the same comm-id order;
-        # only the exact ActorGroup-aligned endpoints issue the P2P operation.
-        for comm_id in sorted(specs_by_comm_id):
-            node = local_nodes.get(comm_id)
-            payload_specs = specs_by_comm_id[comm_id]
-            dist.barrier()
-            samples: list[float] = []
-            if node is not None:
-                stream = self.runtime.directional_p2p_stream_for_task(node)
-                tensors = [
-                    torch.empty(shape, dtype=getattr(torch, dtype.split(".")[-1]), device=self.runtime.device)
-                    for shape, dtype in payload_specs
-                ]
-                peer = int(node.peer_pp_rank)
-            for _ in range(int(repeats)):
-                # Every actor must enter every barrier even though only the
-                # two endpoints of this transaction issue P2P work.
-                torch.cuda.synchronize(self.runtime.device)
-                dist.barrier()
-                if node is not None:
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record(stream)
-                    if node.node_kind == "SEND_COMM":
-                        p2p_launch = self.communication.send(
-                            tensors, peer, stream, task=node
-                        )
-                    else:
-                        # Allocate the exact receive buffers here instead of
-                        # reusing payload tensors, matching normal recv setup.
-                        recv = [torch.empty_like(tensor) for tensor in tensors]
-                        with torch.cuda.stream(stream):
-                            source = self.runtime.pipeline_peer_global_rank(peer)
-                            group = self.runtime.p2p_process_group_for_task(node)
-                            for tensor in recv:
-                                dist.recv(tensor, src=source, group=group)
-                    end.record(stream)
-                    end.synchronize()
-                    if node.node_kind == "SEND_COMM":
-                        del p2p_launch
-                    samples.append(float(start.elapsed_time(end)) * 1000.0)
-            if samples:
-                results[comm_id] = float(statistics.median(samples))
-            dist.barrier()
-        return results
-
-    def clear_profile_allocator_cache(self) -> None:
-        """Release unused cached blocks before a recorded profile series."""
-
-        torch.cuda.synchronize(self.runtime.device)
-        gc.collect()
-        torch.cuda.empty_cache()

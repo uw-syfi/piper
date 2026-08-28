@@ -1185,7 +1185,7 @@ def aggregate(rank_results: list[dict[str, Any]]) -> dict[str, Any]:
                         a2a_concurrent[rank] - a2a_solo[rank]
                     ),
                     "allreduce_slowdown": ar_concurrent[rank] / ar_solo[rank],
-                    "pair_overhead_vs_interference_free": (
+                    "pair_overhead_vs_isolated": (
                         pair_concurrent[rank] / ideal_pair
                     ),
                     "speedup_vs_solo_sum": serialized_pair / pair_concurrent[rank],
@@ -1203,7 +1203,7 @@ def aggregate(rank_results: list[dict[str, Any]]) -> dict[str, Any]:
                     "a2a_slowdown",
                     "a2a_critical_delay_ms",
                     "allreduce_slowdown",
-                    "pair_overhead_vs_interference_free",
+                    "pair_overhead_vs_isolated",
                     "speedup_vs_solo_sum",
                     "overlap_efficiency",
                 )
@@ -1243,7 +1243,7 @@ def aggregate(rank_results: list[dict[str, Any]]) -> dict[str, Any]:
                 {
                     "a2a_solo_ms": a2a,
                     "allreduce_solo_ms": allreduce,
-                    "ideal_interference_free_pair_ms": ideal,
+                    "ideal_isolated_pair_ms": ideal,
                     "normal_pair_ms": normal,
                     "a2a_slowdown": contended_a2a / a2a,
                     "a2a_critical_delay_ms": contended_a2a - a2a,

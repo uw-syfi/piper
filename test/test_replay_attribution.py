@@ -15,7 +15,7 @@ def _node(
     uid: str,
     *,
     normal_us: float,
-    interference_free_us: float,
+    isolated_us: float,
     stream: str,
 ) -> TrainingDAGNode:
     return TrainingDAGNode(
@@ -27,7 +27,7 @@ def _node(
         stream=stream,
         profile_times_by_mode={
             "normal": {0: _profile(normal_us)},
-            "interference_free": {0: _profile(interference_free_us)},
+            "isolated": {0: _profile(isolated_us)},
         },
     )
 
@@ -45,8 +45,8 @@ def test_sequential_savings_are_fully_exposed_and_additive() -> None:
     result = attribute_profile_mode_savings(
         [
             _dag(
-                _node("a", normal_us=10.0, interference_free_us=4.0, stream="s"),
-                _node("b", normal_us=8.0, interference_free_us=6.0, stream="s"),
+                _node("a", normal_us=10.0, isolated_us=4.0, stream="s"),
+                _node("b", normal_us=8.0, isolated_us=6.0, stream="s"),
                 edges=(("a", "b"),),
             )
         ],
@@ -56,7 +56,7 @@ def test_sequential_savings_are_fully_exposed_and_additive() -> None:
 
     by_uid = {item.feature.uids[0]: item for item in result.features}
     assert result.normal_step_time_us == pytest.approx(18.0)
-    assert result.interference_free_step_time_us == pytest.approx(10.0)
+    assert result.isolated_step_time_us == pytest.approx(10.0)
     assert result.attributed_step_savings_us == pytest.approx(8.0)
     assert result.additivity_residual_us == pytest.approx(0.0)
     assert by_uid["a"].attributed_savings_us == pytest.approx(6.0)
@@ -68,8 +68,8 @@ def test_parallel_bottleneck_splits_exposed_and_hidden_savings() -> None:
     result = attribute_profile_mode_savings(
         [
             _dag(
-                _node("a", normal_us=10.0, interference_free_us=4.0, stream="a"),
-                _node("b", normal_us=8.0, interference_free_us=7.0, stream="b"),
+                _node("a", normal_us=10.0, isolated_us=4.0, stream="a"),
+                _node("b", normal_us=8.0, isolated_us=7.0, stream="b"),
             )
         ],
         permutations=2,
@@ -80,7 +80,7 @@ def test_parallel_bottleneck_splits_exposed_and_hidden_savings() -> None:
 
     by_uid = {item.feature.uids[0]: item for item in result.features}
     assert result.normal_step_time_us == pytest.approx(10.0)
-    assert result.interference_free_step_time_us == pytest.approx(7.0)
+    assert result.isolated_step_time_us == pytest.approx(7.0)
     # The raw node-duration deltas sum to 7 us, but the overlap-aware
     # counterfactual makespan delta is only 3 us.
     assert sum(
@@ -101,8 +101,8 @@ def test_signed_exposed_deltas_include_negative_counterfactual_marginals() -> No
     result = attribute_profile_mode_savings(
         [
             _dag(
-                _node("faster", normal_us=10.0, interference_free_us=4.0, stream="s"),
-                _node("slower", normal_us=2.0, interference_free_us=5.0, stream="s"),
+                _node("faster", normal_us=10.0, isolated_us=4.0, stream="s"),
+                _node("slower", normal_us=2.0, isolated_us=5.0, stream="s"),
                 edges=(("faster", "slower"),),
             )
         ],
@@ -117,15 +117,15 @@ def test_signed_exposed_deltas_include_negative_counterfactual_marginals() -> No
 
 
 def test_attribution_uses_the_reported_mean_of_replay_samples() -> None:
-    a = _node("a", normal_us=0.0, interference_free_us=0.0, stream="a")
-    b = _node("b", normal_us=0.0, interference_free_us=0.0, stream="b")
+    a = _node("a", normal_us=0.0, isolated_us=0.0, stream="a")
+    b = _node("b", normal_us=0.0, isolated_us=0.0, stream="b")
     a.profile_times_by_mode = {
         "normal": {0: NodeProfile.from_samples((10.0, 1.0, 1.0))},
-        "interference_free": {0: NodeProfile.from_samples((4.0, 1.0, 1.0))},
+        "isolated": {0: NodeProfile.from_samples((4.0, 1.0, 1.0))},
     }
     b.profile_times_by_mode = {
         "normal": {0: NodeProfile.from_samples((1.0, 10.0, 1.0))},
-        "interference_free": {0: NodeProfile.from_samples((1.0, 4.0, 1.0))},
+        "isolated": {0: NodeProfile.from_samples((1.0, 4.0, 1.0))},
     }
 
     result = attribute_profile_mode_savings(
@@ -137,7 +137,7 @@ def test_attribution_uses_the_reported_mean_of_replay_samples() -> None:
     assert result.step_time_estimator == "mean"
     assert result.sample_iteration_ids == (0, 1, 2)
     assert result.normal_step_time_us == pytest.approx(7.0)
-    assert result.interference_free_step_time_us == pytest.approx(3.0)
+    assert result.isolated_step_time_us == pytest.approx(3.0)
     assert result.net_exposed_step_savings_us == pytest.approx(4.0)
 
 
@@ -163,7 +163,7 @@ def test_symmetric_routed_transaction_switches_profile_modes_atomically() -> Non
                     (2.0,), start_offset_samples_us=(20.0,)
                 )
             },
-            "interference_free": {
+            "isolated": {
                 0: NodeProfile.from_samples(
                     # The endpoint starts 10 us before the observed group
                     # rendezvous and retains a 2 us aggregate tail.
@@ -186,7 +186,7 @@ def test_symmetric_routed_transaction_switches_profile_modes_atomically() -> Non
                     (15.0,), start_offset_samples_us=(10.0,)
                 )
             },
-            "interference_free": {
+            "isolated": {
                 1: NodeProfile.from_samples(
                     (3.0,), start_offset_samples_us=(10.0,)
                 )
@@ -203,7 +203,7 @@ def test_symmetric_routed_transaction_switches_profile_modes_atomically() -> Non
                         "samples": 1,
                         "max_pairwise_uncertainty_us": 0.0,
                     }
-                    for mode in ("normal", "interference_free")
+                    for mode in ("normal", "isolated")
                 }
             }
         },
@@ -212,7 +212,7 @@ def test_symmetric_routed_transaction_switches_profile_modes_atomically() -> Non
     result = attribute_profile_mode_savings(plan, permutations=2)
 
     assert result.normal_step_time_us == pytest.approx(5.0)
-    assert result.interference_free_step_time_us == pytest.approx(3.0)
+    assert result.isolated_step_time_us == pytest.approx(3.0)
     assert result.total_step_savings_us == pytest.approx(2.0)
     routed_feature = next(
         item for item in result.features

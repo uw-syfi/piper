@@ -1,8 +1,8 @@
-"""Durable multi-mode node profiling records for stream simulation.
+"""Durable multi-mode node profiling records for stream replay.
 
 This module intentionally contains no CUDA or Ray code.  Actors produce
 ``ActorProfileResult`` records, the coordinator merges those records into the
-finalized DAGs, and the simulator consumes the resulting
+finalized DAGs, and the replay consumes the resulting
 ``ProfiledTrainingPlan``.  Keeping the interchange types here prevents live FX,
 CUDA event, and executor state from leaking into saved profile artifacts.
 """
@@ -21,10 +21,10 @@ from .dag import TrainingDAG, TrainingDAGEdge, TrainingDAGNode
 
 
 PROFILE_SCHEMA_VERSION = 2
-PROFILE_PLAN_SCHEMA_VERSION = 4
-INTERFERENCE_FREE_PROFILE_MODE = "interference_free"
+PROFILE_PLAN_SCHEMA_VERSION = 5
+ISOLATED_PROFILE_MODE = "isolated"
 NORMAL_PROFILE_MODE = "normal"
-PROFILE_MODES = frozenset({INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE})
+PROFILE_MODES = frozenset({ISOLATED_PROFILE_MODE, NORMAL_PROFILE_MODE})
 DEFAULT_ISOLATION_SCOPE = "event_serialized_logical_streams"
 DEFAULT_NORMAL_SCOPE = "logical_streams_with_directional_p2p"
 
@@ -77,6 +77,11 @@ class NodeProfile:
     # which representation a plan contains.
     start_offset_samples_us: tuple[float, ...] = ()
     start_offset_estimate_us: float | None = None
+    # CPU timestamp immediately before the first isend/irecv call represented
+    # by a compound P2P node. These use the same per-iteration origin as the
+    # GPU start offsets and are empty for non-P2P and legacy profiles.
+    p2p_post_offset_samples_us: tuple[float, ...] = ()
+    p2p_post_offset_estimate_us: float | None = None
     estimate_us: float = 0.0
     estimator: str = "median"
     timing_source: str = "cuda_event"
@@ -142,6 +147,43 @@ class NodeProfile:
             raise ValueError(
                 "start_offset_estimate_us requires start_offset_samples_us"
             )
+        if self.p2p_post_offset_samples_us:
+            if len(self.p2p_post_offset_samples_us) != len(self.samples_us):
+                raise ValueError(
+                    "p2p_post_offset_samples_us must have one entry per raw "
+                    f"sample: offsets={len(self.p2p_post_offset_samples_us)}, "
+                    f"samples={len(self.samples_us)}"
+                )
+            for offset in self.p2p_post_offset_samples_us:
+                if not math.isfinite(float(offset)) or float(offset) < 0:
+                    raise ValueError(
+                        "P2P post offsets must be finite and non-negative: "
+                        f"{self.p2p_post_offset_samples_us}"
+                    )
+            if self.p2p_post_offset_estimate_us is None:
+                object.__setattr__(
+                    self,
+                    "p2p_post_offset_estimate_us",
+                    estimate_profile_time(
+                        self.p2p_post_offset_samples_us, self.estimator
+                    ),
+                )
+        if self.p2p_post_offset_estimate_us is not None and (
+            not math.isfinite(float(self.p2p_post_offset_estimate_us))
+            or float(self.p2p_post_offset_estimate_us) < 0
+        ):
+            raise ValueError(
+                "P2P post-offset estimate must be finite and non-negative, "
+                f"got {self.p2p_post_offset_estimate_us}"
+            )
+        if (
+            not self.p2p_post_offset_samples_us
+            and self.p2p_post_offset_estimate_us is not None
+        ):
+            raise ValueError(
+                "p2p_post_offset_estimate_us requires "
+                "p2p_post_offset_samples_us"
+            )
         if not self.estimator:
             raise ValueError("profile estimator must be non-empty")
         if self.executed and self.skip_reason is not None:
@@ -158,9 +200,13 @@ class NodeProfile:
         tensor_specs: Sequence[TensorProfileSpec] = (),
         sample_iteration_ids: Sequence[int] | None = None,
         start_offset_samples_us: Sequence[float] = (),
+        p2p_post_offset_samples_us: Sequence[float] = (),
     ) -> NodeProfile:
         samples = tuple(float(sample) for sample in samples_us)
         start_offsets = tuple(float(offset) for offset in start_offset_samples_us)
+        p2p_post_offsets = tuple(
+            float(offset) for offset in p2p_post_offset_samples_us
+        )
         if not samples:
             raise ValueError("cannot estimate a node duration from zero samples")
         estimate = estimate_profile_time(samples, estimator)
@@ -176,6 +222,12 @@ class NodeProfile:
             start_offset_estimate_us=(
                 estimate_profile_time(start_offsets, estimator)
                 if start_offsets
+                else None
+            ),
+            p2p_post_offset_samples_us=p2p_post_offsets,
+            p2p_post_offset_estimate_us=(
+                estimate_profile_time(p2p_post_offsets, estimator)
+                if p2p_post_offsets
                 else None
             ),
             estimator=estimator,
@@ -210,6 +262,9 @@ class NodeProfile:
         value["samples_us"] = list(self.samples_us)
         value["sample_iteration_ids"] = list(self.sample_iteration_ids)
         value["start_offset_samples_us"] = list(self.start_offset_samples_us)
+        value["p2p_post_offset_samples_us"] = list(
+            self.p2p_post_offset_samples_us
+        )
         value["tensor_specs"] = [asdict(spec) for spec in self.tensor_specs]
         return value
 
@@ -225,7 +280,14 @@ class NodeProfile:
         start_offset_samples = tuple(
             float(offset) for offset in value.get("start_offset_samples_us", ())
         )
+        p2p_post_offset_samples = tuple(
+            float(offset)
+            for offset in value.get("p2p_post_offset_samples_us", ())
+        )
         raw_start_offset_estimate = value.get("start_offset_estimate_us")
+        raw_p2p_post_offset_estimate = value.get(
+            "p2p_post_offset_estimate_us"
+        )
         return cls(
             schema_version=PROFILE_SCHEMA_VERSION,
             samples_us=samples,
@@ -237,6 +299,15 @@ class NodeProfile:
                 None
                 if not start_offset_samples or raw_start_offset_estimate is None
                 else float(raw_start_offset_estimate)
+            ),
+            p2p_post_offset_samples_us=p2p_post_offset_samples,
+            p2p_post_offset_estimate_us=(
+                None
+                if (
+                    not p2p_post_offset_samples
+                    or raw_p2p_post_offset_estimate is None
+                )
+                else float(raw_p2p_post_offset_estimate)
             ),
             estimate_us=float(value.get("estimate_us", 0.0)),
             estimator=str(value.get("estimator", "median")),
@@ -251,7 +322,7 @@ class NodeProfile:
 
 
 def estimate_profile_time(samples_us: Sequence[float], estimator: str = "median") -> float:
-    """Reduce repeated measurements to the duration used by simulation."""
+    """Reduce repeated measurements to the duration used by replay."""
 
     if not samples_us:
         raise ValueError("profile estimator requires at least one sample")
@@ -323,7 +394,7 @@ class ActorProfileResult:
     graph_fingerprint: str
     global_rank: int
     node_profiles: dict[str, NodeProfile]
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE
+    profile_mode: str = ISOLATED_PROFILE_MODE
     pp_rank: int = 0
     device_metadata: dict[str, Any] = field(default_factory=dict)
     prologue_profile: NodeProfile | None = None
@@ -533,7 +604,7 @@ def _json_safe_value(value: Any) -> Any:
 
 
 def get_node_profile_times(
-    node: TrainingDAGNode, mode: str = INTERFERENCE_FREE_PROFILE_MODE
+    node: TrainingDAGNode, mode: str = ISOLATED_PROFILE_MODE
 ) -> dict[int, NodeProfile]:
     """Return rank-keyed node profiles for ``mode``.
 
@@ -558,7 +629,7 @@ def set_node_profile_times(
 
 
 def get_prologue_profile_times(
-    dag: TrainingDAG, mode: str = INTERFERENCE_FREE_PROFILE_MODE
+    dag: TrainingDAG, mode: str = ISOLATED_PROFILE_MODE
 ) -> dict[int, NodeProfile]:
     """Return rank-keyed prologue profiles for ``mode``."""
 
@@ -703,7 +774,7 @@ def training_dag_from_slim_dict(value: Mapping[str, Any]) -> TrainingDAG:
 
 @dataclass
 class ProfiledTrainingPlan:
-    """Versioned, portable input to normal/interference-free simulation."""
+    """Versioned, portable input to normal/isolated replay."""
 
     per_pp_dags: list[TrainingDAG]
     graph_fingerprint: str
@@ -1017,11 +1088,32 @@ def merge_actor_profiles(
             float(origin) - float(base) + float(local_offset)
             for origin, base, local_offset in zip(origins, bases, local_offsets)
         )
+        local_p2p_post_offsets = profile.p2p_post_offset_samples_us
+        if local_p2p_post_offsets and len(local_p2p_post_offsets) != len(origins):
+            raise ValueError(
+                f"profile mode {result.profile_mode!r} rank {result.global_rank} "
+                f"node has P2P post offsets={len(local_p2p_post_offsets)} and "
+                f"calibrated origins={len(origins)}"
+            )
+        global_p2p_post_offsets = tuple(
+            float(origin) - float(base) + float(local_offset)
+            for origin, base, local_offset in zip(
+                origins, bases, local_p2p_post_offsets
+            )
+        )
         return replace(
             profile,
             start_offset_samples_us=global_offsets,
             start_offset_estimate_us=estimate_profile_time(
                 global_offsets, profile.estimator
+            ),
+            p2p_post_offset_samples_us=global_p2p_post_offsets,
+            p2p_post_offset_estimate_us=(
+                estimate_profile_time(
+                    global_p2p_post_offsets, profile.estimator
+                )
+                if global_p2p_post_offsets
+                else None
             ),
         )
     seen_results: set[tuple[str, int]] = set()

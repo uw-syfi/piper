@@ -1,4 +1,4 @@
-"""Replay normal and interference-free Piper step-time profiles."""
+"""Replay normal and isolated Piper step-time profiles."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ if _REPO_ROOT in sys.path:
 sys.path.insert(0, _REPO_ROOT)
 
 from src.profiling import ProfiledTrainingPlan
-from src.simulator import simulate_profile_modes, simulate_training_step
+from src.replay import replay_profile_modes, replay_training_step
 
 
 def _result_dict(result) -> dict:
@@ -59,13 +59,13 @@ def _result_dict(result) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Replay normal and interference-free Piper step-time profiles"
+        description="Replay normal and isolated Piper step-time profiles"
     )
     parser.add_argument("profile", type=Path, help="ProfiledTrainingPlan JSON artifact")
     parser.add_argument("--output", type=Path, help="Optional result JSON path")
     parser.add_argument(
         "--mode",
-        choices=("auto", "interference_free", "normal", "both"),
+        choices=("auto", "isolated", "normal", "both"),
         default="auto",
         help="Profile dataset to replay; auto uses both when both are present.",
     )
@@ -88,12 +88,12 @@ def main() -> None:
     if mode == "auto":
         mode = (
             "both"
-            if {"interference_free", "normal"}
+            if {"isolated", "normal"}
             <= set(plan.available_profile_modes)
-            else "interference_free"
+            else "isolated"
         )
     if mode == "both":
-        comparison = simulate_profile_modes(
+        comparison = replay_profile_modes(
             plan,
             actual_step_samples_us=tuple(
                 sample * 1_000_000.0 for sample in args.actual_step_time_s
@@ -102,40 +102,23 @@ def main() -> None:
             strict=not args.no_strict,
         )
         payload = {
-            "interference_free": _result_dict(comparison.interference_free),
-            "normal": _result_dict(comparison.normal),
-            "statistics_us": {
-                "interference_free": comparison.interference_free_statistics.to_dict(),
-                "normal": comparison.normal_statistics.to_dict(),
-                "actual": (
-                    None
-                    if comparison.actual_statistics is None
-                    else comparison.actual_statistics.to_dict()
-                ),
-                "instrumented_normal_profile": (
-                    None
-                    if comparison.instrumented_normal_statistics is None
-                    else comparison.instrumented_normal_statistics.to_dict()
-                ),
-            },
-            "normal_prediction_error_pct": (
+            "actual_step_time_us": (
                 None
-                if comparison.normal_prediction_error is None
-                else comparison.normal_prediction_error.signed_pct
+                if comparison.actual_statistics is None
+                else comparison.actual_statistics.estimate
             ),
-            "normal_absolute_error_pct": (
-                None
-                if comparison.normal_prediction_error is None
-                else comparison.normal_prediction_error.absolute_pct
+            "normal_replay_step_time_us": (
+                comparison.normal_statistics.estimate
             ),
-            "predicted_interference_reduction_pct": (
-                comparison.predicted_interference_reduction_pct
+            "perfect_overlap_replay_step_time_us": (
+                comparison.isolated_statistics.estimate
             ),
-            "profile_event_overhead_pct": comparison.profile_event_overhead_pct,
+            "prediction_error_pct": comparison.prediction_error_pct,
+            "interference_overhead_pct": comparison.interference_overhead_pct,
         }
     else:
         payload = _result_dict(
-            simulate_training_step(
+            replay_training_step(
                 plan, profile_mode=mode, strict=not args.no_strict
             )
         )

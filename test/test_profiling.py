@@ -7,7 +7,7 @@ import src.directives as directives
 from src.profiling import (
     ActorProfileResult,
     NORMAL_PROFILE_MODE,
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     NodeProfile,
     ProfileConfig,
     ProfiledTrainingPlan,
@@ -46,40 +46,35 @@ def _two_node_dag(device: list[int] | None = None) -> TrainingDAG:
     return dag
 
 
-def test_node_profile_estimator_and_json_round_trip() -> None:
+def test_node_profile_round_trip_preserves_aligned_timing_metadata() -> None:
     spec = TensorProfileSpec(shape=(2, 4), dtype="torch.bfloat16", bytes=16)
-    profile = NodeProfile.from_samples((3.0, 1.0, 2.0), tensor_specs=(spec,))
-
-    assert profile.estimate_us == 2.0
-    assert NodeProfile.from_dict(profile.to_dict()) == profile
-    assert NodeProfile.skipped("zero-byte collective").executed is False
-
-
-def test_node_profile_preserves_explicit_iteration_alignment() -> None:
-    profile = NodeProfile.from_samples(
-        (3.0, 1.0, 2.0), sample_iteration_ids=(20, 30, 40)
-    )
-
-    assert profile.sample_iteration_ids == (20, 30, 40)
-    assert NodeProfile.from_dict(profile.to_dict()) == profile
-    with pytest.raises(ValueError, match="one entry per raw sample"):
-        NodeProfile.from_samples((1.0, 2.0), sample_iteration_ids=(7,))
-
-
-def test_node_profile_preserves_iteration_aligned_start_offsets() -> None:
     profile = NodeProfile.from_samples(
         (3.0, 1.0, 2.0),
         sample_iteration_ids=(20, 30, 40),
         start_offset_samples_us=(100.0, 120.0, 110.0),
+        p2p_post_offset_samples_us=(90.0, 115.0, 105.0),
+        tensor_specs=(spec,),
     )
 
+    assert profile.estimate_us == 2.0
+    assert profile.sample_iteration_ids == (20, 30, 40)
     assert profile.start_offset_samples_us == (100.0, 120.0, 110.0)
     assert profile.start_offset_estimate_us == 110.0
+    assert profile.p2p_post_offset_samples_us == (90.0, 115.0, 105.0)
+    assert profile.p2p_post_offset_estimate_us == 105.0
     assert NodeProfile.from_dict(profile.to_dict()) == profile
-    with pytest.raises(ValueError, match="one entry per raw sample"):
-        NodeProfile.from_samples(
-            (1.0, 2.0), start_offset_samples_us=(10.0,)
-        )
+    assert NodeProfile.skipped("zero-byte collective").executed is False
+
+
+def test_node_profile_rejects_misaligned_timing_metadata() -> None:
+    invalid_metadata = (
+        {"sample_iteration_ids": (7,)},
+        {"start_offset_samples_us": (10.0,)},
+        {"p2p_post_offset_samples_us": (10.0,)},
+    )
+    for metadata in invalid_metadata:
+        with pytest.raises(ValueError, match="one entry per raw sample"):
+            NodeProfile.from_samples((1.0, 2.0), **metadata)
 
 
 def test_node_profile_loads_duration_only_artifact_without_start_offsets() -> None:
@@ -127,7 +122,7 @@ def test_finalized_fingerprint_is_order_and_profile_invariant() -> None:
     reordered.add_node(_node("b", stream="other"))
     reordered.add_node(_node("a"))
     reordered.add_edge(TrainingDAGEdge("a", "b", "data", "activation"))
-    reordered.nodes["a"].profile_times_by_mode["interference_free"] = {
+    reordered.nodes["a"].profile_times_by_mode["isolated"] = {
         0: NodeProfile.from_samples((5.0,))
     }
 
@@ -162,14 +157,14 @@ def test_merge_actor_profiles_attaches_rank_keyed_measurements() -> None:
     plan = merge_actor_profiles([dag], [rank2, rank0], topology={"world_size": 4})
 
     assert plan.per_pp_dags[0] is dag
-    profiles = get_node_profile_times(dag.nodes["a"], "interference_free")
+    profiles = get_node_profile_times(dag.nodes["a"], "isolated")
     assert profiles[0].estimate_us == 11.0
     assert profiles[2].estimate_us == 11.0
-    assert get_prologue_profile_times(dag, "interference_free")[0].estimate_us == 1.0
+    assert get_prologue_profile_times(dag, "isolated")[0].estimate_us == 1.0
     assert plan.topology == {"world_size": 4}
 
 
-def test_merge_actor_profiles_keeps_interference_free_and_normal_datasets() -> None:
+def test_merge_actor_profiles_keeps_isolated_and_normal_datasets() -> None:
     dag = _two_node_dag(device=[0])
     fingerprint = finalized_dag_fingerprint(dag)
 
@@ -193,11 +188,11 @@ def test_merge_actor_profiles_keeps_interference_free_and_normal_datasets() -> N
     plan = merge_actor_profiles(
         [dag],
         [
-            _result(INTERFERENCE_FREE_PROFILE_MODE, 10.0),
+            _result(ISOLATED_PROFILE_MODE, 10.0),
             _result(NORMAL_PROFILE_MODE, 20.0),
         ],
         profile_configs={
-            INTERFERENCE_FREE_PROFILE_MODE: ProfileConfig(repeat_iters=2),
+            ISOLATED_PROFILE_MODE: ProfileConfig(repeat_iters=2),
             NORMAL_PROFILE_MODE: ProfileConfig(
                 repeat_iters=2,
                 isolation_scope="logical_streams_with_directional_p2p",
@@ -205,8 +200,8 @@ def test_merge_actor_profiles_keeps_interference_free_and_normal_datasets() -> N
         },
     )
 
-    assert plan.available_profile_modes == ("interference_free", "normal")
-    assert get_node_profile_times(dag.nodes["a"], "interference_free")[0].estimate_us == 10.5
+    assert plan.available_profile_modes == ("isolated", "normal")
+    assert get_node_profile_times(dag.nodes["a"], "isolated")[0].estimate_us == 10.5
     assert get_node_profile_times(dag.nodes["a"], "normal")[0].estimate_us == 20.5
     assert get_prologue_profile_times(dag, "normal")[0].estimate_us == 20.0
     assert plan.config_for_mode("normal").repeat_iters == 2
@@ -224,7 +219,9 @@ def test_merge_actor_profiles_aligns_cuda_offsets_across_actor_clocks() -> None:
             profile_mode=NORMAL_PROFILE_MODE,
             node_profiles={
                 "a": NodeProfile.from_samples(
-                    (3.0,), start_offset_samples_us=(5.0,)
+                    (3.0,),
+                    start_offset_samples_us=(5.0,),
+                    p2p_post_offset_samples_us=(4.0,),
                 ),
                 "b": NodeProfile.from_samples(
                     (4.0,), start_offset_samples_us=(9.0,)
@@ -241,6 +238,8 @@ def test_merge_actor_profiles_aligns_cuda_offsets_across_actor_clocks() -> None:
     profiles = get_node_profile_times(dag.nodes["a"], NORMAL_PROFILE_MODE)
     assert profiles[0].start_offset_samples_us == pytest.approx((5.0,))
     assert profiles[2].start_offset_samples_us == pytest.approx((17.0,))
+    assert profiles[0].p2p_post_offset_samples_us == pytest.approx((4.0,))
+    assert profiles[2].p2p_post_offset_samples_us == pytest.approx((16.0,))
     alignment = plan.profile_metadata["timeline_alignment"]
     assert (
         alignment["method"]
@@ -253,6 +252,9 @@ def test_merge_actor_profiles_aligns_cuda_offsets_across_actor_clocks() -> None:
         restored.per_pp_dags[0].nodes["a"], NORMAL_PROFILE_MODE
     )
     assert restored_profiles[2].start_offset_samples_us == pytest.approx((17.0,))
+    assert restored_profiles[2].p2p_post_offset_samples_us == pytest.approx(
+        (16.0,)
+    )
     assert restored.profile_metadata["timeline_alignment"] == alignment
 
 
@@ -339,13 +341,13 @@ def test_profiled_plan_slim_round_trip_drops_live_metadata() -> None:
     dag.nodes["a"].node_meta["gm"] = object()
     dag.nodes["a"].node_meta["safe"] = {"shape": [2, 3]}
     for node in dag.nodes.values():
-        node.profile_times_by_mode["interference_free"] = {
+        node.profile_times_by_mode["isolated"] = {
             0: NodeProfile.from_samples((2.5,))
         }
     plan = ProfiledTrainingPlan.from_dags(
         [dag],
         profile_configs={
-            "interference_free": ProfileConfig(warmup_iters=1, repeat_iters=2)
+            "isolated": ProfileConfig(warmup_iters=1, repeat_iters=2)
         },
     )
 
@@ -356,11 +358,11 @@ def test_profiled_plan_slim_round_trip_drops_live_metadata() -> None:
     assert "gm" not in restored.per_pp_dags[0].nodes["a"].node_meta
     assert restored.per_pp_dags[0].nodes["a"].node_meta["safe"] == {"shape": [2, 3]}
     assert get_node_profile_times(
-        restored.per_pp_dags[0].nodes["a"], "interference_free"
+        restored.per_pp_dags[0].nodes["a"], "isolated"
     )[0].estimate_us == 2.5
 
 
-@pytest.mark.parametrize("mode", ("isolated", "concurrent"))
+@pytest.mark.parametrize("mode", ("interference_free", "solo", "concurrent"))
 def test_removed_profile_mode_aliases_are_rejected(mode: str) -> None:
     with pytest.raises(ValueError, match="unsupported profile mode"):
         normalize_profile_mode(mode)

@@ -1191,8 +1191,8 @@ def aggregate_case(
                     "allgather_concurrent_ms": ag_concurrent,
                     "allgather_slowdown": ag_concurrent / ag_solo,
                     "normal_pair_ms": pair_makespan,
-                    "ideal_interference_free_pair_ms": ideal_pair,
-                    "pair_overhead_vs_interference_free": (
+                    "ideal_isolated_pair_ms": ideal_pair,
+                    "pair_overhead_vs_isolated": (
                         pair_makespan / ideal_pair
                     ),
                     "removable_fraction_of_normal": (
@@ -1331,10 +1331,10 @@ def csv_rows(
                         "median"
                     ],
                     "ideal_pair_median_ms": critical[
-                        "ideal_interference_free_pair_ms"
+                        "ideal_isolated_pair_ms"
                     ]["median"],
                     "pair_overhead_median": critical[
-                        "pair_overhead_vs_interference_free"
+                        "pair_overhead_vs_isolated"
                     ]["median"],
                     "removable_fraction_median": critical[
                         "removable_fraction_of_normal"

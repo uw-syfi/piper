@@ -757,7 +757,7 @@ def write_report(
                 "**Important comparability caveat:** all strict-alone A2As are "
                 "small setup HLOs. None of the 64 steady `all-to-all.2` kernels "
                 "runs strictly alone, so the trace does not provide an "
-                "interference-free baseline for the production A2A shape."
+                "isolated baseline for the production A2A shape."
             ),
             "",
             "### Breakdown by all-to-all HLO operation",

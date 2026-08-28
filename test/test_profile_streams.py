@@ -129,41 +129,6 @@ def test_execution_stream_policy_uses_directional_p2p_streams() -> None:
     )
 
 
-def test_execution_stream_policy_preserves_declared_routed_stream() -> None:
-    runtime = _runtime()
-    logical_stream = runtime.streams["compute_stream"]
-
-    for node_kind in ("A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"):
-        task = SimpleNamespace(uid=node_kind, node_kind=node_kind)
-        assert runtime.execution_stream_for_task(task, logical_stream) is logical_stream
-
-
-def test_interference_free_profile_preserves_non_p2p_logical_stream() -> None:
-    runtime = _runtime()
-    task = SimpleNamespace(uid="compute", node_kind="COMPUTE")
-    logical_stream = runtime.streams["compute_stream"]
-
-    assert (
-        runtime.profile_stream_for_task(
-            task, logical_stream, profile_mode="interference_free"
-        )
-        is logical_stream
-    )
-
-
-def test_normal_profile_preserves_non_p2p_logical_stream() -> None:
-    runtime = _runtime()
-    task = SimpleNamespace(uid="compute", node_kind="COMPUTE")
-    logical_stream = runtime.streams["compute_stream"]
-
-    assert (
-        runtime.profile_stream_for_task(
-            task, logical_stream, profile_mode="normal"
-        )
-        is logical_stream
-    )
-
-
 def test_both_profile_modes_keep_directional_p2p_streams() -> None:
     runtime = _runtime(global_pp_rank=1)
     task = SimpleNamespace(
@@ -171,7 +136,7 @@ def test_both_profile_modes_keep_directional_p2p_streams() -> None:
     )
     logical_stream = runtime.streams["compute_stream"]
 
-    for profile_mode in ("interference_free", "normal"):
+    for profile_mode in ("isolated", "normal"):
         assert (
             runtime.profile_stream_for_task(
                 task, logical_stream, profile_mode=profile_mode
@@ -180,12 +145,17 @@ def test_both_profile_modes_keep_directional_p2p_streams() -> None:
         )
 
 
-def test_both_profile_modes_preserve_declared_routed_stream() -> None:
+def test_profile_modes_preserve_non_p2p_logical_streams() -> None:
     runtime = _runtime()
     logical_stream = runtime.streams["compute_stream"]
 
-    for profile_mode in ("interference_free", "normal"):
-        for node_kind in ("A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"):
+    for profile_mode in ("isolated", "normal"):
+        for node_kind in (
+            "COMPUTE",
+            "A2A_COMM",
+            "M_TO_N_COMM",
+            "N_TO_M_COMM",
+        ):
             task = SimpleNamespace(uid=node_kind, node_kind=node_kind)
             assert (
                 runtime.profile_stream_for_task(

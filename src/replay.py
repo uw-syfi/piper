@@ -1,26 +1,31 @@
-"""Interference-free, node-level simulation for profiled TrainingDAGs.
+"""Isolated, node-level replay for profiled TrainingDAGs.
 
-The simulator is deliberately CUDA-free.  It treats each profiled compute
-duration as the service time the node would observe in isolation, preserves
+The replay is deliberately CUDA-free. It uses the selected policy's profiled
+duration for each non-communication node, preserves
 TrainingDAG dependencies and CUDA stream FIFO order, and otherwise provides no
 shared GPU or network capacity.  Consequently, independent streams and
 communication transactions overlap completely.  Communication endpoint
 timings can include time spent waiting for other ranks to arrive.  The
-simulator therefore separates rank-local endpoint arrival and completion with
-a shared zero-duration rendezvous.  For calibrated profiles it derives each
-endpoint's post-rendezvous tail once from the observed, cross-actor-aligned
-timeline and reuses that tail in both replays.  Symmetric collectives use an
+replay therefore separates rank-local endpoint arrival and completion with
+a shared zero-duration rendezvous. For each policy it derives every endpoint's
+post-rendezvous service time from that policy's observed, cross-actor-aligned
+timeline. Symmetric collectives use an
 all-participant rendezvous.  Routed A2A, M-to-N, and N-to-M nodes use one
 logical rendezvous per DAG node followed by rank-local aggregate envelope
 tails; internal metadata/payload phases are not modeled separately.
-Collective replay fails closed when aligned endpoint timestamps are
-unavailable.
+Communication profiles with observed cross-actor offsets fail closed when
+timeline alignment is unavailable.
 
-P2P SEND/RECV endpoints retain distinct completion vertices.  Both arrivals
-gate their shared rendezvous, but send-side successors wait only for send
-completion and receive-side consumers wait only for receive completion.
-Every finalized DAG dependency is preserved. Directional P2P physical streams
-remain independent, but an explicit edge between them is never relaxed.
+Each matched P2P SEND/RECV node pair is one compound transaction, even when its
+runtime protocol makes multiple P2P calls. The aggregate CUDA envelope supplies
+independent endpoint service tails. Send completion is local: it waits only for
+its own first call and send-source readiness. Receive completion waits for both
+first calls plus send-source and receive-destination readiness. Successors wait
+only for their local endpoint's completion.
+Every finalized data and temporal dependency is preserved. Issue-only edges
+control executor dispatch but do not constrain replay timing. Directional P2P
+physical streams remain independent, while their DAG-encoded FIFO and
+completion dependencies remain authoritative.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ from .execution_plan import (
 )
 from .profiling import (
     NORMAL_PROFILE_MODE,
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     estimate_profile_time,
     get_node_profile_times,
     get_prologue_profile_times,
@@ -78,8 +83,8 @@ _COLLECTIVE_KINDS = _SYMMETRIC_COLLECTIVE_KINDS
 _COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS
 
 
-class SimulationValidationError(ValueError):
-    """Raised when an input cannot define an unambiguous simulation."""
+class ReplayValidationError(ValueError):
+    """Raised when an input cannot define an unambiguous replay."""
 
 
 @dataclass(frozen=True, order=True)
@@ -92,12 +97,14 @@ class NodeInstance:
 
 @dataclass(frozen=True)
 class TimelineEvent:
-    """The simulated interval for one rank-local node occurrence.
+    """The replayed interval for one rank-local node occurrence.
 
-    ``start_us`` is the earliest legal start implied by the DAG and physical
-    stream FIFO constraints.  Observed CUDA start offsets are retained only
-    for validation; they are not replay release constraints in either timing
-    mode, so normal and isolated replays differ solely by service times.
+    ``start_us`` is the earliest legal service start implied by the DAG,
+    physical-stream FIFO constraints, and communication gates. Observed CUDA
+    start offsets are retained only for validation. P2P host-post offsets are
+    distinct release constraints; the normal post schedule is shared by both
+    timing modes, so normal and isolated replays differ solely by service
+    times.
     """
 
     operation: NodeInstance
@@ -120,7 +127,7 @@ class TimelineEvent:
 
 @dataclass(frozen=True)
 class CriticalPathEntry:
-    """One (possibly multi-rank) operation on the simulated critical path."""
+    """One (possibly multi-rank) operation on the replayed critical path."""
 
     operation_id: str
     members: tuple[NodeInstance, ...]
@@ -130,15 +137,15 @@ class CriticalPathEntry:
 
 
 @dataclass(frozen=True)
-class SimulationResult:
-    """Interference-free step-time estimate and its supporting timeline."""
+class ReplayResult:
+    """One policy's step-time estimate and its supporting timeline."""
 
     step_time_us: float
     per_rank_makespan_us: dict[int, float]
     timeline: tuple[TimelineEvent, ...]
     critical_path: tuple[CriticalPathEntry, ...]
     warnings: tuple[str, ...] = ()
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE
+    profile_mode: str = ISOLATED_PROFILE_MODE
     sample_iteration_id: int | None = None
 
     @property
@@ -154,29 +161,29 @@ class SimulationResult:
 
 
 @dataclass(frozen=True)
-class SimulationComparisonResult:
-    """Interference-free and normal replays plus uncertainty and calibration."""
+class ReplayComparisonResult:
+    """Isolated and normal replays plus uncertainty and calibration."""
 
-    interference_free: SimulationResult
-    normal: SimulationResult
-    interference_free_samples_us: tuple[float, ...]
+    isolated: ReplayResult
+    normal: ReplayResult
+    isolated_samples_us: tuple[float, ...]
     normal_samples_us: tuple[float, ...]
     observed_normal_envelope_samples_us: tuple[float, ...]
-    interference_free_statistics: MeanStatistics
+    isolated_statistics: MeanStatistics
     normal_statistics: MeanStatistics
-    dependency_replay_savings_statistics: PairedSavingsStatistics
+    perfect_overlap_savings_statistics: PairedSavingsStatistics
     observed_normal_envelope_statistics: TimingStatistics | None = None
     actual_statistics: TimingStatistics | None = None
     instrumented_normal_statistics: TimingStatistics | None = None
-    instrumented_interference_free_statistics: TimingStatistics | None = None
+    instrumented_isolated_statistics: TimingStatistics | None = None
     uninstrumented_normal_statistics: TimingStatistics | None = None
-    uninstrumented_interference_free_statistics: TimingStatistics | None = None
-    normal_prediction_error: PredictionError | None = None
+    uninstrumented_isolated_statistics: TimingStatistics | None = None
+    normal_replay_error: PredictionError | None = None
     instrumented_normal_replay_error: PredictionError | None = None
-    instrumented_interference_free_replay_error: PredictionError | None = None
-    predicted_interference_reduction_pct: float | None = None
-    dependency_replay_absolute_savings_us: float | None = None
-    dependency_replay_interference_reduction_pct: float | None = None
+    instrumented_isolated_replay_error: PredictionError | None = None
+    prediction_error_pct: float | None = None
+    perfect_overlap_absolute_savings_us: float | None = None
+    interference_overhead_pct: float | None = None
     instrumented_policy_reduction_pct: float | None = None
     observed_interference_reduction_pct: float | None = None
     envelope_modeled_interference_reduction_pct: float | None = None
@@ -203,7 +210,7 @@ def compare_earliest_legal_starts(
     profile_mode: str = NORMAL_PROFILE_MODE,
     strict: bool = True,
 ) -> EarliestLegalStartComparison:
-    """Compare simulated earliest legal starts with recorded CUDA starts.
+    """Compare replayed earliest legal starts with recorded CUDA starts.
 
     The comparison is per node instance and raw profile iteration.  A positive
     error means the observed CUDA start was later than its DAG/stream-ready
@@ -213,7 +220,7 @@ def compare_earliest_legal_starts(
     mode = normalize_profile_mode(profile_mode)
     errors: list[float] = []
     for iteration_id in profile_iteration_ids(plan_or_dags, profile_mode=mode):
-        result = simulate_training_step(
+        result = replay_training_step(
             plan_or_dags,
             profile_mode=mode,
             sample_iteration_id=iteration_id,
@@ -228,7 +235,7 @@ def compare_earliest_legal_starts(
             )
             errors.append(float(observed) - float(earliest_start))
     if not errors:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"profile mode {mode!r} has no events to compare"
         )
     absolute_errors = sorted(abs(error) for error in errors)
@@ -265,6 +272,7 @@ class _InstanceRecord:
     profile_duration_us: float
     profile_start_offset_us: float = 0.0
     observed_profile_start_offset_us: float = 0.0
+    p2p_post_offset_us: float | None = None
 
 
 @dataclass
@@ -302,7 +310,7 @@ def _profile_duration_us(
     sample_iteration_id: int | None = None,
 ) -> float:
     if isinstance(profile, bool):
-        raise SimulationValidationError(f"{context}: boolean is not a valid profile duration")
+        raise ReplayValidationError(f"{context}: boolean is not a valid profile duration")
     if isinstance(profile, Real):
         value = float(profile)
     elif isinstance(profile, Mapping):
@@ -317,7 +325,7 @@ def _profile_duration_us(
             try:
                 value = samples[ids.index(int(sample_iteration_id))]
             except ValueError as exc:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"{context}: no raw sample for iteration {sample_iteration_id}"
                 ) from exc
         elif "estimate_us" in profile:
@@ -325,7 +333,7 @@ def _profile_duration_us(
         elif "duration_us" in profile:
             value = float(profile["duration_us"])
         else:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"{context}: profile mapping has neither estimate_us nor duration_us"
             )
     else:
@@ -337,7 +345,7 @@ def _profile_duration_us(
             try:
                 value = float(samples[tuple(ids).index(int(sample_iteration_id))])
             except ValueError as exc:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"{context}: no raw sample for iteration {sample_iteration_id}"
                 ) from exc
             estimate = value
@@ -346,12 +354,12 @@ def _profile_duration_us(
         if estimate is None:
             estimate = getattr(profile, "duration_us", None)
         if estimate is None:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"{context}: profile has neither estimate_us nor duration_us"
             )
         value = float(estimate)
     if not math.isfinite(value) or value < 0.0:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"{context}: duration must be finite and non-negative, got {value!r}"
         )
     return value
@@ -379,7 +387,7 @@ def _profile_start_offset_us(
         try:
             value = samples[ids.index(int(sample_iteration_id))]
         except ValueError as exc:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"{context}: no start-offset sample for iteration "
                 f"{sample_iteration_id}"
             ) from exc
@@ -396,8 +404,48 @@ def _profile_start_offset_us(
     else:
         return 0.0
     if not math.isfinite(value) or value < 0.0:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"{context}: start offset must be finite and non-negative, got {value!r}"
+        )
+    return value
+
+
+def _profile_p2p_post_offset_us(
+    profile: Any,
+    *,
+    context: str,
+    sample_iteration_id: int | None = None,
+) -> float | None:
+    """Read an optional offset for entry to a node's first P2P call."""
+
+    if isinstance(profile, Mapping):
+        raw_samples = profile.get("p2p_post_offset_samples_us", ())
+        estimate = profile.get("p2p_post_offset_estimate_us")
+        raw_ids = profile.get("sample_iteration_ids", ())
+    else:
+        raw_samples = getattr(profile, "p2p_post_offset_samples_us", ())
+        estimate = getattr(profile, "p2p_post_offset_estimate_us", None)
+        raw_ids = getattr(profile, "sample_iteration_ids", ())
+    samples = tuple(float(value) for value in (raw_samples or ()))
+    if sample_iteration_id is not None and samples:
+        ids = tuple(int(value) for value in (raw_ids or range(len(samples))))
+        try:
+            value = samples[ids.index(int(sample_iteration_id))]
+        except ValueError as exc:
+            raise ReplayValidationError(
+                f"{context}: no P2P post-offset sample for iteration "
+                f"{sample_iteration_id}"
+            ) from exc
+    elif estimate is not None:
+        value = float(estimate)
+    elif samples:
+        value = estimate_profile_time(samples, _profile_estimator(profile))
+    else:
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        raise ReplayValidationError(
+            f"{context}: P2P post offset must be finite and non-negative, "
+            f"got {value!r}"
         )
     return value
 
@@ -407,7 +455,7 @@ def _profile_for_rank(
 ) -> Any:
     profiles = get_node_profile_times(node, profile_mode)
     if not isinstance(profiles, Mapping):
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"node {node.uid!r} has no rank-keyed {profile_mode} profile mapping"
         )
     if rank in profiles:
@@ -416,13 +464,24 @@ def _profile_for_rank(
     # ProfiledTrainingPlan loader yet.
     if str(rank) in profiles:
         return profiles[str(rank)]
-    raise SimulationValidationError(
+    raise ReplayValidationError(
         f"missing profile for node {node.uid!r} on global rank {rank} "
         f"in mode {profile_mode!r}"
     )
 
 
-def _profile_iteration_ids_for_collective(
+def _optional_profile_for_rank(
+    node: TrainingDAGNode, rank: int, profile_mode: str
+) -> Any | None:
+    profiles = get_node_profile_times(node, profile_mode)
+    if not isinstance(profiles, Mapping):
+        return None
+    if rank in profiles:
+        return profiles[rank]
+    return profiles.get(str(rank))
+
+
+def _profile_iteration_ids_for_communication(
     profile: Any, *, context: str
 ) -> tuple[int, ...]:
     if isinstance(profile, Mapping):
@@ -432,8 +491,8 @@ def _profile_iteration_ids_for_collective(
         samples = tuple(getattr(profile, "samples_us", ()))
         raw_ids = tuple(getattr(profile, "sample_iteration_ids", ()))
     if not samples:
-        raise SimulationValidationError(
-            f"{context}: aligned collective profile has no raw samples"
+        raise ReplayValidationError(
+            f"{context}: aligned communication profile has no raw samples"
         )
     return tuple(int(value) for value in (raw_ids or range(len(samples))))
 
@@ -444,36 +503,64 @@ def _profile_estimator(profile: Any) -> str:
     return str(getattr(profile, "estimator", "median"))
 
 
-def _symmetric_collective_observed_services(
+def _profile_timing_source(profile: Any) -> str:
+    if isinstance(profile, Mapping):
+        return str(profile.get("timing_source", ""))
+    return str(getattr(profile, "timing_source", ""))
+
+
+def _communication_observed_services(
     members: Sequence[_InstanceRecord],
     *,
     communication_id: str,
     sample_iteration_id: int | None,
     pairwise_alignment_uncertainty_us: float,
 ) -> dict[NodeInstance, float]:
-    """Derive endpoint service from paired aligned activity occurrences."""
+    """Derive wait-free endpoint service from aligned profile occurrences.
 
+    Collectives become serviceable after every participant's GPU activity has
+    arrived. A compound P2P send can complete after its own first call and GPU
+    readiness without waiting for the peer. Receive data becomes serviceable
+    only after both first calls and both endpoints' GPU readiness. Aggregate
+    envelopes may contain additional internal P2P calls.
+    """
+
+    is_p2p = all(member.node.node_kind in _P2P_KINDS for member in members)
     if sample_iteration_id is None:
         if any(member.profile is None for member in members):
-            raise SimulationValidationError(
-                f"collective {communication_id!r} has no endpoint profile"
+            raise ReplayValidationError(
+                f"communication {communication_id!r} has no endpoint profile"
             )
-        endpoint_ids = {
-            _profile_iteration_ids_for_collective(
-                member.profile,
-                context=(
-                    f"collective {communication_id!r} rank "
-                    f"{member.key.global_rank} uid={member.key.uid!r}"
-                ),
+        endpoint_has_samples = tuple(
+            bool(
+                member.profile.get("samples_us", ())
+                if isinstance(member.profile, Mapping)
+                else getattr(member.profile, "samples_us", ())
             )
             for member in members
-        }
-        if len(endpoint_ids) != 1:
-            raise SimulationValidationError(
-                f"collective {communication_id!r} endpoint iteration IDs are "
-                f"not aligned: {sorted(endpoint_ids)!r}"
-            )
-        iteration_ids = next(iter(endpoint_ids))
+        )
+        if is_p2p and not any(endpoint_has_samples):
+            # Duration-only test and legacy profiles have no observed offsets;
+            # treating every endpoint start as zero applies the same service
+            # formula without inventing cross-actor timing data.
+            iteration_ids: tuple[int | None, ...] = (None,)
+        else:
+            endpoint_ids = {
+                _profile_iteration_ids_for_communication(
+                    member.profile,
+                    context=(
+                        f"communication {communication_id!r} rank "
+                        f"{member.key.global_rank} uid={member.key.uid!r}"
+                    ),
+                )
+                for member in members
+            }
+            if len(endpoint_ids) != 1:
+                raise ReplayValidationError(
+                    f"communication {communication_id!r} endpoint iteration IDs are "
+                    f"not aligned: {sorted(endpoint_ids)!r}"
+                )
+            iteration_ids = next(iter(endpoint_ids))
     else:
         iteration_ids = (int(sample_iteration_id),)
 
@@ -485,7 +572,7 @@ def _symmetric_collective_observed_services(
             member.key: _profile_duration_us(
                 member.profile,
                 context=(
-                    f"collective {communication_id!r} rank "
+                    f"communication {communication_id!r} rank "
                     f"{member.key.global_rank} uid={member.key.uid!r}"
                 ),
                 sample_iteration_id=iteration_id,
@@ -493,13 +580,13 @@ def _symmetric_collective_observed_services(
             for member in members
         }
         zero_activity_states = {duration == 0.0 for duration in durations.values()}
-        routed_collective = all(
+        permits_zero_activity_endpoints = all(
             member.node.node_kind in _ROUTED_COLLECTIVE_KINDS
             for member in members
-        )
-        if len(zero_activity_states) > 1 and not routed_collective:
-            raise SimulationValidationError(
-                f"collective {communication_id!r} iteration {iteration_id} "
+        ) or is_p2p
+        if len(zero_activity_states) > 1 and not permits_zero_activity_endpoints:
+            raise ReplayValidationError(
+                f"communication {communication_id!r} iteration {iteration_id} "
                 "mixes zero-activity and nonzero-activity endpoint profiles"
             )
         if zero_activity_states == {True}:
@@ -511,28 +598,90 @@ def _symmetric_collective_observed_services(
             member.key: _profile_start_offset_us(
                 member.profile,
                 context=(
-                    f"collective {communication_id!r} rank "
+                    f"communication {communication_id!r} rank "
                     f"{member.key.global_rank} uid={member.key.uid!r}"
                 ),
                 sample_iteration_id=iteration_id,
             )
             for member in members
         }
-        observed_rendezvous_us = max(starts.values())
+        if is_p2p:
+            posts = {
+                member.key: _profile_p2p_post_offset_us(
+                    member.profile,
+                    context=(
+                        f"P2P {communication_id!r} rank "
+                        f"{member.key.global_rank} uid={member.key.uid!r}"
+                    ),
+                    sample_iteration_id=iteration_id,
+                )
+                for member in members
+            }
+            permits_synthetic_zero_posts = all(
+                _profile_timing_source(member.profile) != "kineto_cupti"
+                for member in members
+            )
+            if all(value is None for value in posts.values()) and (
+                iteration_id is None or permits_synthetic_zero_posts
+            ):
+                # Duration-only and synthetic programmatic profiles have no
+                # real host timestamps. Treat both operations as posted at
+                # zero. A durable Kineto profile fails closed below because
+                # replaying it without the new post markers is ambiguous.
+                observed_match_us = 0.0
+            elif any(value is None for value in posts.values()):
+                missing = sorted(
+                    member.key
+                    for member in members
+                    if posts[member.key] is None
+                )
+                raise ReplayValidationError(
+                    f"P2P {communication_id!r} has no aligned host post "
+                    f"timestamps for endpoints {missing!r}; re-profile the plan"
+                )
+            else:
+                observed_match_us = max(
+                    float(value) for value in posts.values() if value is not None
+                )
+            send_members = [
+                member for member in members
+                if member.node.node_kind == "SEND_COMM"
+            ]
+            if len(send_members) != 1:
+                raise ReplayValidationError(
+                    f"P2P {communication_id!r} must have exactly one send endpoint"
+                )
+            observed_send_ready_us = starts[send_members[0].key]
+        else:
+            observed_match_us = max(starts.values())
+            observed_send_ready_us = 0.0
         for member in members:
             if durations[member.key] == 0.0:
                 service_samples[member.key].append(0.0)
                 continue
             observed_end_us = starts[member.key] + durations[member.key]
-            raw_service_us = observed_end_us - observed_rendezvous_us
+            service_origin_us = observed_match_us
+            if is_p2p and member.node.node_kind == "SEND_COMM":
+                local_post_us = posts[member.key]
+                service_origin_us = max(
+                    starts[member.key],
+                    0.0 if local_post_us is None else float(local_post_us),
+                )
+            elif is_p2p:
+                service_origin_us = max(
+                    service_origin_us,
+                    starts[member.key],
+                    observed_send_ready_us,
+                )
+            raw_service_us = observed_end_us - service_origin_us
             if raw_service_us < -pairwise_alignment_uncertainty_us:
-                raise SimulationValidationError(
-                    f"collective {communication_id!r} iteration {iteration_id} "
+                raise ReplayValidationError(
+                    f"communication {communication_id!r} iteration {iteration_id} "
                     "has an inconsistent aligned endpoint at rank "
                     f"{member.key.global_rank}, uid={member.key.uid!r}: "
                     f"start={starts[member.key]:.3f} us, "
-                    f"end={observed_end_us:.3f} us, rendezvous="
-                    f"{observed_rendezvous_us:.3f} us, pairwise_uncertainty="
+                    f"end={observed_end_us:.3f} us, service_origin="
+                    f"{service_origin_us:.3f} us, pairwise_uncertainty="
                     f"{pairwise_alignment_uncertainty_us:.3f} us"
                 )
             service_samples[member.key].append(max(0.0, raw_service_us))
@@ -570,11 +719,11 @@ def _extract_inputs(
         dags = list(plan_or_dags)
     else:
         raise TypeError(
-            "simulate_training_step expects a ProfiledTrainingPlan-like object "
+            "replay_training_step expects a ProfiledTrainingPlan-like object "
             "or a sequence of TrainingDAGs"
         )
     if not dags:
-        raise SimulationValidationError("at least one per-PP TrainingDAG is required")
+        raise ReplayValidationError("at least one per-PP TrainingDAG is required")
     if any(not isinstance(dag, TrainingDAG) for dag in dags):
         raise TypeError("every per-PP DAG must be a TrainingDAG")
 
@@ -594,16 +743,16 @@ def _dag_device_ranks(dag: TrainingDAG) -> tuple[int, ...] | None:
             continue
         ranks = tuple(int(rank) for rank in node.device)
         if not ranks:
-            raise SimulationValidationError(f"node {node.uid!r} has an empty device list")
+            raise ReplayValidationError(f"node {node.uid!r} has an empty device list")
         if len(set(ranks)) != len(ranks):
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"node {node.uid!r} has duplicate ranks in device={node.device!r}"
             )
         layouts.add(ranks)
     if not layouts:
         return None
     if len(layouts) != 1:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             "a per-PP DAG must have one consistent ordered device list; got "
             f"{sorted(layouts)!r}"
         )
@@ -619,7 +768,7 @@ def _profile_ranks(dag: TrainingDAG, profile_mode: str) -> tuple[int, ...]:
                 try:
                     ranks.add(int(rank))
                 except (TypeError, ValueError) as exc:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"node {node.uid!r} has non-integer profile rank {rank!r}"
                     ) from exc
     prologue = get_prologue_profile_times(dag, profile_mode)
@@ -649,7 +798,7 @@ def _explicit_ranks_by_pp(
     else:
         groups = list(raw)
     if len(groups) != num_pp_dags or any(group is None for group in groups):
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"topology ranks_by_pp must contain {num_pp_dags} groups"
         )
     return tuple(tuple(int(rank) for rank in group) for group in groups)
@@ -666,7 +815,7 @@ def _build_rank_layout(
     topology_world = _mapping_int(topology, "world_size")
     pp_degree = int(pp_degree if pp_degree is not None else topology_pp or len(dags))
     if pp_degree != len(dags):
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"pp_degree={pp_degree} does not match {len(dags)} per-PP DAGs"
         )
 
@@ -679,7 +828,7 @@ def _build_rank_layout(
             if device_ranks is not None and explicit[index] != device_ranks
         ]
         if mismatches:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 "DAG device sets do not match explicit ActorGroups: "
                 + ", ".join(
                     f"group {index}: topology={expected!r}, DAG={actual!r}"
@@ -702,17 +851,17 @@ def _build_rank_layout(
 
     lengths = {len(ranks) for ranks in ranks_by_pp}
     if not lengths or 0 in lengths:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"all ActorGroup rank lists must be non-empty, got {ranks_by_pp!r}"
         )
     flat = [rank for ranks in ranks_by_pp for rank in ranks]
     if len(flat) != len(set(flat)):
-        raise SimulationValidationError(f"global ranks occur in multiple PP groups: {ranks_by_pp!r}")
+        raise ReplayValidationError(f"global ranks occur in multiple PP groups: {ranks_by_pp!r}")
     if any(rank < 0 for rank in flat):
-        raise SimulationValidationError(f"global ranks must be non-negative: {ranks_by_pp!r}")
+        raise ReplayValidationError(f"global ranks must be non-negative: {ranks_by_pp!r}")
     if topology_world is not None and int(topology_world) != len(flat):
-        raise SimulationValidationError(
-            f"world_size={topology_world} does not match {len(flat)} simulated ranks"
+        raise ReplayValidationError(
+            f"world_size={topology_world} does not match {len(flat)} replayed ranks"
         )
 
     lane_by_rank: dict[int, int] = {}
@@ -732,7 +881,7 @@ def _comm_id(node: TrainingDAGNode) -> str:
         from_uid = meta.get("from_uid")
         to_uid = meta.get("to_uid")
         if from_uid is None or to_uid is None:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"P2P node {node.uid!r} needs comm_id or from_uid/to_uid metadata"
             )
         return f"{from_uid}->{to_uid}"
@@ -761,7 +910,7 @@ def _merge_prologue_profiles(
         candidate = get_prologue_profile_times(dag, profile_mode)
         if candidate:
             if not isinstance(candidate, Mapping):
-                raise SimulationValidationError("DAG prologue_profile_times must be a mapping")
+                raise ReplayValidationError("DAG prologue_profile_times must be a mapping")
             sources.append(candidate)
     for source in sources:
         for raw_rank, profile in source.items():
@@ -770,7 +919,7 @@ def _merge_prologue_profiles(
                 old = _profile_duration_us(profiles[rank], context=f"prologue rank {rank}")
                 new = _profile_duration_us(profile, context=f"prologue rank {rank}")
                 if old != new:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"conflicting prologue profiles for rank {rank}: {old} vs {new} us"
                     )
             profiles[rank] = profile
@@ -782,12 +931,12 @@ def _expected_participants(node: TrainingDAGNode) -> tuple[int, ...] | None:
     if raw is None:
         return None
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"node {node.uid!r} participants must be a rank sequence"
         )
     result = tuple(int(rank) for rank in raw)
     if len(result) != len(set(result)):
-        raise SimulationValidationError(f"node {node.uid!r} has duplicate participants")
+        raise ReplayValidationError(f"node {node.uid!r} has duplicate participants")
     return result
 
 
@@ -801,13 +950,13 @@ def _validate_p2p_vertex(
             f"rank {member.key.global_rank}:{member.node.node_kind}:{member.node.uid}"
             for member in vertex.members
         ]
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"P2P transaction {vertex.communication_id!r} must have exactly one SEND and "
             f"one RECV endpoint; got {descriptions!r}"
         )
     send, recv = sends[0], recvs[0]
     if send.actor_group_local_rank != recv.actor_group_local_rank:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"P2P transaction {vertex.communication_id!r} crosses ActorGroup-local "
             f"ranks: {send.actor_group_local_rank} vs "
             f"{recv.actor_group_local_rank}"
@@ -817,7 +966,7 @@ def _validate_p2p_vertex(
         recv.key.global_rank,
     }
     # Piper inserts one SEND/RECV node per pair of ActorGroups, then the
-    # simulator expands that node once per same-position ActorGroup member.
+    # replay expands that node once per same-position ActorGroup member.
     # Consequently P2P
     # ``participants`` describes the full pair of device groups (for example
     # ranks 0,1,2,3), while this vertex is one ActorGroup-local transaction (for
@@ -837,13 +986,13 @@ def _validate_p2p_vertex(
         meta = endpoint.node.node_meta
         peer_global = meta.get("peer_global_rank", meta.get("peer_rank"))
         if peer_global is not None and int(peer_global) != counterpart.key.global_rank:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"P2P endpoint {endpoint.key} expects peer rank {peer_global}, got "
                 f"{counterpart.key.global_rank}"
             )
         peer_pp = meta.get("peer_pp_rank")
         if peer_pp is not None and int(peer_pp) != counterpart.pp_index:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"P2P endpoint {endpoint.key} expects peer PP rank {peer_pp}, got "
                 f"{counterpart.pp_index}"
             )
@@ -852,14 +1001,14 @@ def _validate_p2p_vertex(
             participants is not None
             and frozenset(participants) not in valid_participant_sets
         ):
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"P2P endpoint {endpoint.key} participants={participants!r} do not match "
                 f"transaction ranks {(send.key.global_rank, recv.key.global_rank)!r} "
                 f"or endpoint device-group ranks {tuple(sorted(device_group_ranks))!r}"
             )
     groups = {_p2p_group(member) for member in vertex.members}
     if len(groups) != 1:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"P2P transaction {vertex.communication_id!r} endpoints disagree on "
             f"comm_group_kind: {sorted(groups)!r}"
         )
@@ -870,7 +1019,7 @@ def _p2p_group(record: _InstanceRecord) -> str:
     if explicit is not None:
         group = str(explicit)
         if not group:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"P2P endpoint {record.key} has an empty comm_group_kind"
             )
         return group
@@ -896,7 +1045,7 @@ def _representative(vertex: _Vertex, preferred_rank: int | None = None) -> NodeI
     return members[0]
 
 
-def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
+def _replay_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
     indegree = {vertex_id: len(vertex.preds) for vertex_id, vertex in vertices.items()}
     ready = [vertex_id for vertex_id, degree in indegree.items() if degree == 0]
     heapq.heapify(ready)
@@ -914,7 +1063,7 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
             vertex.start_us = vertices[best_pred].end_us
         if vertex.release_us > vertex.start_us:
             vertex.start_us = vertex.release_us
-            # A host/GPU release constraint, rather than a simulated vertex,
+            # A host/GPU release constraint, rather than a replayed vertex,
             # determines this start.  Do not claim a shorter dependency-only
             # chain is critical through the release gap.
             vertex.critical_pred = None
@@ -922,7 +1071,7 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
             arrival = vertices[vertex.endpoint_arrival_vertex_id]
             observed_service_us = vertex.endpoint_observed_service_us
             if observed_service_us is None:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"endpoint completion {vertex_id!r} has no communication timing"
                 )
             vertex.rendezvous_wait_us = max(
@@ -936,23 +1085,23 @@ def _simulate_vertices(vertices: dict[str, _Vertex]) -> tuple[str, ...]:
                 heapq.heappush(ready, succ)
     if len(order) != len(vertices):
         cyclic = sorted(vertex_id for vertex_id, degree in indegree.items() if degree > 0)
-        raise SimulationValidationError(
-            "communication simulation graph contains a cycle (often inconsistent collective "
+        raise ReplayValidationError(
+            "communication replay graph contains a cycle (often inconsistent collective "
             f"ordering across ranks): {cyclic!r}"
         )
     return tuple(order)
 
 
-def simulate_training_step(
+def replay_training_step(
     plan_or_dags: Any,
     *,
     pp_degree: int | None = None,
     prologue_profile_times: Mapping[int, Any] | None = None,
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE,
+    profile_mode: str = ISOLATED_PROFILE_MODE,
     sample_iteration_id: int | None = None,
     strict: bool = True,
-) -> SimulationResult:
-    """Simulate one interference-free training step.
+) -> ReplayResult:
+    """Replay one training step using the selected timing profile.
 
     Args:
         plan_or_dags: A ``ProfiledTrainingPlan`` (or compatible object) or a
@@ -985,7 +1134,7 @@ def simulate_training_step(
         for node in dag.nodes.values()
     )
     if has_rendezvous_collectives and not cross_actor_offsets_aligned:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"profile mode {profile_mode!r} contains rendezvous collectives but "
             "has no cross-actor timeline alignment; re-profile this plan with "
             "aligned CUPTI iteration anchors"
@@ -1007,13 +1156,13 @@ def simulate_training_step(
         not math.isfinite(pairwise_alignment_uncertainty_us)
         or pairwise_alignment_uncertainty_us < 0.0
     ):
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"profile mode {profile_mode!r} has invalid pairwise timeline "
             f"uncertainty {raw_pairwise_uncertainty!r}"
         )
     empty_dags = [index for index, dag in enumerate(dags) if not dag.nodes]
     if empty_dags:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"per-PP TrainingDAGs must be non-empty; empty indices={empty_dags!r}"
         )
     layout = _build_rank_layout(
@@ -1036,7 +1185,7 @@ def simulate_training_step(
                 )
                 new = _profile_duration_us(profile, context=f"prologue rank {rank}")
                 if old != new:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"conflicting prologue profiles for rank {rank}: {old} vs {new} us"
                     )
             merged_prologue[rank] = profile
@@ -1046,34 +1195,34 @@ def simulate_training_step(
         missing = sorted(rank_set - set(merged_prologue))
         extra = sorted(set(merged_prologue) - rank_set)
         if missing:
-            message = f"prologue profiles are missing simulated ranks {missing!r}"
+            message = f"prologue profiles are missing replayed ranks {missing!r}"
             if strict:
-                raise SimulationValidationError(message)
+                raise ReplayValidationError(message)
             warnings.append(message)
         if extra:
-            message = f"prologue profiles contain non-simulated ranks {extra!r}"
+            message = f"prologue profiles contain non-replayed ranks {extra!r}"
             if strict:
-                raise SimulationValidationError(message)
+                raise ReplayValidationError(message)
             warnings.append(message)
 
     instances: dict[NodeInstance, _InstanceRecord] = {}
     dag_plans: list[tuple[PlannedOperation, ...]] = []
     for pp_index, dag in enumerate(dags):
         if _PROLOGUE_UID in dag.nodes:
-            raise SimulationValidationError(
-                f"node UID {_PROLOGUE_UID!r} is reserved by the simulator"
+            raise ReplayValidationError(
+                f"node UID {_PROLOGUE_UID!r} is reserved by the replay"
             )
         try:
             plan = tuple(build_execution_plan(dag))
         except ValueError as exc:
-            raise SimulationValidationError(str(exc)) from exc
+            raise ReplayValidationError(str(exc)) from exc
         dag_plans.append(plan)
         expected_ranks = set(layout.ranks_by_pp[pp_index])
         for operation in plan:
             uid = operation.uid
             node = dag.nodes[uid]
             if not isinstance(node.stream, str) or not node.stream:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"node {uid!r} must have a non-empty logical stream name"
                 )
             profiles = get_node_profile_times(node, profile_mode)
@@ -1081,23 +1230,24 @@ def simulate_training_step(
                 try:
                     attached_ranks = {int(rank) for rank in profiles}
                 except (TypeError, ValueError) as exc:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"node {uid!r} has a non-integer profile rank"
                     ) from exc
                 extra = sorted(attached_ranks - expected_ranks)
                 if extra:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"node {uid!r} in PP DAG {pp_index} has profiles for "
                         f"non-member ranks {extra!r}"
                     )
             for rank in layout.ranks_by_pp[pp_index]:
                 key = NodeInstance(rank, uid)
                 if key in instances:
-                    raise SimulationValidationError(f"duplicate node instance {key}")
+                    raise ReplayValidationError(f"duplicate node instance {key}")
                 if node.node_kind == "ORDER_DUMMY":
                     profile = None
                     profile_duration = 0.0
                     profile_start_offset = 0.0
+                    p2p_post_offset = None
                 else:
                     profile = _profile_for_rank(node, rank, profile_mode)
                     profile_duration = _profile_duration_us(
@@ -1119,10 +1269,52 @@ def simulate_training_step(
                     if cross_actor_offsets_aligned and not tuple(
                         getattr(profile, "start_offset_samples_us", ())
                     ):
-                        raise SimulationValidationError(
+                        raise ReplayValidationError(
                             f"aligned profile mode {profile_mode!r} is missing "
                             f"start offsets for node {uid!r} rank {rank}"
                         )
+                    p2p_post_offset = None
+                    if node.node_kind in _P2P_KINDS:
+                        # Host dispatch is the intended normal schedule in
+                        # both counterfactual replays.  Isolated capture has a
+                        # different profiling issue order, so it is used only
+                        # to derive service, never to schedule P2P posts when a
+                        # normal post profile is available.
+                        normal_post_profile = _optional_profile_for_rank(
+                            node, rank, NORMAL_PROFILE_MODE
+                        )
+                        post_profile = (
+                            normal_post_profile
+                            if normal_post_profile is not None
+                            and _profile_p2p_post_offset_us(
+                                normal_post_profile,
+                                context=(
+                                    f"normal P2P post for node {uid!r} rank {rank}"
+                                ),
+                                sample_iteration_id=sample_iteration_id,
+                            )
+                            is not None
+                            else profile
+                        )
+                        p2p_post_offset = _profile_p2p_post_offset_us(
+                            post_profile,
+                            context=f"P2P post for node {uid!r} rank {rank}",
+                            sample_iteration_id=sample_iteration_id,
+                        )
+                        post_profile_mode = (
+                            NORMAL_PROFILE_MODE
+                            if post_profile is normal_post_profile
+                            else profile_mode
+                        )
+                        if (
+                            p2p_post_offset is not None
+                            and post_profile_mode not in aligned_modes
+                        ):
+                            raise ReplayValidationError(
+                                f"P2P post timestamps for node {uid!r} rank "
+                                f"{rank} in mode {post_profile_mode!r} are not "
+                                "cross-actor aligned"
+                            )
                 if node.node_kind == "ORDER_DUMMY":
                     observed_profile_start_offset = 0.0
                 instances[key] = _InstanceRecord(
@@ -1136,6 +1328,7 @@ def simulate_training_step(
                     observed_profile_start_offset_us=(
                         observed_profile_start_offset
                     ),
+                    p2p_post_offset_us=p2p_post_offset,
                 )
 
     comm_groups: dict[tuple[Any, ...], list[_InstanceRecord]] = defaultdict(list)
@@ -1175,7 +1368,7 @@ def simulate_training_step(
             emit_timeline=False,
         )
         if rendezvous_id in vertices:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"duplicate communication identity {rendezvous_id!r}"
             )
         vertices[rendezvous_id] = transaction
@@ -1191,38 +1384,46 @@ def simulate_training_step(
                 if expected is not None
             }
             if len(expected_sets) > 1:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"collective {communication_id!r} endpoints disagree on participants: "
                     f"{sorted(expected_sets)!r}"
                 )
             if group_key[1] in _ROUTED_COLLECTIVE_KINDS and not expected_sets:
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"routed collective {communication_id!r} has no declared participants"
                 )
             if expected_sets and actual != set(next(iter(expected_sets))):
-                raise SimulationValidationError(
+                raise ReplayValidationError(
                     f"collective {communication_id!r} has ranks {sorted(actual)!r}, expected "
                     f"{sorted(next(iter(expected_sets)))!r}"
                 )
 
-        observed_service_by_endpoint: dict[NodeInstance, float]
-        if group_key[0] == "collective":
-            observed_service_by_endpoint = _symmetric_collective_observed_services(
-                members,
-                communication_id=communication_id,
-                sample_iteration_id=sample_iteration_id,
-                pairwise_alignment_uncertainty_us=(
-                    pairwise_alignment_uncertainty_us
-                ),
+        if group_key[0] == "p2p" and not cross_actor_offsets_aligned:
+            has_observed_offsets = any(
+                bool(
+                    member.profile.get("start_offset_samples_us", ())
+                    if isinstance(member.profile, Mapping)
+                    else getattr(member.profile, "start_offset_samples_us", ())
+                )
+                for member in members
             )
-        else:
-            # Directional P2P durations are isolated transfer-service
-            # microprofiles, so no observed-wait decomposition is needed.
-            observed_service_by_endpoint = {
-                member.key: member.profile_duration_us for member in members
-            }
+            if has_observed_offsets:
+                raise ReplayValidationError(
+                    f"profile mode {profile_mode!r} contains P2P communication "
+                    "with endpoint start offsets but has no cross-actor timeline "
+                    "alignment"
+                )
+        observed_service_by_endpoint = _communication_observed_services(
+            members,
+            communication_id=communication_id,
+            sample_iteration_id=sample_iteration_id,
+            pairwise_alignment_uncertainty_us=(
+                pairwise_alignment_uncertainty_us
+            ),
+        )
 
         arrival_ids: dict[NodeInstance, str] = {}
+        post_ids: dict[NodeInstance, str] = {}
         completion_ids: dict[NodeInstance, str] = {}
         for member in members:
             endpoint_suffix = (
@@ -1234,8 +1435,15 @@ def simulate_training_step(
             completion_id = (
                 f"comm:{group_key[0]}:{communication_id}:completion:{endpoint_suffix}"
             )
-            if arrival_id in vertices or completion_id in vertices:
-                raise SimulationValidationError(
+            post_id = (
+                f"comm:p2p:{communication_id}:post:{endpoint_suffix}"
+            )
+            if (
+                arrival_id in vertices
+                or completion_id in vertices
+                or (group_key[0] == "p2p" and post_id in vertices)
+            ):
+                raise ReplayValidationError(
                     f"duplicate communication endpoint {member.key!r}"
                 )
             vertices[arrival_id] = _Vertex(
@@ -1246,11 +1454,21 @@ def simulate_training_step(
                 communication_id=communication_id,
                 emit_timeline=False,
             )
+            if group_key[0] == "p2p":
+                vertices[post_id] = _Vertex(
+                    vertex_id=post_id,
+                    members=[member],
+                    duration_us=0.0,
+                    release_us=float(member.p2p_post_offset_us or 0.0),
+                    communication_id=communication_id,
+                    emit_timeline=False,
+                )
+                post_ids[member.key] = post_id
             vertices[completion_id] = _Vertex(
                 vertex_id=completion_id,
                 members=[member],
                 # Calibrated profiles provide a fixed tail derived from the
-                # observed rendezvous.
+                # endpoint's observed service origin.
                 duration_us=0.0,
                 communication_id=communication_id,
                 endpoint_arrival_vertex_id=arrival_id,
@@ -1263,16 +1481,55 @@ def simulate_training_step(
             instance_start_vertex[member.key] = arrival_id
             instance_vertex[member.key] = completion_id
 
-        for member in members:
-            _add_vertex_edge(vertices, arrival_ids[member.key], rendezvous_id)
-            _add_vertex_edge(
-                vertices,
-                rendezvous_id,
-                completion_ids[member.key],
+        if group_key[0] == "p2p":
+            send_member = next(
+                member
+                for member in members
+                if member.node.node_kind == "SEND_COMM"
             )
-            vertices[
-                completion_ids[member.key]
-            ].endpoint_rendezvous_vertex_id = rendezvous_id
+            send_arrival_id = arrival_ids[send_member.key]
+            for member in members:
+                _add_vertex_edge(vertices, post_ids[member.key], rendezvous_id)
+            for member in members:
+                _add_vertex_edge(
+                    vertices,
+                    arrival_ids[member.key],
+                    completion_ids[member.key],
+                )
+                if member.node.node_kind == "RECV_COMM":
+                    # Delivery requires both calls plus source and destination
+                    # readiness. Send completion is local and may precede the
+                    # receive call, as ProcessGroupNCCL permits in practice.
+                    _add_vertex_edge(
+                        vertices,
+                        rendezvous_id,
+                        completion_ids[member.key],
+                    )
+                    _add_vertex_edge(
+                        vertices,
+                        send_arrival_id,
+                        completion_ids[member.key],
+                    )
+                    vertices[
+                        completion_ids[member.key]
+                    ].endpoint_rendezvous_vertex_id = rendezvous_id
+                else:
+                    _add_vertex_edge(
+                        vertices,
+                        post_ids[member.key],
+                        completion_ids[member.key],
+                    )
+        else:
+            for member in members:
+                _add_vertex_edge(vertices, arrival_ids[member.key], rendezvous_id)
+                _add_vertex_edge(
+                    vertices,
+                    rendezvous_id,
+                    completion_ids[member.key],
+                )
+                vertices[
+                    completion_ids[member.key]
+                ].endpoint_rendezvous_vertex_id = rendezvous_id
 
     for record in instances.values():
         if record.key in instance_vertex:
@@ -1333,11 +1590,6 @@ def simulate_training_step(
                 for predecessor_uid in operation.completion_predecessors:
                     src = instance_vertex[NodeInstance(rank, predecessor_uid)]
                     _add_vertex_edge(vertices, src, dst)
-                for predecessor_uid in operation.issue_predecessors:
-                    src = instance_start_vertex[
-                        NodeInstance(rank, predecessor_uid)
-                    ]
-                    _add_vertex_edge(vertices, src, dst)
 
     # Every prologue precedes every real operation on its rank.  Adding all
     # such edges is equivalent to gating the first operation of each stream.
@@ -1351,11 +1603,11 @@ def simulate_training_step(
                     instance_start_vertex[record.key],
                 )
 
-    simulation_order = _simulate_vertices(vertices)
+    replay_order = _replay_vertices(vertices)
 
     timeline: list[TimelineEvent] = []
     per_rank: dict[int, float] = {rank: 0.0 for rank in layout.ranks}
-    for vertex_id in simulation_order:
+    for vertex_id in replay_order:
         vertex = vertices[vertex_id]
         if not vertex.emit_timeline:
             continue
@@ -1417,7 +1669,7 @@ def simulate_training_step(
         for vertex_id in critical_vertex_ids
     )
 
-    return SimulationResult(
+    return ReplayResult(
         step_time_us=max(per_rank.values(), default=0.0),
         per_rank_makespan_us=per_rank,
         timeline=tuple(timeline),
@@ -1431,7 +1683,7 @@ def simulate_training_step(
 def profile_iteration_ids(
     plan_or_dags: Any,
     *,
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE,
+    profile_mode: str = ISOLATED_PROFILE_MODE,
 ) -> tuple[int, ...]:
     """Return raw sample iterations shared by every executed node profile."""
 
@@ -1453,7 +1705,7 @@ def profile_iteration_ids(
                     continue
                 samples = tuple(getattr(profile, "samples_us", ()))
                 if not samples:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"{mode} profile has no raw samples for uncertainty analysis"
                     )
                 ids = tuple(
@@ -1467,32 +1719,32 @@ def profile_iteration_ids(
                 if expected is None:
                     expected = current
                 elif current != expected:
-                    raise SimulationValidationError(
+                    raise ReplayValidationError(
                         f"{mode} raw profile iteration IDs are not aligned: "
                         f"expected={sorted(expected)!r}, got={sorted(current)!r}"
                     )
     if not expected:
-        raise SimulationValidationError(
+        raise ReplayValidationError(
             f"profile mode {mode!r} has no raw timing samples"
         )
     return tuple(sorted(expected))
 
 
-def simulate_training_step_samples(
+def replay_training_step_samples(
     plan_or_dags: Any,
     *,
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE,
-    **simulation_kwargs,
+    profile_mode: str = ISOLATED_PROFILE_MODE,
+    **replay_kwargs,
 ) -> tuple[float, ...]:
     """Replay every aligned raw profile iteration and return step times in us."""
 
     mode = normalize_profile_mode(profile_mode)
     return tuple(
-        simulate_training_step(
+        replay_training_step(
             plan_or_dags,
             profile_mode=mode,
             sample_iteration_id=iteration_id,
-            **simulation_kwargs,
+            **replay_kwargs,
         ).step_time_us
         for iteration_id in profile_iteration_ids(
             plan_or_dags, profile_mode=mode
@@ -1533,7 +1785,7 @@ def observed_profile_step_time_samples(
                         getattr(profile, "start_offset_samples_us", ())
                     )
                     if not offsets:
-                        raise SimulationValidationError(
+                        raise ReplayValidationError(
                             f"node {node.uid!r} rank {rank} in mode {mode!r} "
                             "has no observed start-offset samples"
                         )
@@ -1549,60 +1801,60 @@ def observed_profile_step_time_samples(
                     )
                     ends_us.append(offset_us + duration_us)
         if not ends_us:
-            raise SimulationValidationError(
+            raise ReplayValidationError(
                 f"profile mode {mode!r} has no executed timeline events"
             )
         samples.append(max(ends_us))
     return tuple(samples)
 
 
-def simulate_profile_modes(
+def replay_profile_modes(
     plan_or_dags: Any,
     *,
     actual_step_samples_us: Sequence[float] | None = None,
     strict: bool = True,
-) -> SimulationComparisonResult:
-    """Replay interference-free and normal profiles and quantify uncertainty."""
+) -> ReplayComparisonResult:
+    """Replay isolated and normal profiles and quantify uncertainty."""
 
-    interference_free = simulate_training_step(
+    isolated = replay_training_step(
         plan_or_dags,
-        profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
+        profile_mode=ISOLATED_PROFILE_MODE,
         strict=strict,
     )
-    normal = simulate_training_step(
+    normal = replay_training_step(
         plan_or_dags,
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
-    interference_free_iteration_ids = profile_iteration_ids(
-        plan_or_dags, profile_mode=INTERFERENCE_FREE_PROFILE_MODE
+    isolated_iteration_ids = profile_iteration_ids(
+        plan_or_dags, profile_mode=ISOLATED_PROFILE_MODE
     )
     normal_iteration_ids = profile_iteration_ids(
         plan_or_dags, profile_mode=NORMAL_PROFILE_MODE
     )
-    if interference_free_iteration_ids != normal_iteration_ids:
-        raise SimulationValidationError(
-            "normal and interference-free profile iterations must align for "
-            "paired IF-savings estimation: "
+    if isolated_iteration_ids != normal_iteration_ids:
+        raise ReplayValidationError(
+            "normal and isolated profile iterations must align for "
+            "paired isolated-savings estimation: "
             f"normal={normal_iteration_ids!r}, "
-            f"interference_free={interference_free_iteration_ids!r}"
+            f"isolated={isolated_iteration_ids!r}"
         )
-    interference_free_samples = simulate_training_step_samples(
+    isolated_samples = replay_training_step_samples(
         plan_or_dags,
-        profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
+        profile_mode=ISOLATED_PROFILE_MODE,
         strict=strict,
     )
-    normal_samples = simulate_training_step_samples(
+    normal_samples = replay_training_step_samples(
         plan_or_dags,
         profile_mode=NORMAL_PROFILE_MODE,
         strict=strict,
     )
-    interference_free_statistics = summarize_mean_samples(
-        interference_free_samples
+    isolated_statistics = summarize_mean_samples(
+        isolated_samples
     )
     normal_statistics = summarize_mean_samples(normal_samples)
-    dependency_replay_savings_statistics = summarize_paired_savings(
-        normal_samples, interference_free_samples
+    perfect_overlap_savings_statistics = summarize_paired_savings(
+        normal_samples, isolated_samples
     )
     observed_normal_envelope_samples: tuple[float, ...] = ()
     observed_normal_envelope_statistics = None
@@ -1611,7 +1863,7 @@ def simulate_profile_modes(
             plan_or_dags,
             profile_mode=NORMAL_PROFILE_MODE,
         )
-    except SimulationValidationError:
+    except ReplayValidationError:
         # Duration-only artifacts predate start-offset capture and retain the
         # dependency-replay behavior without an envelope diagnostic.
         pass
@@ -1626,14 +1878,14 @@ def simulate_profile_modes(
     reduction_pct = None
     event_overhead_pct = None
     instrumented_statistics = None
-    instrumented_interference_free_statistics = None
+    instrumented_isolated_statistics = None
     uninstrumented_normal_statistics = None
-    uninstrumented_interference_free_statistics = None
+    uninstrumented_isolated_statistics = None
     instrumented_normal_replay_error = None
-    instrumented_interference_free_replay_error = None
+    instrumented_isolated_replay_error = None
     observed_reduction_pct = None
     dependency_replay_reduction_pct = (
-        dependency_replay_savings_statistics.percent
+        perfect_overlap_savings_statistics.percent
     )
     instrumented_policy_reduction_pct = None
     envelope_modeled_reduction_pct = None
@@ -1653,24 +1905,24 @@ def simulate_profile_modes(
             normal_statistics.estimate,
             instrumented_statistics.estimate,
         )
-    instrumented_interference_free_samples = instrumented_by_mode.get(
-        INTERFERENCE_FREE_PROFILE_MODE, ()
+    instrumented_isolated_samples = instrumented_by_mode.get(
+        ISOLATED_PROFILE_MODE, ()
     )
-    if instrumented_interference_free_samples:
-        instrumented_interference_free_statistics = summarize_timing_samples(
-            instrumented_interference_free_samples,
+    if instrumented_isolated_samples:
+        instrumented_isolated_statistics = summarize_timing_samples(
+            instrumented_isolated_samples,
             estimator="median",
         )
-        instrumented_interference_free_replay_error = prediction_error(
-            interference_free_statistics.estimate,
-            instrumented_interference_free_statistics.estimate,
+        instrumented_isolated_replay_error = prediction_error(
+            isolated_statistics.estimate,
+            instrumented_isolated_statistics.estimate,
         )
     if (
         instrumented_statistics is not None
-        and instrumented_interference_free_statistics is not None
+        and instrumented_isolated_statistics is not None
     ):
         instrumented_policy_reduction_pct = predicted_reduction(
-            instrumented_interference_free_statistics.estimate,
+            instrumented_isolated_statistics.estimate,
             instrumented_statistics.estimate,
         )
 
@@ -1680,30 +1932,30 @@ def simulate_profile_modes(
     uninstrumented_normal_samples = uninstrumented_by_mode.get(
         NORMAL_PROFILE_MODE, ()
     )
-    uninstrumented_interference_free_samples = uninstrumented_by_mode.get(
-        INTERFERENCE_FREE_PROFILE_MODE, ()
+    uninstrumented_isolated_samples = uninstrumented_by_mode.get(
+        ISOLATED_PROFILE_MODE, ()
     )
     if uninstrumented_normal_samples:
         uninstrumented_normal_statistics = summarize_timing_samples(
             uninstrumented_normal_samples,
             estimator="median",
         )
-    if uninstrumented_interference_free_samples:
-        uninstrumented_interference_free_statistics = summarize_timing_samples(
-            uninstrumented_interference_free_samples,
+    if uninstrumented_isolated_samples:
+        uninstrumented_isolated_statistics = summarize_timing_samples(
+            uninstrumented_isolated_samples,
             estimator="median",
         )
     if (
         uninstrumented_normal_statistics is not None
-        and uninstrumented_interference_free_statistics is not None
+        and uninstrumented_isolated_statistics is not None
     ):
         observed_reduction_pct = predicted_reduction(
-            uninstrumented_interference_free_statistics.estimate,
+            uninstrumented_isolated_statistics.estimate,
             uninstrumented_normal_statistics.estimate,
         )
     if observed_normal_envelope_statistics is not None:
         envelope_modeled_reduction_pct = predicted_reduction(
-            interference_free_statistics.estimate,
+            isolated_statistics.estimate,
             observed_normal_envelope_statistics.estimate,
         )
         normal_dependency_replay_excess_pct = prediction_error(
@@ -1728,7 +1980,7 @@ def simulate_profile_modes(
             normal_statistics.estimate, actual_statistics.estimate
         )
         reduction_pct = predicted_reduction(
-            interference_free_statistics.estimate, actual_statistics.estimate
+            isolated_statistics.estimate, actual_statistics.estimate
         )
 
         if instrumented_samples:
@@ -1737,41 +1989,41 @@ def simulate_profile_modes(
                 actual_statistics.estimate,
             ).signed_pct
 
-    return SimulationComparisonResult(
-        interference_free=interference_free,
+    return ReplayComparisonResult(
+        isolated=isolated,
         normal=normal,
-        interference_free_samples_us=interference_free_samples,
+        isolated_samples_us=isolated_samples,
         normal_samples_us=normal_samples,
         observed_normal_envelope_samples_us=(
             observed_normal_envelope_samples
         ),
-        interference_free_statistics=interference_free_statistics,
+        isolated_statistics=isolated_statistics,
         normal_statistics=normal_statistics,
-        dependency_replay_savings_statistics=(
-            dependency_replay_savings_statistics
+        perfect_overlap_savings_statistics=(
+            perfect_overlap_savings_statistics
         ),
         observed_normal_envelope_statistics=(
             observed_normal_envelope_statistics
         ),
         actual_statistics=actual_statistics,
         instrumented_normal_statistics=instrumented_statistics,
-        instrumented_interference_free_statistics=(
-            instrumented_interference_free_statistics
+        instrumented_isolated_statistics=(
+            instrumented_isolated_statistics
         ),
         uninstrumented_normal_statistics=uninstrumented_normal_statistics,
-        uninstrumented_interference_free_statistics=(
-            uninstrumented_interference_free_statistics
+        uninstrumented_isolated_statistics=(
+            uninstrumented_isolated_statistics
         ),
-        normal_prediction_error=normal_error,
+        normal_replay_error=normal_error,
         instrumented_normal_replay_error=instrumented_normal_replay_error,
-        instrumented_interference_free_replay_error=(
-            instrumented_interference_free_replay_error
+        instrumented_isolated_replay_error=(
+            instrumented_isolated_replay_error
         ),
-        predicted_interference_reduction_pct=reduction_pct,
-        dependency_replay_absolute_savings_us=(
-            dependency_replay_savings_statistics.absolute_mean
+        prediction_error_pct=reduction_pct,
+        perfect_overlap_absolute_savings_us=(
+            perfect_overlap_savings_statistics.absolute_mean
         ),
-        dependency_replay_interference_reduction_pct=(
+        interference_overhead_pct=(
             dependency_replay_reduction_pct
         ),
         instrumented_policy_reduction_pct=instrumented_policy_reduction_pct,
@@ -1798,13 +2050,13 @@ def simulate_profile_modes(
 __all__ = [
     "CriticalPathEntry",
     "NodeInstance",
-    "SimulationResult",
-    "SimulationComparisonResult",
-    "SimulationValidationError",
+    "ReplayResult",
+    "ReplayComparisonResult",
+    "ReplayValidationError",
     "TimelineEvent",
     "profile_iteration_ids",
-    "simulate_training_step",
-    "simulate_training_step_samples",
+    "replay_training_step",
+    "replay_training_step_samples",
     "observed_profile_step_time_samples",
-    "simulate_profile_modes",
+    "replay_profile_modes",
 ]

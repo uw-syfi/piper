@@ -865,7 +865,7 @@ def aggregate_cases(rank_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "compute_slowdown": compute_concurrent[rank]
                         / compute_solo[rank],
                         slowdown_metric: comm_concurrent[rank] / comm_solo[rank],
-                        "pair_overhead_vs_interference_free": pair_concurrent[rank]
+                        "pair_overhead_vs_isolated": pair_concurrent[rank]
                         / ideal_pair,
                         "overlap_efficiency": (
                             compute_solo[rank]
@@ -883,9 +883,9 @@ def aggregate_cases(rank_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 slowdown_metric: summarize(
                     [row[slowdown_metric] for row in rank_metrics]
                 ),
-                "pair_overhead_vs_interference_free": summarize(
+                "pair_overhead_vs_isolated": summarize(
                     [
-                        row["pair_overhead_vs_interference_free"]
+                        row["pair_overhead_vs_isolated"]
                         for row in rank_metrics
                     ]
                 ),
@@ -1087,7 +1087,7 @@ def main() -> None:
                             "median"
                         ],
                         "pair_overhead_median": concurrent[
-                            "pair_overhead_vs_interference_free"
+                            "pair_overhead_vs_isolated"
                         ]["median"],
                         "overlap_efficiency_median": concurrent[
                             "overlap_efficiency"

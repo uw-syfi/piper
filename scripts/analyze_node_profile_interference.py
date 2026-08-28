@@ -2,15 +2,15 @@
 """Attribute per-node normal-profile slowdowns using PyTorch CPU/GPU traces.
 
 The profile ratio artifact contains CUDA-event timings from the normal and
-interference-free profiling passes.  The PyTorch traces capture normal
+isolated profiling passes.  The PyTorch traces capture normal
 execution only.  This script correlates every labeled device activity in the
 normal trace back to its CPU runtime launch and enclosing Piper NVTX range,
 then decomposes the normal device span into associated GPU activity, device
 gaps, CPU-launch-exposed gaps, and otherwise unexplained time.
 
-Because there is no interference-free PyTorch trace, attribution of GPU
+Because there is no isolated PyTorch trace, attribution of GPU
 activity-duration inflation is conservative: the normal trace's associated
-GPU activity is compared with the *entire* interference-free node duration.
+GPU activity is compared with the *entire* isolated node duration.
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ DEVICE_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
 OUTPUT_FIELDS = (
     "node_uid",
     "median_normal_time_us",
-    "median_interference_free_time_us",
-    "normal_to_interference_free_ratio",
-    "normal_minus_interference_free_us",
+    "median_isolated_time_us",
+    "normal_to_isolated_ratio",
+    "normal_minus_isolated_us",
     "trace_task_type",
     "trace_cpu_occurrence_count",
     "trace_gpu_occurrence_count",
@@ -61,7 +61,7 @@ OUTPUT_FIELDS = (
     "normal_profile_minus_trace_gpu_span_us",
     "inferred_profile_edge_gap_us",
     "total_gpu_gap_budget_us",
-    "gpu_activity_excess_over_if_total_us",
+    "gpu_activity_excess_over_isolated_total_us",
     "profile_delta_unexplained_by_trace_us",
     "fraction_occurrences_cpu_gap_ge_60pct_delta",
     "primary_interference_attribution",
@@ -552,14 +552,14 @@ def _fallback_task_type(uid: str) -> str:
 
 def _classify(
     normal: float,
-    interference_free: float,
+    isolated: float,
     aggregate: NodeTraceAggregate,
 ) -> dict[str, Any]:
     metrics = aggregate.occurrence_metrics
     cpu_count = len(aggregate.cpu_durations)
     gpu_count = len(metrics)
     match_fraction = gpu_count / cpu_count if cpu_count else 0.0
-    normal_delta = normal - interference_free
+    normal_delta = normal - isolated
 
     result: dict[str, Any] = {
         "trace_cpu_occurrence_count": cpu_count,
@@ -612,7 +612,7 @@ def _classify(
         else None
     )
     activity_excess = (
-        max(0.0, work - interference_free)
+        max(0.0, work - isolated)
         if isinstance(work, float)
         else None
     )
@@ -657,7 +657,7 @@ def _classify(
             "normal_profile_minus_trace_gpu_span_us": profile_minus_span,
             "inferred_profile_edge_gap_us": edge_gap,
             "total_gpu_gap_budget_us": gap_budget,
-            "gpu_activity_excess_over_if_total_us": activity_excess,
+            "gpu_activity_excess_over_isolated_total_us": activity_excess,
             "profile_delta_unexplained_by_trace_us": unexplained,
             "fraction_occurrences_cpu_gap_ge_60pct_delta": cpu_dominant_fraction,
         }
@@ -668,7 +668,7 @@ def _classify(
     elif gpu_count == 0:
         trace_status = (
             "expected_no_device_activity"
-            if normal < 10.0 and interference_free < 10.0
+            if normal < 10.0 and isolated < 10.0
             else "cpu_annotation_only"
         )
     elif match_fraction < 0.8:
@@ -680,9 +680,9 @@ def _classify(
     else:
         trace_status = "matched_profile_trace_mismatch"
 
-    significant_threshold = max(50.0, 0.05 * interference_free)
+    significant_threshold = max(50.0, 0.05 * isolated)
     if normal_delta < -significant_threshold:
-        attribution = "interference_free_slower"
+        attribution = "isolated_slower"
     elif normal_delta <= significant_threshold:
         attribution = "no_significant_slowdown"
     elif not isinstance(work, float) or not isinstance(gap, float):
@@ -782,12 +782,12 @@ def _classify(
     if "recv" in task_types:
         activity_interpretation = (
             "NCCL recv residency, commonly peer-arrival/network wait rather than "
-            "compute; the simulator collapses the send/recv endpoints, so this raw "
+            "compute; the replay collapses the send/recv endpoints, so this raw "
             "recv duration is not itself a compute-stream service time"
         )
     elif "send" in task_types:
         activity_interpretation = (
-            "NCCL send residency; the simulator collapses the send/recv endpoints "
+            "NCCL send residency; the replay collapses the send/recv endpoints "
             "and uses one rendezvous service time"
         )
     elif task_types & {"all_reduce", "all_to_all"}:
@@ -807,7 +807,7 @@ def _classify(
             f"gaps + {(edge_gap or 0.0):.3f} us unlocated profile-edge gap; "
             f"CPU-launch-exposed gap={cpu_exposed:.3f} us; other GPU work overlaps "
             f"{other_gap:.3f} us of gaps; associated activity exceeds the entire "
-            f"IF node time by {(activity_excess or 0.0):.3f} us; trace/profile "
+            f"isolated node time by {(activity_excess or 0.0):.3f} us; trace/profile "
             f"span ratio={(profile_to_span if profile_to_span is not None else math.nan):.3f}"
         )
     else:
@@ -852,18 +852,18 @@ def main() -> None:
     for ratio_row in ratio_rows:
         uid = ratio_row["node_uid"]
         normal = float(ratio_row["median_normal_time_us"])
-        interference_free = float(ratio_row["median_interference_free_time_us"])
+        isolated = float(ratio_row["median_isolated_time_us"])
         aggregate = aggregates[uid]
-        analysis = _classify(normal, interference_free, aggregate)
+        analysis = _classify(normal, isolated, aggregate)
         task_types = sorted(aggregate.task_types)
         row: dict[str, Any] = {
             "node_uid": uid,
             "median_normal_time_us": normal,
-            "median_interference_free_time_us": interference_free,
-            "normal_to_interference_free_ratio": float(
-                ratio_row["normal_to_interference_free_ratio"]
+            "median_isolated_time_us": isolated,
+            "normal_to_isolated_ratio": float(
+                ratio_row["normal_to_isolated_ratio"]
             ),
-            "normal_minus_interference_free_us": normal - interference_free,
+            "normal_minus_isolated_us": normal - isolated,
             "trace_task_type": ";".join(task_types)
             if task_types
             else _fallback_task_type(uid),

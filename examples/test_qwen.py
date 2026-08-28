@@ -14,7 +14,7 @@ from src.piper import (
     piper_measure_dags,
     piper_measure_profile_modes,
     piper_profile_dags,
-    simulate_profiled_modes,
+    replay_profiled_modes,
 )
 from src.profiling import ProfileConfig
 from src.schedule import load_schedule_directives
@@ -181,17 +181,17 @@ def main(args, pg):
             warmup_iters=args.profile_warmup_iters,
             repeat_iters=args.profile_iters,
             block_iters=args.profile_mode_block_iters,
-            profile_modes=("interference_free", "normal"),
+            profile_modes=("isolated", "normal"),
         )
         metrics["uninstrumented_normal_step_time_samples_s"] = [
             sample / 1_000_000.0 for sample in mode_samples["normal"]
         ]
-        metrics["uninstrumented_interference_free_step_time_samples_s"] = [
+        metrics["uninstrumented_isolated_step_time_samples_s"] = [
             sample / 1_000_000.0
-            for sample in mode_samples["interference_free"]
+            for sample in mode_samples["isolated"]
         ]
 
-    if args.profile_and_simulate:
+    if args.profile_and_replay:
         profile_config = ProfileConfig(
             warmup_iters=args.profile_warmup_iters,
             repeat_iters=args.profile_iters,
@@ -199,13 +199,13 @@ def main(args, pg):
         plan = piper_profile_dags(
             loss_fn,
             profile_config,
-            profile_modes=("interference_free", "normal"),
+            profile_modes=("isolated", "normal"),
             output_path=args.step_time_profile_output or None,
         )
-        comparison = simulate_profiled_modes(
+        comparison = replay_profiled_modes(
             plan, actual_step_samples_s=iter_times
         )
-        _add_profile_comparison_metrics(metrics, comparison, plan)
+        _add_profile_comparison_metrics(metrics, comparison)
 
     if args.pytorch_profiler:
         if args.pytorch_profiler_iters < 1:
@@ -350,11 +350,11 @@ def parse_args(argv=None):
         help="Number of active iterations retained in the PyTorch trace.",
     )
     parser.add_argument(
-        "--profile-and-simulate",
-        dest="profile_and_simulate",
+        "--profile-and-replay",
+        dest="profile_and_replay",
         action="store_true",
         default=False,
-        help="Profile and simulate both normal and interference-free step times.",
+        help="Profile and replay both normal and isolated step times.",
     )
     parser.add_argument("--profile-warmup-iters", type=int, default=5)
     parser.add_argument("--profile-iters", type=int, default=30)
@@ -362,7 +362,7 @@ def parse_args(argv=None):
         "--measure-profile-modes-only",
         action="store_true",
         help=(
-            "Measure normal and interference-free stream policies without "
+            "Measure normal and isolated stream policies without "
             "per-node CUDA-event instrumentation."
         ),
     )

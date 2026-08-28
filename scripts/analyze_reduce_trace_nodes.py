@@ -207,14 +207,14 @@ def main() -> None:
                 ),
                 "csv": {
                     "normal_us": float(ratio["median_normal_time_us"]),
-                    "interference_free_us": float(
-                        ratio["median_interference_free_time_us"]
+                    "isolated_us": float(
+                        ratio["median_isolated_time_us"]
                     ),
-                    "ratio": float(ratio["normal_to_interference_free_ratio"]),
+                    "ratio": float(ratio["normal_to_isolated_ratio"]),
                 },
                 "profiles": {
                     mode: _profile_summary(node, mode)
-                    for mode in ("normal", "interference_free")
+                    for mode in ("normal", "isolated")
                 },
                 "trace": {
                     "occurrence_count": len(occurrences),

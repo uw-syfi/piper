@@ -22,7 +22,7 @@ from src.ordering import (
     resolve_total_order_per_stream,
 )
 from src.profiling import NodeProfile
-from src.simulator import simulate_training_step
+from src.replay import replay_training_step
 from src.piper import (
     _materialize_global_communication_issue_edges,
     _order_communication_transactions,
@@ -165,7 +165,7 @@ def _assert_connected(dag: TrainingDAG) -> None:
 
 
 def _assert_cpu_replay_completes(dags: list[TrainingDAG]) -> None:
-    mode = "interference_free"
+    mode = "isolated"
     for dag in dags:
         for node in dag.nodes.values():
             if node.node_kind == "ORDER_DUMMY":
@@ -192,7 +192,7 @@ def _assert_cpu_replay_completes(dags: list[TrainingDAG]) -> None:
             }
         },
     )
-    assert simulate_training_step(plan, profile_mode=mode).step_time_us > 0
+    assert replay_training_step(plan, profile_mode=mode).step_time_us > 0
 
 
 @pytest.mark.parametrize(

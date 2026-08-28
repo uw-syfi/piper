@@ -497,12 +497,12 @@ class RuntimeState:
         task: Any,
         logical_stream: torch.cuda.Stream,
         *,
-        profile_mode: str = "interference_free",
+        profile_mode: str = "isolated",
     ) -> torch.cuda.Stream:
         """Resolve the physical stream for one profiling policy.
 
         Both profiling policies preserve the ordinary logical stream
-        assignment.  Interference-free execution is serialized separately by
+        assignment.  Isolated execution is serialized separately by
         :class:`DagExecutor`, using a CUDA-event handoff between nodes.
 
         Directional P2P communication is identical to ordinary execution in

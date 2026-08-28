@@ -449,7 +449,7 @@ def write_report(path: Path, result: dict[str, Any]) -> None:
             f"**{fmt(speedup['ci95_low'], 2)}–"
             f"{fmt(speedup['ci95_high'], 2)}%**). Equivalently, the observed "
             f"trace is **{fmt(overhead['estimate'], 2)}%** slower than the "
-            f"estimated interference-free trace (95% CI "
+            f"estimated isolated trace (95% CI "
             f"{fmt(overhead['ci95_low'], 2)}–"
             f"{fmt(overhead['ci95_high'], 2)}%)."
         ),
@@ -463,7 +463,7 @@ def write_report(path: Path, result: dict[str, Any]) -> None:
         ),
         (
             "2. For a matched signature that has strict-alone occurrences, "
-            "the interference-free baseline is their median. If an exact "
+            "the isolated baseline is their median. If an exact "
             "signature never runs alone, the baseline is its within-signature "
             f"{CENTRAL_BASELINE_QUANTILE:.0%} duration quantile across ranks/"
             "occurrences. This is a conservative low-contention proxy and "
@@ -632,7 +632,7 @@ def write_report(path: Path, result: dict[str, Any]) -> None:
             (
                 "- This is a trace counterfactual, not a randomized causal "
                 "experiment. A dedicated solo/overlap replay of the exact HLO "
-                "kernels would give stronger interference-free controls."
+                "kernels would give stronger isolated controls."
             ),
             (
                 "- The four EP ranks participate in the same collectives, so "

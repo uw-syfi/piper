@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Render simulator savings attribution as a Perfetto/Chrome trace.
+"""Render replay savings attribution as a Perfetto/Chrome trace.
 
-The input timeline is the *normal simulator replay*, rather than a hardware
+The input timeline is the *normal replay*, rather than a hardware
 Kineto timeline.  This is important: the attribution explains a change in the
-simulator's makespan, so the highlighted intervals must use the same schedule
+replay's makespan, so the highlighted intervals must use the same schedule
 and timestamps that the counterfactual replays used.
 
 ``NORMAL_INPUT`` may be either a ``ProfiledTrainingPlan`` JSON artifact (the
 normal replay is generated automatically) or JSON emitted by
-``scripts/profile_and_replay/simulate_step_times.py``.  The latter may contain a top-level
+``scripts/profile_and_replay/replay_step_times.py``.  The latter may contain a top-level
 ``timeline`` or a ``normal.timeline`` comparison result.
 """
 
@@ -29,7 +29,7 @@ if _REPO_ROOT in sys.path:
 sys.path.insert(0, _REPO_ROOT)
 
 from src.profiling import NORMAL_PROFILE_MODE, ProfiledTrainingPlan
-from src.simulator import SimulationResult, simulate_training_step
+from src.replay import ReplayResult, replay_training_step
 
 
 @dataclass(frozen=True)
@@ -128,10 +128,10 @@ def _matches_communication(event: Mapping[str, Any], feature: _Feature) -> bool:
     family, identity = parsed
     observed = str(communication_id)
     if family == "p2p":
-        # The feature is atomic across all DP replicas, while the simulator
+        # The feature is atomic across all DP replicas, while the replay
         # appends the DP lane to each physical P2P rendezvous ID.
         return observed == identity or observed.startswith(f"{identity}:")
-    # Collective simulator IDs are ``NODE_KIND:comm_id``.  Accept a bare
+    # Collective replay IDs are ``NODE_KIND:comm_id``.  Accept a bare
     # identity too so older exported timelines remain renderable.
     return observed == identity or observed.lower() == f"{family}:{identity}".lower()
 
@@ -201,7 +201,7 @@ def _color(feature: _Feature | None, threshold_us: float, largest_us: float) -> 
     return "cq_build_abandoned"
 
 
-def _timeline_dict(result: SimulationResult) -> list[dict[str, Any]]:
+def _timeline_dict(result: ReplayResult) -> list[dict[str, Any]]:
     return [
         {
             "global_rank": event.operation.global_rank,
@@ -218,7 +218,7 @@ def _timeline_dict(result: SimulationResult) -> list[dict[str, Any]]:
     ]
 
 
-def build_attributed_simulation_trace(
+def build_attributed_replay_trace(
     timeline: Sequence[Mapping[str, Any]],
     attribution: Mapping[str, Any],
     *,
@@ -266,7 +266,7 @@ def build_attributed_simulation_trace(
                     "ph": "M",
                     "pid": rank,
                     "tid": 0,
-                    "args": {"name": f"simulated GPU rank {rank}"},
+                    "args": {"name": f"replayed GPU rank {rank}"},
                 },
                 {
                     "name": "process_sort_index",
@@ -384,7 +384,7 @@ def build_attributed_simulation_trace(
     net_exposed_step_savings_us = (
         positive_exposed_step_savings_us + negative_exposed_step_savings_us
     )
-    simulator_step_savings_us = _finite_float(
+    replay_step_savings_us = _finite_float(
         attribution.get(
             "total_step_savings_us",
             _finite_float(
@@ -392,28 +392,28 @@ def build_attributed_simulation_trace(
                 field="normal_step_time_us",
             )
             - _finite_float(
-                attribution.get("interference_free_step_time_us", 0.0),
-                field="interference_free_step_time_us",
+                attribution.get("isolated_step_time_us", 0.0),
+                field="isolated_step_time_us",
             ),
         ),
         field="total_step_savings_us",
     )
     exposed_savings_validation_residual_us = (
-        net_exposed_step_savings_us - simulator_step_savings_us
+        net_exposed_step_savings_us - replay_step_savings_us
     )
     checksum_tolerance_us = max(
         1e-6,
         1e-9
         * max(
             abs(net_exposed_step_savings_us),
-            abs(simulator_step_savings_us),
+            abs(replay_step_savings_us),
             1.0,
         ),
     )
     summary = {
         "normal_step_time_us": attribution.get("normal_step_time_us"),
-        "interference_free_step_time_us": attribution.get(
-            "interference_free_step_time_us"
+        "isolated_step_time_us": attribution.get(
+            "isolated_step_time_us"
         ),
         "total_step_savings_us": attribution.get("total_step_savings_us"),
         "attributed_step_savings_us": attribution.get(
@@ -433,7 +433,7 @@ def build_attributed_simulation_trace(
             * net_exposed_step_savings_us
             / float(attribution["normal_step_time_us"])
         ),
-        "simulator_step_savings_us": simulator_step_savings_us,
+        "replay_step_savings_us": replay_step_savings_us,
         "step_time_estimator": attribution.get("step_time_estimator", "point"),
         "sample_iteration_ids": attribution.get("sample_iteration_ids", []),
         "exposed_savings_validation_residual_us": (
@@ -478,7 +478,7 @@ def _load_normal_timeline(path: Path) -> list[dict[str, Any]]:
     # It is a ProfiledTrainingPlan rather than an already exported replay.
     plan = ProfiledTrainingPlan.load_json(path)
     return _timeline_dict(
-        simulate_training_step(plan, profile_mode=NORMAL_PROFILE_MODE)
+        replay_training_step(plan, profile_mode=NORMAL_PROFILE_MODE)
     )
 
 
@@ -487,7 +487,7 @@ def main() -> None:
     parser.add_argument(
         "normal_input",
         type=Path,
-        help="ProfiledTrainingPlan JSON or an exported normal simulation JSON",
+        help="ProfiledTrainingPlan JSON or an exported normal replay JSON",
     )
     parser.add_argument("attribution", type=Path, help="Savings attribution JSON")
     parser.add_argument("--output", "-o", type=Path, required=True)
@@ -499,7 +499,7 @@ def main() -> None:
     args = parser.parse_args()
 
     attribution = json.loads(args.attribution.read_text(encoding="utf-8"))
-    trace = build_attributed_simulation_trace(
+    trace = build_attributed_replay_trace(
         _load_normal_timeline(args.normal_input),
         attribution,
         exposure_threshold_us=args.exposure_threshold_us,

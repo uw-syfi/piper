@@ -1,8 +1,8 @@
 """Lower a :class:`TrainingDAG` into actor-local stream dependencies.
 
-The CUDA executor and simulator replay both consume this
+The CUDA executor and dependency replay both consume this
 representation.  Keeping the lowering CUDA-free makes the dependency model
-testable without a GPU and, more importantly, prevents the simulator from
+testable without a GPU and, more importantly, prevents replay from
 quietly drifting away from the ordering implemented by the runtime.
 """
 
@@ -83,7 +83,7 @@ def build_execution_plan(
     """Materialize the local CUDA completion dependencies for ``dag``.
 
     The finalized DAG is the sole source of inter-node dependencies. Same-
-    stream edges remain visible for diagnostics and simulation, while CUDA FIFO
+    stream edges remain visible for diagnostics and replay, while CUDA FIFO
     satisfies them without an additional event wait.
     """
     order = _validated_dispatch_order(dag, dispatch_order)

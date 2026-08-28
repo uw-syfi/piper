@@ -1,5 +1,5 @@
-from scripts.profile_and_replay.visualize_simulation_savings import (
-    build_attributed_simulation_trace,
+from scripts.profile_and_replay.visualize_replay_savings import (
+    build_attributed_replay_trace,
 )
 
 
@@ -34,7 +34,7 @@ def _feature(
 def test_trace_highlights_every_endpoint_of_atomic_communication_feature() -> None:
     attribution = {
         "normal_step_time_us": 100.0,
-        "interference_free_step_time_us": 93.8,
+        "isolated_step_time_us": 93.8,
         "total_step_savings_us": 6.2,
         "attributed_step_savings_us": 6.2,
         "exposure_threshold_us": 1.0,
@@ -102,7 +102,7 @@ def test_trace_highlights_every_endpoint_of_atomic_communication_feature() -> No
         },
     ]
 
-    trace = build_attributed_simulation_trace(timeline, attribution)
+    trace = build_attributed_replay_trace(timeline, attribution)
     complete = [event for event in trace["traceEvents"] if event["ph"] == "X"]
 
     assert complete[0]["name"].startswith("★ ")
@@ -123,7 +123,7 @@ def test_trace_highlights_every_endpoint_of_atomic_communication_feature() -> No
     assert trace["piperSavingsAttribution"]["unmatched_feature_ids"] == []
     summary = trace["piperSavingsAttribution"]
     assert summary["net_exposed_step_savings_us"] == 6.2
-    assert summary["simulator_step_savings_us"] == 6.2
+    assert summary["replay_step_savings_us"] == 6.2
     assert summary["exposed_savings_validation_residual_us"] == 0.0
     assert summary["exposed_savings_validation_passed"] is True
     assert sum(

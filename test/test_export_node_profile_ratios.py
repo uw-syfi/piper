@@ -17,7 +17,7 @@ def _profiled_node(
     uid: str,
     *,
     normal_by_rank: dict[int, tuple[float, ...]],
-    interference_free_by_rank: dict[int, tuple[float, ...]],
+    isolated_by_rank: dict[int, tuple[float, ...]],
 ) -> TrainingDAGNode:
     node = TrainingDAGNode(
         uid=uid,
@@ -32,9 +32,9 @@ def _profiled_node(
             rank: NodeProfile.from_samples(samples)
             for rank, samples in normal_by_rank.items()
         },
-        "interference_free": {
+        "isolated": {
             rank: NodeProfile.from_samples(samples)
-            for rank, samples in interference_free_by_rank.items()
+            for rank, samples in isolated_by_rank.items()
         },
     }
     return node
@@ -46,14 +46,14 @@ def test_build_node_profile_ratios_pools_ranks_and_sorts_descending(tmp_path) ->
         _profiled_node(
             "high_ratio",
             normal_by_rank={0: (10.0, 14.0), 2: (18.0, 22.0)},
-            interference_free_by_rank={0: (2.0, 4.0), 2: (6.0, 8.0)},
+            isolated_by_rank={0: (2.0, 4.0), 2: (6.0, 8.0)},
         )
     )
     dag.add_node(
         _profiled_node(
             "unit_ratio",
             normal_by_rank={0: (2.0, 4.0)},
-            interference_free_by_rank={0: (2.0, 4.0)},
+            isolated_by_rank={0: (2.0, 4.0)},
         )
     )
     skipped = TrainingDAGNode(
@@ -66,14 +66,14 @@ def test_build_node_profile_ratios_pools_ranks_and_sorts_descending(tmp_path) ->
     )
     skipped.profile_times_by_mode = {
         "normal": {0: NodeProfile.skipped("not executed")},
-        "interference_free": {0: NodeProfile.skipped("not executed")},
+        "isolated": {0: NodeProfile.skipped("not executed")},
     }
     dag.add_node(skipped)
     plan = ProfiledTrainingPlan.from_dags(
         [dag],
         profile_configs={
             "normal": ProfileConfig(),
-            "interference_free": ProfileConfig(),
+            "isolated": ProfileConfig(),
         },
     )
 
@@ -81,15 +81,15 @@ def test_build_node_profile_ratios_pools_ranks_and_sorts_descending(tmp_path) ->
 
     assert [row.node_uid for row in rows] == ["high_ratio", "unit_ratio"]
     assert rows[0].median_normal_time_us == pytest.approx(16.0)
-    assert rows[0].median_interference_free_time_us == pytest.approx(5.0)
-    assert rows[0].normal_to_interference_free_ratio == pytest.approx(3.2)
+    assert rows[0].median_isolated_time_us == pytest.approx(5.0)
+    assert rows[0].normal_to_isolated_ratio == pytest.approx(3.2)
     assert skipped_count == 1
 
     summaries = summarize_node_types(rows)
     assert len(summaries) == 1
     assert summaries[0].node_type == "forward"
     assert summaries[0].node_count == 2
-    assert summaries[0].average_normal_to_interference_free_ratio == pytest.approx(
+    assert summaries[0].average_normal_to_isolated_ratio == pytest.approx(
         2.1
     )
 
@@ -107,7 +107,7 @@ def test_build_node_profile_ratios_pools_ranks_and_sorts_descending(tmp_path) ->
         {
             "node_type": "forward",
             "node_count": "2",
-            "average_normal_to_interference_free_ratio": "2.1",
+            "average_normal_to_isolated_ratio": "2.1",
         }
     ]
 

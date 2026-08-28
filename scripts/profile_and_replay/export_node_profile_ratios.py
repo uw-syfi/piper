@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export per-node normal/interference-free profile-time ratios to CSV."""
+"""Export per-node normal/isolated profile-time ratios to CSV."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ sys.path.insert(0, _REPO_ROOT)
 
 from src.dag import TrainingDAGNode
 from src.profiling import (
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     NORMAL_PROFILE_MODE,
     ProfiledTrainingPlan,
 )
@@ -28,13 +28,13 @@ from src.profiling import (
 CSV_FIELDS = (
     "node_uid",
     "median_normal_time_us",
-    "median_interference_free_time_us",
-    "normal_to_interference_free_ratio",
+    "median_isolated_time_us",
+    "normal_to_isolated_ratio",
 )
 SUMMARY_CSV_FIELDS = (
     "node_type",
     "node_count",
-    "average_normal_to_interference_free_ratio",
+    "average_normal_to_isolated_ratio",
 )
 
 
@@ -58,18 +58,18 @@ class NodeProfileRatio:
     node_uid: str
     node_type: str
     median_normal_time_us: float
-    median_interference_free_time_us: float
-    normal_to_interference_free_ratio: float
+    median_isolated_time_us: float
+    normal_to_isolated_ratio: float
 
     def to_csv_row(self) -> dict[str, str | float]:
         return {
             "node_uid": self.node_uid,
             "median_normal_time_us": self.median_normal_time_us,
-            "median_interference_free_time_us": (
-                self.median_interference_free_time_us
+            "median_isolated_time_us": (
+                self.median_isolated_time_us
             ),
-            "normal_to_interference_free_ratio": (
-                self.normal_to_interference_free_ratio
+            "normal_to_isolated_ratio": (
+                self.normal_to_isolated_ratio
             ),
         }
 
@@ -78,14 +78,14 @@ class NodeProfileRatio:
 class NodeTypeSummary:
     node_type: str
     node_count: int
-    average_normal_to_interference_free_ratio: float
+    average_normal_to_isolated_ratio: float
 
     def to_csv_row(self) -> dict[str, str | int | float]:
         return {
             "node_type": self.node_type,
             "node_count": self.node_count,
-            "average_normal_to_interference_free_ratio": (
-                self.average_normal_to_interference_free_ratio
+            "average_normal_to_isolated_ratio": (
+                self.average_normal_to_isolated_ratio
             ),
         }
 
@@ -125,14 +125,14 @@ def _samples_for_mode(node: TrainingDAGNode, mode: str) -> tuple[float, ...]:
 def build_node_profile_ratios(
     plan: ProfiledTrainingPlan,
 ) -> tuple[list[NodeProfileRatio], int]:
-    """Build descending normal/interference-free ratios for measured nodes.
+    """Build descending normal/isolated ratios for measured nodes.
 
     Nodes with no samples in either mode are non-executing DAG bookkeeping
     nodes and are omitted. Missing samples in only one mode indicate an
     incomplete profile and fail explicitly.
     """
 
-    required_modes = {NORMAL_PROFILE_MODE, INTERFERENCE_FREE_PROFILE_MODE}
+    required_modes = {NORMAL_PROFILE_MODE, ISOLATED_PROFILE_MODE}
     missing_modes = required_modes - set(plan.available_profile_modes)
     if missing_modes:
         raise ValueError(
@@ -145,29 +145,29 @@ def build_node_profile_ratios(
     for dag in plan.per_pp_dags:
         for node in dag.nodes.values():
             normal_samples = _samples_for_mode(node, NORMAL_PROFILE_MODE)
-            interference_free_samples = _samples_for_mode(
-                node, INTERFERENCE_FREE_PROFILE_MODE
+            isolated_samples = _samples_for_mode(
+                node, ISOLATED_PROFILE_MODE
             )
-            if not normal_samples and not interference_free_samples:
+            if not normal_samples and not isolated_samples:
                 skipped_nodes += 1
                 continue
-            if not normal_samples or not interference_free_samples:
+            if not normal_samples or not isolated_samples:
                 missing_mode = (
                     NORMAL_PROFILE_MODE
                     if not normal_samples
-                    else INTERFERENCE_FREE_PROFILE_MODE
+                    else ISOLATED_PROFILE_MODE
                 )
                 raise ValueError(
                     f"node {node.uid!r} has no executed samples for {missing_mode!r}"
                 )
 
             normal_median = float(statistics.median(normal_samples))
-            interference_free_median = float(
-                statistics.median(interference_free_samples)
+            isolated_median = float(
+                statistics.median(isolated_samples)
             )
             ratio = (
-                normal_median / interference_free_median
-                if interference_free_median > 0.0
+                normal_median / isolated_median
+                if isolated_median > 0.0
                 else math.inf
             )
             rows.append(
@@ -175,12 +175,12 @@ def build_node_profile_ratios(
                     node_uid=node.uid,
                     node_type=node_type(node),
                     median_normal_time_us=normal_median,
-                    median_interference_free_time_us=interference_free_median,
-                    normal_to_interference_free_ratio=ratio,
+                    median_isolated_time_us=isolated_median,
+                    normal_to_isolated_ratio=ratio,
                 )
             )
 
-    rows.sort(key=lambda row: (-row.normal_to_interference_free_ratio, row.node_uid))
+    rows.sort(key=lambda row: (-row.normal_to_isolated_ratio, row.node_uid))
     return rows, skipped_nodes
 
 
@@ -192,19 +192,19 @@ def summarize_node_types(
     ratios_by_type: dict[str, list[float]] = collections.defaultdict(list)
     for row in rows:
         ratios_by_type[row.node_type].append(
-            row.normal_to_interference_free_ratio
+            row.normal_to_isolated_ratio
         )
     summaries = [
         NodeTypeSummary(
             node_type=type_name,
             node_count=len(ratios),
-            average_normal_to_interference_free_ratio=statistics.fmean(ratios),
+            average_normal_to_isolated_ratio=statistics.fmean(ratios),
         )
         for type_name, ratios in ratios_by_type.items()
     ]
     summaries.sort(
         key=lambda summary: (
-            -summary.average_normal_to_interference_free_ratio,
+            -summary.average_normal_to_isolated_ratio,
             summary.node_type,
         )
     )
@@ -305,11 +305,11 @@ def main() -> None:
         f"Wrote {len(result.summaries)} node-type summaries to "
         f"{result.summary_csv_path}"
     )
-    print("Node type summary (average normal/interference-free ratio):")
+    print("Node type summary (average normal/isolated ratio):")
     for summary in result.summaries:
         print(
             f"  {summary.node_type}: "
-            f"{summary.average_normal_to_interference_free_ratio:.6f}x "
+            f"{summary.average_normal_to_isolated_ratio:.6f}x "
             f"(nodes={summary.node_count})"
         )
 

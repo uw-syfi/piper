@@ -703,9 +703,9 @@ def aggregate_case(
                     "ba_concurrent_ms": ba_concurrent,
                     "ab_slowdown": ab_concurrent / ab_solo,
                     "ba_slowdown": ba_concurrent / ba_solo,
-                    "ideal_interference_free_pair_ms": ideal_pair,
+                    "ideal_isolated_pair_ms": ideal_pair,
                     "normal_pair_ms": pair_ms,
-                    "pair_overhead_vs_interference_free": pair_ms / ideal_pair,
+                    "pair_overhead_vs_isolated": pair_ms / ideal_pair,
                     "removable_fraction_of_normal": 1.0 - ideal_pair / pair_ms,
                     "speedup_vs_serialized": serialized_pair / pair_ms,
                     "overlap_efficiency": (
@@ -786,11 +786,11 @@ def csv_rows(aggregate_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ],
                     "ba_slowdown_median": metrics["ba_slowdown"]["median"],
                     "ideal_pair_ms_median": metrics[
-                        "ideal_interference_free_pair_ms"
+                        "ideal_isolated_pair_ms"
                     ]["median"],
                     "normal_pair_ms_median": metrics["normal_pair_ms"]["median"],
                     "pair_overhead_median": metrics[
-                        "pair_overhead_vs_interference_free"
+                        "pair_overhead_vs_isolated"
                     ]["median"],
                     "removable_fraction_median": metrics[
                         "removable_fraction_of_normal"

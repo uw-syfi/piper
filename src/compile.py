@@ -12,7 +12,7 @@ from .state import (
 from .fx import _serialize_graphmodule
 from .model_state import DEFAULT_MODEL_SEED
 from .piper import (
-    _interference_free_serial_orders,
+    _isolated_serial_orders,
     _reset_annotation_state,
     piper,
 )
@@ -127,7 +127,7 @@ def _load_training_dags_on_actors(
     actor_groups = schedule_info.get("actor_groups", [])
     dag_by_group = _actor_group_dags_by_id(per_group_training_dags, schedule_info)
     ordered_group_ids = sorted(dag_by_group)
-    orders = _interference_free_serial_orders(
+    orders = _isolated_serial_orders(
         [dag_by_group[group_id] for group_id in ordered_group_ids]
     )
     order_by_group = dict(zip(ordered_group_ids, orders))

@@ -75,103 +75,28 @@ _RAY_FORWARDED_ENV_VARS = (
 )
 
 
-def _add_profile_comparison_metrics(metrics, comparison, plan) -> None:
-    """Add profile-and-simulate results to a model's raw metrics mapping."""
+def _add_profile_comparison_metrics(metrics, comparison) -> None:
+    """Add profile-and-replay results to a model's raw metrics mapping."""
 
-    metrics["interference_free_step_time_us"] = (
-        comparison.interference_free_statistics.estimate
+    metrics["perfect_overlap_replay_step_time_us"] = (
+        comparison.isolated_statistics.estimate
     )
-    metrics["interference_free_step_time_s"] = (
-        comparison.interference_free_statistics.estimate / 1_000_000.0
+    metrics["perfect_overlap_replay_step_time_s"] = (
+        comparison.isolated_statistics.estimate / 1_000_000.0
     )
-    metrics["simulated_interference_free_step_time_samples_s"] = [
+    metrics["perfect_overlap_replay_step_time_samples_s"] = [
         sample / 1_000_000.0
-        for sample in comparison.interference_free_samples_us
+        for sample in comparison.isolated_samples_us
     ]
-    metrics["simulated_normal_step_time_us"] = comparison.normal_statistics.estimate
-    metrics["simulated_normal_step_time_s"] = (
+    metrics["normal_replay_step_time_us"] = comparison.normal_statistics.estimate
+    metrics["normal_replay_step_time_s"] = (
         comparison.normal_statistics.estimate / 1_000_000.0
     )
-    metrics["simulated_normal_step_time_samples_s"] = [
+    metrics["normal_replay_step_time_samples_s"] = [
         sample / 1_000_000.0 for sample in comparison.normal_samples_us
     ]
-    metrics["simulated_interference_free_statistics_us"] = (
-        comparison.interference_free_statistics.to_dict()
-    )
-    metrics["simulated_normal_statistics_us"] = (
-        comparison.normal_statistics.to_dict()
-    )
-    if comparison.normal_prediction_error is not None:
-        metrics["simulated_normal_prediction_error_pct"] = (
-            comparison.normal_prediction_error.signed_pct
-        )
-        metrics["simulated_normal_absolute_error_pct"] = (
-            comparison.normal_prediction_error.absolute_pct
-        )
-    metrics["predicted_interference_reduction_pct"] = (
-        comparison.predicted_interference_reduction_pct
-    )
-    metrics["dependency_replay_interference_reduction_pct"] = (
-        comparison.dependency_replay_interference_reduction_pct
-    )
-    savings_stats = comparison.dependency_replay_savings_statistics
-    metrics["dependency_replay_absolute_savings_us"] = (
-        savings_stats.absolute_mean
-    )
-    metrics["dependency_replay_interference_reduction_standard_error_pct"] = (
-        savings_stats.percent_standard_error
-    )
-    metrics["dependency_replay_interference_reduction_ci95_low_pct"] = (
-        savings_stats.percent_ci95_low
-    )
-    metrics["dependency_replay_interference_reduction_ci95_high_pct"] = (
-        savings_stats.percent_ci95_high
-    )
-    metrics["instrumented_policy_reduction_pct"] = (
-        comparison.instrumented_policy_reduction_pct
-    )
-    metrics["profile_event_overhead_pct"] = comparison.profile_event_overhead_pct
-    metrics["mode_profile_event_overhead_pct"] = (
-        comparison.mode_profile_event_overhead_pct
-    )
-    metrics["observed_interference_reduction_pct"] = (
-        comparison.observed_interference_reduction_pct
-    )
-    metrics["envelope_modeled_interference_reduction_pct"] = (
-        comparison.envelope_modeled_interference_reduction_pct
-    )
-    metrics["normal_dependency_replay_excess_pct"] = (
-        comparison.normal_dependency_replay_excess_pct
-    )
-    metrics["observed_normal_envelope_step_time_samples_s"] = [
-        sample / 1_000_000.0
-        for sample in comparison.observed_normal_envelope_samples_us
-    ]
-    if comparison.instrumented_normal_replay_error is not None:
-        metrics["instrumented_normal_replay_error_pct"] = (
-            comparison.instrumented_normal_replay_error.signed_pct
-        )
-    if comparison.instrumented_interference_free_replay_error is not None:
-        metrics["instrumented_interference_free_replay_error_pct"] = (
-            comparison.instrumented_interference_free_replay_error.signed_pct
-        )
-    instrumented = plan.profile_metadata.get(
-        "instrumented_global_step_samples_us_by_mode", {}
-    ).get("normal", ())
-    metrics["instrumented_normal_profile_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0 for sample in instrumented
-    ]
-    uninstrumented = plan.profile_metadata.get(
-        "uninstrumented_global_step_samples_us_by_mode", {}
-    )
-    metrics["uninstrumented_normal_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("normal", ())
-    ]
-    metrics["uninstrumented_interference_free_step_time_samples_s"] = [
-        float(sample) / 1_000_000.0
-        for sample in uninstrumented.get("interference_free", ())
-    ]
+    metrics["prediction_error_pct"] = comparison.prediction_error_pct
+    metrics["interference_overhead_pct"] = comparison.interference_overhead_pct
 
 
 def main() -> None:
@@ -280,16 +205,16 @@ def main() -> None:
         help="Number of active iterations retained in the trace.",
     )
     parser.add_argument(
-        "--profile-and-simulate",
-        dest="profile_and_simulate",
+        "--profile-and-replay",
+        dest="profile_and_replay",
         action="store_true",
-        help="Profile and simulate both normal and interference-free step times.",
+        help="Profile and replay both normal and isolated step times.",
     )
     parser.add_argument(
         "--measure-profile-modes-only",
         action="store_true",
         help=(
-            "Measure normal and interference-free stream policies without "
+            "Measure normal and isolated stream policies without "
             "per-node CUDA-event instrumentation."
         ),
     )
@@ -369,11 +294,11 @@ def main() -> None:
     if args.viz:
         forwarded_args.append("--viz")
     step_time_profile_path: Path | None = None
-    if args.profile_and_simulate:
+    if args.profile_and_replay:
         step_time_profile_path = (run_dir / "step_time_profiles.json").resolve()
         forwarded_args.extend(
             [
-                "--profile-and-simulate",
+                "--profile-and-replay",
                 "--profile-warmup-iters",
                 str(args.profile_warmup_iters),
                 "--profile-iters",
@@ -859,14 +784,14 @@ def _metrics_rows(program_metrics: list[dict]) -> list[dict]:
 
         for prefix, samples_key, scalar_key in (
             (
-                "simulated_normal_step_time",
-                "simulated_normal_step_time_samples_s",
-                "simulated_normal_step_time_s",
+                "normal_replay_step_time",
+                "normal_replay_step_time_samples_s",
+                "normal_replay_step_time_s",
             ),
             (
-                "simulated_interference_free_step_time",
-                "simulated_interference_free_step_time_samples_s",
-                "interference_free_step_time_s",
+                "perfect_overlap_replay_step_time",
+                "perfect_overlap_replay_step_time_samples_s",
+                "perfect_overlap_replay_step_time_s",
             ),
         ):
             statistic_samples = m.get(samples_key) or []
@@ -877,56 +802,12 @@ def _metrics_rows(program_metrics: list[dict]) -> list[dict]:
                 stats = summarize_mean_samples([float(m[scalar_key])])
                 _add_timing_statistics_columns(row, prefix, stats)
 
-        for prefix, samples_key in (
-            (
-                "instrumented_normal_profile_step_time",
-                "instrumented_normal_profile_step_time_samples_s",
-            ),
-            (
-                "uninstrumented_normal_step_time",
-                "uninstrumented_normal_step_time_samples_s",
-            ),
-            (
-                "uninstrumented_interference_free_step_time",
-                "uninstrumented_interference_free_step_time_samples_s",
-            ),
-            (
-                "observed_normal_envelope_step_time",
-                "observed_normal_envelope_step_time_samples_s",
-            ),
-        ):
-            statistic_samples = m.get(samples_key) or []
-            if statistic_samples:
-                stats = summarize_timing_samples(statistic_samples, estimator="median")
-                _add_timing_statistics_columns(row, prefix, stats)
-
         for key in (
-            "simulated_normal_prediction_error_pct",
-            "simulated_normal_absolute_error_pct",
-            "predicted_interference_reduction_pct",
-            "dependency_replay_interference_reduction_pct",
-            "dependency_replay_absolute_savings_us",
-            "dependency_replay_interference_reduction_standard_error_pct",
-            "dependency_replay_interference_reduction_ci95_low_pct",
-            "dependency_replay_interference_reduction_ci95_high_pct",
-            "instrumented_policy_reduction_pct",
-            "observed_interference_reduction_pct",
-            "envelope_modeled_interference_reduction_pct",
-            "normal_dependency_replay_excess_pct",
-            "profile_event_overhead_pct",
-            "mode_profile_event_overhead_pct",
-            "instrumented_normal_replay_error_pct",
-            "instrumented_interference_free_replay_error_pct",
+            "prediction_error_pct",
+            "interference_overhead_pct",
         ):
             if m.get(key) is not None:
                 row[key] = float(m[key])
-        if m.get("interference_free_step_time_s") is not None:
-            row["interference_free_step_time_s"] = m[
-                "interference_free_step_time_s"
-            ]
-            row["interference_free_step_time_us"] = m.get(
-                "interference_free_step_time_us"
-            )
         # Peak memory is keyed by global actor rank.
         peak = m.get("peak_memory_by_rank") or {}
         for rank in sorted(peak, key=lambda r: int(r)):

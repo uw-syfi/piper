@@ -223,6 +223,102 @@ def test_p2p_work_wait_is_enqueued_on_declared_stream(monkeypatch) -> None:
     assert len(launch.works) == 1
 
 
+def test_p2p_post_marker_precedes_first_call_and_occurs_once(monkeypatch) -> None:
+    sequence = []
+
+    @contextmanager
+    def record_function(name):
+        sequence.append(name)
+        yield
+
+    class Work:
+        def wait(self):
+            sequence.append("wait")
+
+    def isend(*_args, **_kwargs):
+        sequence.append("isend")
+        return Work()
+
+    runtime = SimpleNamespace(
+        pytorch_profiler_enabled=True,
+        pipeline_peer_global_rank=lambda _peer_group: 3,
+        p2p_process_group_for_task=lambda _task: "pair-group",
+    )
+    communication = CommunicationExecutor(runtime, stages=None, logger=None)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(executors.torch.profiler, "record_function", record_function)
+    monkeypatch.setattr(executors.dist, "isend", isend)
+
+    communication.send(
+        (torch.ones(1), torch.ones(2)),
+        1,
+        object(),
+        task=SimpleNamespace(uid="send", node_kind="SEND_COMM"),
+    )
+
+    assert sequence == [
+        executors.P2P_POST_PROFILER_MARKER,
+        "isend",
+        "wait",
+        "isend",
+        "wait",
+    ]
+
+
+def test_sized_p2p_marks_first_header_call_not_later_payload_batch(
+    monkeypatch,
+) -> None:
+    sequence = []
+
+    @contextmanager
+    def record_function(name):
+        sequence.append(name)
+        yield
+
+    class Work:
+        def wait(self):
+            sequence.append("wait")
+
+    def isend(*_args, **_kwargs):
+        sequence.append("isend")
+        return Work()
+
+    def p2p_op(op, tensor, peer, group):
+        return SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group)
+
+    def batch_isend_irecv(_ops):
+        sequence.append("batch")
+        return [Work()]
+
+    runtime = SimpleNamespace(
+        device="cpu",
+        pytorch_profiler_enabled=True,
+        pipeline_peer_global_rank=lambda _peer_group: 3,
+        p2p_process_group_for_task=lambda _task: "pair-group",
+    )
+    communication = CommunicationExecutor(runtime, stages=None, logger=None)
+    monkeypatch.setattr(executors.torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(executors.torch.profiler, "record_function", record_function)
+    monkeypatch.setattr(executors.dist, "isend", isend)
+    monkeypatch.setattr(executors.dist, "P2POp", p2p_op)
+    monkeypatch.setattr(executors.dist, "batch_isend_irecv", batch_isend_irecv)
+
+    communication.send_sized_tensors(
+        [torch.ones(2, 3)],
+        1,
+        object(),
+        task=SimpleNamespace(uid="dense-send", node_kind="SEND_COMM"),
+    )
+
+    assert sequence == [
+        executors.P2P_POST_PROFILER_MARKER,
+        "isend",
+        "wait",
+        "batch",
+        "wait",
+    ]
+
+
 def test_fixed_shape_receive_retains_all_work_and_tensors(monkeypatch) -> None:
     task = SimpleNamespace(uid="recv", node_kind="RECV_COMM")
     bucket = SimpleNamespace(

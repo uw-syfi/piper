@@ -1,4 +1,4 @@
-"""Counterfactual attribution for normal-to-interference-free replay savings."""
+"""Counterfactual attribution for normal-to-isolated replay savings."""
 
 from __future__ import annotations
 
@@ -9,16 +9,16 @@ import statistics
 from typing import Any, Mapping, Sequence
 
 from .profiling import (
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     NORMAL_PROFILE_MODE,
     get_node_profile_times,
     get_prologue_profile_times,
 )
-from .simulator import (
-    SimulationValidationError,
+from .replay import (
+    ReplayValidationError,
     _comm_id,
     profile_iteration_ids,
-    simulate_training_step,
+    replay_training_step,
 )
 
 
@@ -42,7 +42,7 @@ class AttributionValidationError(ValueError):
 
 @dataclass(frozen=True)
 class AttributionFeature:
-    """One profile unit switched atomically from normal to IF timing."""
+    """One profile unit switched atomically from normal to isolated timing."""
 
     feature_id: str
     pp_indices: tuple[int, ...]
@@ -77,10 +77,10 @@ class FeatureSavingsAttribution:
 
 @dataclass(frozen=True)
 class SavingsAttributionResult:
-    """Additive attribution of one point normal/IF simulation comparison."""
+    """Additive attribution of one point normal/isolated replay comparison."""
 
     normal_step_time_us: float
-    interference_free_step_time_us: float
+    isolated_step_time_us: float
     total_step_savings_us: float
     attributed_step_savings_us: float
     additivity_residual_us: float
@@ -122,7 +122,7 @@ class SavingsAttributionResult:
 
     @property
     def net_exposed_step_savings_us(self) -> float:
-        """Signed normal-to-IF step saving from all unique feature deltas."""
+        """Signed normal-to-isolated step saving from all unique feature deltas."""
 
         return (
             self.positive_exposed_step_savings_us
@@ -137,15 +137,15 @@ class SavingsAttributionResult:
 
     @property
     def exposed_savings_validation_residual_us(self) -> float:
-        """Checksum residual against the simulator's normal-to-IF delta."""
+        """Checksum residual against the replay's normal-to-isolated delta."""
 
         return self.net_exposed_step_savings_us - self.total_step_savings_us
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "normal_step_time_us": self.normal_step_time_us,
-            "interference_free_step_time_us": (
-                self.interference_free_step_time_us
+            "isolated_step_time_us": (
+                self.isolated_step_time_us
             ),
             "total_step_savings_us": self.total_step_savings_us,
             "attributed_step_savings_us": self.attributed_step_savings_us,
@@ -178,7 +178,7 @@ class _ProfileBinding:
     profiles: dict[int, Any]
     rank: int
     normal_profile: Any
-    interference_free_profile: Any
+    isolated_profile: Any
     pp_index: int
     uid: str
     node_kind: str
@@ -187,8 +187,8 @@ class _ProfileBinding:
     def select_normal(self) -> None:
         self.profiles[self.rank] = self.normal_profile
 
-    def select_interference_free(self) -> None:
-        self.profiles[self.rank] = self.interference_free_profile
+    def select_isolated(self) -> None:
+        self.profiles[self.rank] = self.isolated_profile
 
 
 @dataclass
@@ -200,9 +200,9 @@ class _MutableFeature:
         for binding in self.bindings:
             binding.select_normal()
 
-    def select_interference_free(self) -> None:
+    def select_isolated(self) -> None:
         for binding in self.bindings:
-            binding.select_interference_free()
+            binding.select_isolated()
 
 
 def _per_pp_dags(plan_or_dags: Any) -> list[Any]:
@@ -228,13 +228,13 @@ def _build_features(plan_or_dags: Any) -> tuple[_MutableFeature, ...]:
     for pp_index, dag in enumerate(_per_pp_dags(plan_or_dags)):
         for node in dag.nodes.values():
             normal = get_node_profile_times(node, NORMAL_PROFILE_MODE)
-            interference_free = get_node_profile_times(
-                node, INTERFERENCE_FREE_PROFILE_MODE
+            isolated = get_node_profile_times(
+                node, ISOLATED_PROFILE_MODE
             )
-            if set(normal) != set(interference_free):
+            if set(normal) != set(isolated):
                 raise AttributionValidationError(
                     f"node {node.uid!r} PP index {pp_index} has different "
-                    "normal and IF profile ranks"
+                    "normal and isolated profile ranks"
                 )
             feature_id = _feature_id(pp_index, node)
             bindings = grouped.setdefault(feature_id, [])
@@ -244,7 +244,7 @@ def _build_features(plan_or_dags: Any) -> tuple[_MutableFeature, ...]:
                         profiles=normal,
                         rank=int(rank),
                         normal_profile=normal[rank],
-                        interference_free_profile=interference_free[rank],
+                        isolated_profile=isolated[rank],
                         pp_index=pp_index,
                         uid=str(node.uid),
                         node_kind=str(node.node_kind),
@@ -255,12 +255,12 @@ def _build_features(plan_or_dags: Any) -> tuple[_MutableFeature, ...]:
         normal_prologue = get_prologue_profile_times(
             dag, NORMAL_PROFILE_MODE
         )
-        interference_free_prologue = get_prologue_profile_times(
-            dag, INTERFERENCE_FREE_PROFILE_MODE
+        isolated_prologue = get_prologue_profile_times(
+            dag, ISOLATED_PROFILE_MODE
         )
-        if set(normal_prologue) != set(interference_free_prologue):
+        if set(normal_prologue) != set(isolated_prologue):
             raise AttributionValidationError(
-                f"PP index {pp_index} has different normal and IF prologue ranks"
+                f"PP index {pp_index} has different normal and isolated prologue ranks"
             )
         if normal_prologue:
             bindings = grouped.setdefault(f"prologue:pp{pp_index}", [])
@@ -270,8 +270,8 @@ def _build_features(plan_or_dags: Any) -> tuple[_MutableFeature, ...]:
                         profiles=normal_prologue,
                         rank=int(rank),
                         normal_profile=normal_prologue[rank],
-                        interference_free_profile=(
-                            interference_free_prologue[rank]
+                        isolated_profile=(
+                            isolated_prologue[rank]
                         ),
                         pp_index=pp_index,
                         uid="__prologue__",
@@ -292,7 +292,7 @@ def _build_features(plan_or_dags: Any) -> tuple[_MutableFeature, ...]:
             binding_count=len(bindings),
             raw_profile_savings_us=sum(
                 _profile_estimate_us(item.normal_profile)
-                - _profile_estimate_us(item.interference_free_profile)
+                - _profile_estimate_us(item.isolated_profile)
                 for item in bindings
             ),
         )
@@ -323,16 +323,16 @@ def _orders(
 
 
 def _shared_profile_iteration_ids(plan_or_dags: Any) -> tuple[int, ...]:
-    """Return paired normal/IF raw sample IDs, or empty for legacy profiles."""
+    """Return paired normal/isolated raw sample IDs, or empty for legacy profiles."""
 
-    errors: dict[str, SimulationValidationError] = {}
+    errors: dict[str, ReplayValidationError] = {}
     ids_by_mode: dict[str, tuple[int, ...]] = {}
-    for mode in (NORMAL_PROFILE_MODE, INTERFERENCE_FREE_PROFILE_MODE):
+    for mode in (NORMAL_PROFILE_MODE, ISOLATED_PROFILE_MODE):
         try:
             ids_by_mode[mode] = profile_iteration_ids(
                 plan_or_dags, profile_mode=mode
             )
-        except SimulationValidationError as exc:
+        except ReplayValidationError as exc:
             errors[mode] = exc
     if len(errors) == 2:
         has_raw_samples = False
@@ -340,7 +340,7 @@ def _shared_profile_iteration_ids(plan_or_dags: Any) -> tuple[int, ...]:
             for node in dag.nodes.values():
                 for mode in (
                     NORMAL_PROFILE_MODE,
-                    INTERFERENCE_FREE_PROFILE_MODE,
+                    ISOLATED_PROFILE_MODE,
                 ):
                     has_raw_samples = has_raw_samples or any(
                         bool(getattr(profile, "samples_us", ()))
@@ -348,7 +348,7 @@ def _shared_profile_iteration_ids(plan_or_dags: Any) -> tuple[int, ...]:
                     )
             for mode in (
                 NORMAL_PROFILE_MODE,
-                INTERFERENCE_FREE_PROFILE_MODE,
+                ISOLATED_PROFILE_MODE,
             ):
                 has_raw_samples = has_raw_samples or any(
                     bool(getattr(profile, "samples_us", ()))
@@ -369,16 +369,16 @@ def _shared_profile_iteration_ids(plan_or_dags: Any) -> tuple[int, ...]:
             f"{error}"
         ) from error
     normal_ids = ids_by_mode[NORMAL_PROFILE_MODE]
-    interference_free_ids = ids_by_mode[INTERFERENCE_FREE_PROFILE_MODE]
-    if normal_ids != interference_free_ids:
+    isolated_ids = ids_by_mode[ISOLATED_PROFILE_MODE]
+    if normal_ids != isolated_ids:
         raise AttributionValidationError(
-            "normal and IF raw profile iteration IDs differ: "
-            f"normal={normal_ids!r}, IF={interference_free_ids!r}"
+            "normal and isolated raw profile iteration IDs differ: "
+            f"normal={normal_ids!r}, isolated={isolated_ids!r}"
         )
     return normal_ids
 
 
-def _simulate_step_objective(
+def _replay_step_objective(
     plan_or_dags: Any,
     *,
     profile_mode: str,
@@ -388,14 +388,14 @@ def _simulate_step_objective(
     """Evaluate the same mean step estimator reported by the comparison."""
 
     if not sample_iteration_ids:
-        return simulate_training_step(
+        return replay_training_step(
             plan_or_dags,
             profile_mode=profile_mode,
             strict=strict,
         ).step_time_us
     return float(
         statistics.fmean(
-            simulate_training_step(
+            replay_training_step(
                 plan_or_dags,
                 profile_mode=profile_mode,
                 sample_iteration_id=iteration_id,
@@ -415,7 +415,7 @@ def attribute_profile_mode_savings(
     exposure_threshold_us: float = 1.0,
     strict: bool = True,
 ) -> SavingsAttributionResult:
-    """Attribute point normal-to-IF makespan savings with replay marginals.
+    """Attribute point normal-to-isolated makespan savings with replay marginals.
 
     Every permutation starts from the normal profile and switches one logical
     node or atomic communication transaction at a time.  Its marginal
@@ -431,23 +431,23 @@ def attribute_profile_mode_savings(
 
     features = _build_features(plan_or_dags)
     sample_iteration_ids = _shared_profile_iteration_ids(plan_or_dags)
-    normal = _simulate_step_objective(
+    normal = _replay_step_objective(
         plan_or_dags,
         profile_mode=NORMAL_PROFILE_MODE,
         sample_iteration_ids=sample_iteration_ids,
         strict=strict,
     )
-    canonical_if = _simulate_step_objective(
+    canonical_isolated = _replay_step_objective(
         plan_or_dags,
-        profile_mode=INTERFERENCE_FREE_PROFILE_MODE,
+        profile_mode=ISOLATED_PROFILE_MODE,
         sample_iteration_ids=sample_iteration_ids,
         strict=strict,
     )
 
     try:
         for feature in features:
-            feature.select_interference_free()
-        hybrid_if = _simulate_step_objective(
+            feature.select_isolated()
+        hybrid_isolated = _replay_step_objective(
             plan_or_dags,
             profile_mode=NORMAL_PROFILE_MODE,
             sample_iteration_ids=sample_iteration_ids,
@@ -457,17 +457,17 @@ def attribute_profile_mode_savings(
         for feature in features:
             feature.select_normal()
 
-    endpoint_tolerance_us = max(1e-6, 1e-9 * max(normal, canonical_if, 1.0))
+    endpoint_tolerance_us = max(1e-6, 1e-9 * max(normal, canonical_isolated, 1.0))
     if not math.isclose(
-        hybrid_if,
-        canonical_if,
+        hybrid_isolated,
+        canonical_isolated,
         rel_tol=0.0,
         abs_tol=endpoint_tolerance_us,
     ):
         raise AttributionValidationError(
-            "hybrid replay with every feature set to IF does not reproduce "
-            f"the IF endpoint: hybrid={hybrid_if:.6f} us, "
-            f"canonical={canonical_if:.6f} us"
+            "hybrid replay with every feature set to isolated does not reproduce "
+            f"the isolated endpoint: hybrid={hybrid_isolated:.6f} us, "
+            f"canonical={canonical_isolated:.6f} us"
         )
 
     marginal_samples: list[list[float]] = [list() for _ in features]
@@ -477,13 +477,13 @@ def attribute_profile_mode_savings(
         seed=seed,
         antithetic=antithetic,
     )
-    total_savings = normal - canonical_if
+    total_savings = normal - canonical_isolated
     try:
         for permutation_index, order in enumerate(permutation_orders):
             current = normal
             for feature_index in order:
-                features[feature_index].select_interference_free()
-                updated = _simulate_step_objective(
+                features[feature_index].select_isolated()
+                updated = _replay_step_objective(
                     plan_or_dags,
                     profile_mode=NORMAL_PROFILE_MODE,
                     sample_iteration_ids=sample_iteration_ids,
@@ -530,7 +530,7 @@ def attribute_profile_mode_savings(
     attributed = sum(item.attributed_savings_us for item in rows)
     return SavingsAttributionResult(
         normal_step_time_us=normal,
-        interference_free_step_time_us=canonical_if,
+        isolated_step_time_us=canonical_isolated,
         total_step_savings_us=total_savings,
         attributed_step_savings_us=attributed,
         additivity_residual_us=attributed - total_savings,

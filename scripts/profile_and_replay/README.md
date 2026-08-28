@@ -1,15 +1,20 @@
 # Profile-and-replay tools
 
 This package contains the public offline replay CLI, profile-ratio exporter,
-and reusable diagnostics for comparing instrumented traces with simulator
+and reusable diagnostics for comparing instrumented traces with dependency
 replays.
+
+Profile collection must be launched with `--no-use-inductor`. The current
+profile-and-replay path operates on the eager stage GraphModules; compiling
+those already-lowered graphs can fail when TorchDynamo encounters embedded
+Triton higher-order operators such as `triton_kernel_wrapper_mutation`.
 
 ## Approach
 
-Profile-and-simulate measures the same finalized `TrainingDAG` under two CUDA
+Profile-and-replay measures the same finalized `TrainingDAG` under two CUDA
 execution policies and then replays both sets of node measurements against the
 same dependency graph. The normal replay estimates the profiled schedule with
-its observed interference; the interference-free replay estimates the same
+its observed interference; the isolated replay estimates the same
 work with otherwise-independent node work serialized during measurement.
 
 ### Normal-mode profiles
@@ -29,14 +34,15 @@ work with otherwise-independent node work serialized during measurement.
   gaps inside that range. Synchronized whole-step wall-clock samples are kept
   separately as instrumented-step diagnostics; they are not node durations.
 
-Scheduled P2P ranges can contain time spent waiting for a peer, so Piper first
-microprofiles each matched transfer and records an isolated transfer baseline
-for replay. Actor clocks and CUDA timelines are also aligned so collective wait
-time can be separated from endpoint-local service.
+Actor clocks and CUDA timelines are aligned so participant wait time can be
+separated from endpoint-local service for both collectives and P2P. For each
+P2P node, a CPU-only marker immediately before its first `isend`, `irecv`, or
+`batch_isend_irecv` call records that endpoint's compound-transaction post
+time. This timestamp is distinct from the later start of NCCL GPU activity.
 
-### Interference-free profiles
+### Isolated profiles
 
-Interference-free capture runs the same DAG operations and communication
+Isolated capture runs the same DAG operations and communication
 protocols from the same restored state. It preserves every node's normal
 logical/physical stream instead of moving work to a profiler-only stream. A
 transaction-consistent global order keeps the participants of P2P and
@@ -47,64 +53,93 @@ one communication transaction still rendezvous together.
 
 This policy removes overlap between otherwise-independent node work while
 retaining stream-specific kernel behavior and the actual runtime protocol. Its
-CUPTI envelopes are used as the interference-free service measurements. A
+CUPTI envelopes are used as the isolated service measurements. A
 routed communication node may internally issue several metadata and payload
 collectives, but capture currently stores their combined envelope as one node
 measurement.
 
 ### DAG replay
 
-The CUDA executor and simulator consume the same lowered execution plan. For
-each captured iteration, the simulator discards the observed node start times
+The CUDA executor and replay consume the same lowered execution plan. For
+each captured iteration, the replay discards the observed node start times
 and computes the earliest legal start of every node from:
 
 - all explicit data and temporal DAG dependencies;
-- finalized dispatch order and physical-stream FIFO order;
+- physical-stream FIFO order already encoded in the finalized DAG;
 - the selected mode's rank-local CUPTI node durations; and
 - communication readiness and completion semantics.
 
-Ordinary and routed collectives (`all-reduce`, `all-gather`, `reduce-scatter`,
-`A2A`, `M-to-N`, and `N-to-M`) use an all-participant rendezvous followed by an
-endpoint-specific service tail derived from the aligned capture. "Symmetric"
-here means that every participant must arrive; it does not require equal
-payload sizes or equal endpoint durations. P2P transactions use a paired
-send/receive rendezvous and the isolated transfer baseline, while preserving
-distinct send and receive completion times. The simulated step time is the
-makespan of the resulting event graph.
+Replayed completion is determined by node family:
+
+- **Compute and other non-communication nodes:** completion is the maximum end
+  of the node's data, temporal, and DAG-encoded same-stream predecessors plus
+  the selected profile's complete CUDA activity-envelope duration.
+- **Ordinary and routed collectives** (`all-reduce`, `all-gather`,
+  `reduce-scatter`, `A2A`, `M-to-N`, and `N-to-M`): every participant first
+  reaches an all-participant GPU rendezvous. Each endpoint completes after its
+  policy-specific post-rendezvous service tail. "Symmetric" means every
+  participant must arrive; it does not require equal payloads or equal endpoint
+  durations.
+- **P2P send/receive:** a matched SEND/RECV node pair is one compound
+  transaction, including any internal header, payload, or batched operations.
+  Send completion adds its aggregate profiled tail after its own first-call
+  timestamp and send-source readiness; it does not wait for the receive call.
+  Receive completion adds its own tail after both first-call timestamps plus
+  send-source and receive-destination readiness. The endpoints therefore
+  complete independently, and send may complete before receive starts.
+
+The normal profile's host post schedule is reused by both replays because it is
+the schedule's intended asynchronous issue behavior. Isolated post timestamps
+are used only to remove matching and local-readiness wait from isolated P2P
+service measurements. Issue-only DAG edges do not become GPU timing
+predecessors. The replayed step time is the makespan of the resulting event
+graph.
+
+Durable Kineto profiles containing P2P nodes must include these host post
+timestamps. Replay fails closed with a re-profile error for older P2P artifacts
+instead of falling back to GPU-kernel rendezvous. Duration-only synthetic
+profiles may omit them and are treated as preposted at time zero.
 
 Replay accounts for the exact profiled DAG, placement, dependencies, stream
 assignment, rank-local kernel envelopes, participant readiness, and measured
 endpoint asymmetry. Normal replay uses normal-mode envelopes, in which hardware
-interference is already present; interference-free replay uses the serialized
+interference is already present; isolated replay uses the serialized
 measurements. Their difference estimates interference/overlap overhead for
 that captured workload and topology.
 
-Replay is not a GPU or network resource simulator. It does not independently
+Replay is not a GPU or network resource replay. It does not independently
 model SM or memory-bandwidth contention, network links/NIC capacity,
-communicator occupancy, CPU launch latency, allocator behavior outside the
-attributed CUDA ranges, or interference created by a different schedule.
+communicator occupancy, general CPU launch latency beyond the captured P2P post
+releases, allocator behavior outside the attributed CUDA ranges, or
+interference created by a different schedule.
 Otherwise-independent streams overlap without resource limits. Routed nodes
-are modeled with one entry rendezvous and one aggregate tail even when the
-runtime issues multiple internal collectives, and dense-state P2P headers and
-multiple tensors are not separate replay phases. Consequently, results should
-not be extrapolated to a different topology, tensor shape, routing
-distribution, or kernel selection without collecting new profiles.
+and ordinary A2A nodes are modeled with one all-participant entry rendezvous
+and one aggregate tail even when the runtime issues multiple internal
+collectives. Replay does not model their underlying peer-to-peer transfer
+graph, nonzero split pattern, or independent peer progress. Dense-state P2P
+headers and multiple tensors are also not separate replay phases.
+Consequently, results should not be extrapolated to a different topology,
+tensor shape, routing distribution, or kernel selection without collecting
+new profiles.
 
 The capture and merge path is implemented in `src/piper.py` and `src/actor.py`;
 the shared lowering is in `src/execution_plan.py`; and replay is implemented in
-`src/simulator.py`.
+`src/replay.py`.
 
 ## Offline tools
 
 From the repository root:
 
 ```bash
-python scripts/profile_and_replay/simulate_step_times.py PROFILE.json
+# Collection through the example harness requires --no-use-inductor.
+python examples/test_harness.py ... --profile-and-replay --no-use-inductor
+
+python scripts/profile_and_replay/replay_step_times.py PROFILE.json
 python scripts/profile_and_replay/export_node_profile_ratios.py PROFILE.json
-python scripts/profile_and_replay/attribute_simulation_savings.py PROFILE.json
-python scripts/profile_and_replay/visualize_simulation_savings.py \
+python scripts/profile_and_replay/attribute_replay_savings.py PROFILE.json
+python scripts/profile_and_replay/visualize_replay_savings.py \
   NORMAL_INPUT ATTRIBUTION.json --output savings-trace.json
 ```
 
-The tools import production profile and simulator types from `src/`; they do
-not contain a separate simulator implementation.
+The tools import production profile and replay types from `src/`; they do
+not contain a separate replay implementation.

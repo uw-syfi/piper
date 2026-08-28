@@ -1,1 +1,1 @@
-"""Offline profile-and-replay simulator tools."""
+"""Offline profiling and dependency-replay tools."""

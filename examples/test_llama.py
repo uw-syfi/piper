@@ -10,7 +10,7 @@ from src.piper import (
     piper_exec_dag,
     piper_measure_dags,
     piper_profile_dags,
-    simulate_profiled_modes,
+    replay_profiled_modes,
 )
 from src.profiling import ProfileConfig
 from src.compile import piper_setup
@@ -147,7 +147,7 @@ def main(args, pg):
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
     metrics["peak_memory_samples_by_rank"] = peak_memory_samples_by_rank
 
-    if args.profile_and_simulate:
+    if args.profile_and_replay:
         profile_config = ProfileConfig(
             warmup_iters=args.profile_warmup_iters,
             repeat_iters=args.profile_iters,
@@ -155,13 +155,13 @@ def main(args, pg):
         plan = piper_profile_dags(
             loss_fn,
             profile_config,
-            profile_modes=("interference_free", "normal"),
+            profile_modes=("isolated", "normal"),
             output_path=args.step_time_profile_output or None,
         )
-        comparison = simulate_profiled_modes(
+        comparison = replay_profiled_modes(
             plan, actual_step_samples_s=iter_times
         )
-        _add_profile_comparison_metrics(metrics, comparison, plan)
+        _add_profile_comparison_metrics(metrics, comparison)
 
     if args.pytorch_profiler:
         if args.pytorch_profiler_iters < 1:
@@ -246,11 +246,11 @@ def parse_args(argv=None):
         help="Number of active iterations retained in the PyTorch trace.",
     )
     parser.add_argument(
-        "--profile-and-simulate",
-        dest="profile_and_simulate",
+        "--profile-and-replay",
+        dest="profile_and_replay",
         action="store_true",
         default=False,
-        help="Profile and simulate both normal and interference-free step times.",
+        help="Profile and replay both normal and isolated step times.",
     )
     parser.add_argument("--profile-warmup-iters", type=int, default=5)
     parser.add_argument("--profile-iters", type=int, default=30)

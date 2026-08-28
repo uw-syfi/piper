@@ -49,7 +49,7 @@ from .profile_statistics import summarize_timing_samples
 from .profiling import (
     NORMAL_PROFILE_MODE,
     DEFAULT_NORMAL_SCOPE,
-    INTERFERENCE_FREE_PROFILE_MODE,
+    ISOLATED_PROFILE_MODE,
     ProfileConfig,
     ProfiledTrainingPlan,
     estimate_profile_time,
@@ -1481,14 +1481,14 @@ def _order_communication_transactions(
     return order
 
 
-def _interference_free_serial_orders(
+def _isolated_serial_orders(
     actor_group_dags: Sequence[TrainingDAG],
 ) -> tuple[tuple[str, ...], ...]:
     """Return transaction-consistent profiling orders without mutating DAGs."""
 
     if not actor_group_dags:
         raise ValueError(
-            "interference-free serialization requires ActorGroup DAGs"
+            "isolated serialization requires ActorGroup DAGs"
         )
 
     Unit = tuple[str, str, str]
@@ -1502,7 +1502,7 @@ def _interference_free_serial_orders(
         if key in unit_by_node:
             raise ValueError(
                 f"node {uid!r} in actor DAG {dag_index} belongs to multiple "
-                "interference-free serialization units"
+                "isolated serialization units"
             )
         unit_by_node[key] = unit
         members_by_unit.setdefault(unit, []).append(key)
@@ -1644,7 +1644,7 @@ def _interference_free_serial_orders(
             unit: sorted(members_by_unit[unit]) for unit in cyclic
         }
         raise ValueError(
-            "interference-free transaction graph is cyclic: "
+            "isolated transaction graph is cyclic: "
             f"units={cyclic!r}, actor_dag_members={cyclic_members!r}"
         )
 
@@ -1663,7 +1663,7 @@ def _interference_free_serial_orders(
         for edge in dag.edges:
             if issue_index[edge.src_uid] >= issue_index[edge.dst_uid]:
                 raise ValueError(
-                    "interference-free projection violates actor DAG edge "
+                    "isolated projection violates actor DAG edge "
                     f"{dag_index}:{edge.src_uid}->{edge.dst_uid} "
                     f"({edge.dep_kind})"
                 )
@@ -2991,15 +2991,15 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
         (normalize_profile_mode(result.profile_mode), int(result.global_rank)): result
         for result in results
     }
-    if_ranks = {
+    isolated_ranks = {
         rank for mode, rank in by_mode_rank
-        if mode == INTERFERENCE_FREE_PROFILE_MODE
+        if mode == ISOLATED_PROFILE_MODE
     }
     normal_ranks = {
         rank for mode, rank in by_mode_rank
         if mode == NORMAL_PROFILE_MODE
     }
-    common_ranks = sorted(if_ranks & normal_ranks)
+    common_ranks = sorted(isolated_ranks & normal_ranks)
     summary: dict[str, Any] = {
         "comparison": (
             "exact ordered (GPU activity category, Kineto name) sequence and "
@@ -3024,8 +3024,8 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
         "mismatched_node_ranges": 0,
         "unclassified_node_ranges": 0,
         "missing_mode_ranks": {
-            INTERFERENCE_FREE_PROFILE_MODE: sorted(normal_ranks - if_ranks),
-            NORMAL_PROFILE_MODE: sorted(if_ranks - normal_ranks),
+            ISOLATED_PROFILE_MODE: sorted(normal_ranks - isolated_ranks),
+            NORMAL_PROFILE_MODE: sorted(isolated_ranks - normal_ranks),
         },
         "mismatches": [],
     }
@@ -3056,78 +3056,78 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
 
     for rank in common_ranks:
         mode_audits = {}
-        for mode in (INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE):
+        for mode in (ISOLATED_PROFILE_MODE, NORMAL_PROFILE_MODE):
             result = by_mode_rank[(mode, rank)]
             mode_audits[mode] = result.device_metadata.get(
                 "kineto_attribution_audit", {}
             )
-        node_uids = sorted(set(mode_audits[INTERFERENCE_FREE_PROFILE_MODE]) | set(
+        node_uids = sorted(set(mode_audits[ISOLATED_PROFILE_MODE]) | set(
             mode_audits[NORMAL_PROFILE_MODE]
         ))
         for uid in node_uids:
-            if_audit = mode_audits[INTERFERENCE_FREE_PROFILE_MODE].get(uid)
+            isolated_audit = mode_audits[ISOLATED_PROFILE_MODE].get(uid)
             normal_audit = mode_audits[NORMAL_PROFILE_MODE].get(uid)
             summary["nodes_compared"] += 1
-            if if_audit is None or normal_audit is None:
+            if isolated_audit is None or normal_audit is None:
                 summary["mismatched_nodes"] += 1
                 summary["mismatches"].append({
                     "global_rank": rank,
                     "uid": uid,
                     "reason": "node audit missing from one profile mode",
-                    "if_present": if_audit is not None,
+                    "isolated_present": isolated_audit is not None,
                     "normal_present": normal_audit is not None,
                 })
                 continue
-            if_ranges = list(if_audit.get("range_activity_signatures", ()))
+            isolated_ranges = list(isolated_audit.get("range_activity_signatures", ()))
             normal_ranges = list(normal_audit.get("range_activity_signatures", ()))
             range_mismatches = []
-            for occurrence in range(max(len(if_ranges), len(normal_ranges))):
-                if_range = if_ranges[occurrence] if occurrence < len(if_ranges) else None
+            for occurrence in range(max(len(isolated_ranges), len(normal_ranges))):
+                isolated_range = isolated_ranges[occurrence] if occurrence < len(isolated_ranges) else None
                 normal_range = (
                     normal_ranges[occurrence]
                     if occurrence < len(normal_ranges)
                     else None
                 )
-                if if_range is not None and normal_range is not None:
+                if isolated_range is not None and normal_range is not None:
                     summary["node_ranges_compared"] += 1
                 range_detail: dict[str, Any] = {
                     "occurrence": occurrence,
                     "classification": "unclassified",
                     "missing_activities": [],
                 }
-                if if_range is None or normal_range is None:
+                if isolated_range is None or normal_range is None:
                     range_detail["reason"] = "node range missing from one mode"
                 else:
-                    if_launch_sequence = if_range.get("cpu_launch_sequence")
+                    isolated_launch_sequence = isolated_range.get("cpu_launch_sequence")
                     normal_launch_sequence = normal_range.get(
                         "cpu_launch_sequence"
                     )
-                    if_launches = if_range.get("cpu_launches")
+                    isolated_launches = isolated_range.get("cpu_launches")
                     normal_launches = normal_range.get("cpu_launches")
                     has_launch_evidence = all(
                         isinstance(value, list)
                         for value in (
-                            if_launch_sequence,
+                            isolated_launch_sequence,
                             normal_launch_sequence,
-                            if_launches,
+                            isolated_launches,
                             normal_launches,
                         )
                     )
                     exact_gpu_match = (
-                        if_range.get("signature_sha256")
+                        isolated_range.get("signature_sha256")
                         == normal_range.get("signature_sha256")
-                        and if_range.get("activity_sequence_sha256")
+                        and isolated_range.get("activity_sequence_sha256")
                         == normal_range.get("activity_sequence_sha256")
                     )
                     if has_launch_evidence:
                         summary["expected_cpu_launch_records"] += max(
-                            len(if_launch_sequence), len(normal_launch_sequence)
+                            len(isolated_launch_sequence), len(normal_launch_sequence)
                         )
                     if not has_launch_evidence:
                         summary["launch_evidence_complete"] = False
                         if exact_gpu_match:
                             expected_count = int(
-                                if_range.get("activity_count", 0)
+                                isolated_range.get("activity_count", 0)
                             )
                             summary["expected_gpu_activity_records"] += (
                                 expected_count
@@ -3137,9 +3137,9 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                         range_detail["reason"] = (
                             "per-occurrence CPU launch evidence is missing"
                         )
-                    elif if_launch_sequence != normal_launch_sequence:
+                    elif isolated_launch_sequence != normal_launch_sequence:
                         if (
-                            len(if_launch_sequence) != len(if_launches)
+                            len(isolated_launch_sequence) != len(isolated_launches)
                             or len(normal_launch_sequence) != len(normal_launches)
                         ):
                             range_detail.update({
@@ -3147,28 +3147,28 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                     "canonical CPU launch records do not match "
                                     "their normalized sequences"
                                 ),
-                                "if_cpu_launch_count": len(if_launches),
+                                "isolated_cpu_launch_count": len(isolated_launches),
                                 "normal_cpu_launch_count": len(normal_launches),
                             })
-                            if_missing_launches = None
+                            isolated_missing_launches = None
                             normal_missing_launches = None
                         else:
-                            if_missing_launches = missing_subsequence_entries(
-                                if_launch_sequence, normal_launch_sequence
+                            isolated_missing_launches = missing_subsequence_entries(
+                                isolated_launch_sequence, normal_launch_sequence
                             )
                             normal_missing_launches = missing_subsequence_entries(
-                                normal_launch_sequence, if_launch_sequence
+                                normal_launch_sequence, isolated_launch_sequence
                             )
-                        if if_missing_launches is not None:
+                        if isolated_missing_launches is not None:
                             expected_launches = normal_launches
-                            missing_mode = INTERFERENCE_FREE_PROFILE_MODE
-                            missing_launches = if_missing_launches
+                            missing_mode = ISOLATED_PROFILE_MODE
+                            missing_launches = isolated_missing_launches
                             nondeficient_range = normal_range
                         elif normal_missing_launches is not None:
-                            expected_launches = if_launches
+                            expected_launches = isolated_launches
                             missing_mode = NORMAL_PROFILE_MODE
                             missing_launches = normal_missing_launches
-                            nondeficient_range = if_range
+                            nondeficient_range = isolated_range
                         else:
                             expected_launches = []
                             missing_mode = None
@@ -3191,13 +3191,13 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                             range_detail.update({
                                 "classification": "execution_divergence",
                                 "reason": "normalized CPU launch sequences differ",
-                                "if_cpu_launch_sequence": if_launch_sequence,
+                                "isolated_cpu_launch_sequence": isolated_launch_sequence,
                                 "normal_cpu_launch_sequence": normal_launch_sequence,
                                 "missing_cpu_launches": [],
                             })
                         elif any(
                             launch.get("mapping_status") != "unambiguous"
-                            for launch in (*if_launches, *normal_launches)
+                            for launch in (*isolated_launches, *normal_launches)
                         ) or bool(
                             nondeficient_range.get("unmapped_activities", ())
                         ):
@@ -3207,7 +3207,7 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                     "launch/activity mapping"
                                 ),
                                 "missing_cpu_launches": missing_cpu_launch_details,
-                                "if_unmapped_activities": if_range.get(
+                                "isolated_unmapped_activities": isolated_range.get(
                                     "unmapped_activities", []
                                 ),
                                 "normal_unmapped_activities": normal_range.get(
@@ -3215,13 +3215,13 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                 ),
                             })
                         else:
-                            if_activity_sequence = if_range.get(
+                            isolated_activity_sequence = isolated_range.get(
                                 "activity_sequence"
                             )
                             normal_activity_sequence = normal_range.get(
                                 "activity_sequence"
                             )
-                            if not isinstance(if_activity_sequence, list) or not isinstance(
+                            if not isinstance(isolated_activity_sequence, list) or not isinstance(
                                 normal_activity_sequence, list
                             ):
                                 summary["launch_evidence_complete"] = False
@@ -3233,22 +3233,22 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                     "missing_cpu_launches": missing_cpu_launch_details,
                                 })
                             else:
-                                if_missing_activities = missing_subsequence_entries(
-                                    if_activity_sequence,
+                                isolated_missing_activities = missing_subsequence_entries(
+                                    isolated_activity_sequence,
                                     normal_activity_sequence,
                                 )
                                 normal_missing_activities = missing_subsequence_entries(
                                     normal_activity_sequence,
-                                    if_activity_sequence,
+                                    isolated_activity_sequence,
                                 )
-                                if if_missing_activities is not None:
+                                if isolated_missing_activities is not None:
                                     expected_activities = normal_activity_sequence
                                     gpu_missing_mode = (
-                                        INTERFERENCE_FREE_PROFILE_MODE
+                                        ISOLATED_PROFILE_MODE
                                     )
-                                    missing_activity_entries = if_missing_activities
+                                    missing_activity_entries = isolated_missing_activities
                                 elif normal_missing_activities is not None:
-                                    expected_activities = if_activity_sequence
+                                    expected_activities = isolated_activity_sequence
                                     gpu_missing_mode = NORMAL_PROFILE_MODE
                                     missing_activity_entries = normal_missing_activities
                                 else:
@@ -3272,7 +3272,7 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                             "launch_index": None,
                                             "missing_mode": gpu_missing_mode,
                                             "operation": "",
-                                            "if_api_name": "",
+                                            "isolated_api_name": "",
                                             "normal_api_name": "",
                                             "expected_activity_index": (
                                                 activity_index
@@ -3311,22 +3311,22 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                         ),
                                         "missing_activities": missing_activities,
                                     })
-                    elif len(if_launches) != len(normal_launches):
+                    elif len(isolated_launches) != len(normal_launches):
                         range_detail.update({
                             "classification": "execution_divergence",
                             "reason": "canonical CPU launch counts differ",
-                            "if_cpu_launch_count": len(if_launches),
+                            "isolated_cpu_launch_count": len(isolated_launches),
                             "normal_cpu_launch_count": len(normal_launches),
                         })
                     elif (
-                        not bool(if_range.get("launch_mapping_unambiguous", False))
+                        not bool(isolated_range.get("launch_mapping_unambiguous", False))
                         or not bool(
                             normal_range.get("launch_mapping_unambiguous", False)
                         )
                     ):
                         range_detail.update({
                             "reason": "launch/activity mapping is ambiguous",
-                            "if_unmapped_activities": if_range.get(
+                            "isolated_unmapped_activities": isolated_range.get(
                                 "unmapped_activities", []
                             ),
                             "normal_unmapped_activities": normal_range.get(
@@ -3337,11 +3337,11 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                         missing_activities = []
                         expected_count = 0
                         launch_divergence = None
-                        for launch_index, (if_launch, normal_launch) in enumerate(
-                            zip(if_launches, normal_launches)
+                        for launch_index, (isolated_launch, normal_launch) in enumerate(
+                            zip(isolated_launches, normal_launches)
                         ):
                             if (
-                                if_launch.get("operation")
+                                isolated_launch.get("operation")
                                 != normal_launch.get("operation")
                             ):
                                 launch_divergence = {
@@ -3351,11 +3351,11 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                     ),
                                 }
                                 break
-                            if_activities = list(if_launch.get("activities", ()))
+                            isolated_activities = list(isolated_launch.get("activities", ()))
                             normal_activities = list(
                                 normal_launch.get("activities", ())
                             )
-                            if not if_activities and not normal_activities:
+                            if not isolated_activities and not normal_activities:
                                 launch_divergence = {
                                     "classification": "unclassified",
                                     "reason": (
@@ -3364,21 +3364,21 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                                     ),
                                 }
                                 break
-                            if if_activities == normal_activities:
-                                expected_count += len(if_activities)
+                            if isolated_activities == normal_activities:
+                                expected_count += len(isolated_activities)
                                 continue
-                            if_missing = missing_subsequence_entries(
-                                if_activities, normal_activities
+                            isolated_missing = missing_subsequence_entries(
+                                isolated_activities, normal_activities
                             )
                             normal_missing = missing_subsequence_entries(
-                                normal_activities, if_activities
+                                normal_activities, isolated_activities
                             )
-                            if if_missing is not None:
+                            if isolated_missing is not None:
                                 expected = normal_activities
-                                missing_mode = INTERFERENCE_FREE_PROFILE_MODE
-                                missing_entries = if_missing
+                                missing_mode = ISOLATED_PROFILE_MODE
+                                missing_entries = isolated_missing
                             elif normal_missing is not None:
-                                expected = if_activities
+                                expected = isolated_activities
                                 missing_mode = NORMAL_PROFILE_MODE
                                 missing_entries = normal_missing
                             else:
@@ -3394,8 +3394,8 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                             missing_activities.extend({
                                 "launch_index": launch_index,
                                 "missing_mode": missing_mode,
-                                "operation": str(if_launch.get("operation", "")),
-                                "if_api_name": str(if_launch.get("api_name", "")),
+                                "operation": str(isolated_launch.get("operation", "")),
+                                "isolated_api_name": str(isolated_launch.get("api_name", "")),
                                 "normal_api_name": str(
                                     normal_launch.get("api_name", "")
                                 ),
@@ -3422,42 +3422,42 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                 summary["mismatched_node_ranges"] += 1
                 if range_detail["classification"] != "capture_loss":
                     summary["unclassified_node_ranges"] += 1
-                if_counts = {} if if_range is None else activity_counts(if_range)
+                isolated_counts = {} if isolated_range is None else activity_counts(isolated_range)
                 normal_counts = (
                     {} if normal_range is None else activity_counts(normal_range)
                 )
                 deltas = []
-                for category, name in sorted(set(if_counts) | set(normal_counts)):
-                    if_count = if_counts.get((category, name), 0)
+                for category, name in sorted(set(isolated_counts) | set(normal_counts)):
+                    isolated_count = isolated_counts.get((category, name), 0)
                     normal_count = normal_counts.get((category, name), 0)
-                    if if_count != normal_count:
+                    if isolated_count != normal_count:
                         deltas.append({
                             "category": category,
                             "name": name,
-                            "if_count": if_count,
+                            "isolated_count": isolated_count,
                             "normal_count": normal_count,
                         })
                 range_mismatches.append({
                     **range_detail,
-                    "if_activity_count": (
-                        None if if_range is None
-                        else int(if_range.get("activity_count", 0))
+                    "isolated_activity_count": (
+                        None if isolated_range is None
+                        else int(isolated_range.get("activity_count", 0))
                     ),
                     "normal_activity_count": (
                         None if normal_range is None
                         else int(normal_range.get("activity_count", 0))
                     ),
-                    "if_signature_sha256": (
-                        None if if_range is None
-                        else if_range.get("signature_sha256")
+                    "isolated_signature_sha256": (
+                        None if isolated_range is None
+                        else isolated_range.get("signature_sha256")
                     ),
                     "normal_signature_sha256": (
                         None if normal_range is None
                         else normal_range.get("signature_sha256")
                     ),
-                    "if_activity_sequence_sha256": (
-                        None if if_range is None
-                        else if_range.get("activity_sequence_sha256")
+                    "isolated_activity_sequence_sha256": (
+                        None if isolated_range is None
+                        else isolated_range.get("activity_sequence_sha256")
                     ),
                     "normal_activity_sequence_sha256": (
                         None if normal_range is None
@@ -3465,8 +3465,8 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                     ),
                     "activity_order_match": (
                         False
-                        if if_range is None or normal_range is None
-                        else if_range.get("activity_sequence_sha256")
+                        if isolated_range is None or normal_range is None
+                        else isolated_range.get("activity_sequence_sha256")
                         == normal_range.get("activity_sequence_sha256")
                     ),
                     "different_activity_entries": len(deltas),
@@ -3477,7 +3477,7 @@ def _compare_kineto_activity_signatures(results: Sequence[Any]) -> dict[str, Any
                 summary["mismatches"].append({
                     "global_rank": rank,
                     "uid": uid,
-                    "if_range_count": len(if_ranges),
+                    "isolated_range_count": len(isolated_ranges),
                     "normal_range_count": len(normal_ranges),
                     "ranges": range_mismatches,
                 })
@@ -3549,6 +3549,14 @@ def _filter_kineto_profile_iterations(
                 if profile.start_offset_samples_us
                 else ()
             )
+            p2p_post_offsets = (
+                tuple(
+                    profile.p2p_post_offset_samples_us[index]
+                    for index in selected
+                )
+                if profile.p2p_post_offset_samples_us
+                else ()
+            )
             filtered_profiles[uid] = replace(
                 profile,
                 samples_us=samples,
@@ -3560,6 +3568,14 @@ def _filter_kineto_profile_iterations(
                     if offsets
                     else None
                 ),
+                p2p_post_offset_samples_us=p2p_post_offsets,
+                p2p_post_offset_estimate_us=(
+                    estimate_profile_time(
+                        p2p_post_offsets, profile.estimator
+                    )
+                    if p2p_post_offsets
+                    else None
+                ),
             )
 
         metadata = dict(result.device_metadata)
@@ -3569,11 +3585,11 @@ def _filter_kineto_profile_iterations(
         ).items():
             audit = dict(raw_audit)
             signatures = list(audit.get("range_activity_signatures", ()))
-            durations = list(audit.get("simulator_duration_samples_us", ()))
+            durations = list(audit.get("replay_duration_samples_us", ()))
             audit["range_activity_signatures"] = [
                 signatures[index] for index in selected
             ]
-            audit["simulator_duration_samples_us"] = [
+            audit["replay_duration_samples_us"] = [
                 durations[index] for index in selected
             ]
             audit["range_count"] = len(selected)
@@ -3692,7 +3708,7 @@ def piper_profile_dags(
     Piper intentionally does *not* insert CUDA timing events around individual
     nodes here: those events alter the concurrent-stream schedule being
     measured.  Kineto correlates GPU activity to the existing node
-    ``record_function`` ranges.  The simulator subsequently derives every
+    ``record_function`` ranges.  The replay subsequently derives every
     execution start from its DAG dependencies and stream FIFO ordering.
     Cross-actor-aligned activity offsets are collected only to decompose a
     collective's measured endpoint interval into rendezvous wait and service;
@@ -3704,7 +3720,7 @@ def piper_profile_dags(
         for mode in (
             profile_modes
             if profile_modes is not None
-            else tuple(profile_configs or (INTERFERENCE_FREE_PROFILE_MODE,))
+            else tuple(profile_configs or (ISOLATED_PROFILE_MODE,))
         )
     )
     if not requested_modes or len(set(requested_modes)) != len(requested_modes):
@@ -3719,60 +3735,6 @@ def piper_profile_dags(
     actors = piper_metadata.actors
     if not actors or not piper_metadata.per_pp_training_dags:
         raise RuntimeError("piper_setup() must finalize actors and TrainingDAGs before profiling")
-    receive_spec_shards = ray.get([
-        actor.p2p_receive_specs.remote() for actor in actors.values()
-    ])
-    forward_specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]] = {}
-    for shard in receive_spec_shards:
-        for comm_id, specs in shard.items():
-            forward_specs_by_comm_id.setdefault(comm_id, specs)
-    forward_specs_by_edge: dict[tuple[str, str], list[tuple[tuple[int, ...], str]]] = {}
-    forward_uid_by_backward_uid: dict[str, str] = {}
-    for dag in piper_metadata.per_pp_training_dags:
-        for node in dag.nodes.values():
-            if node.node_kind == "COMPUTE" and node.compute_subkind in {"BWD", "BWD_I", "BWD_W"}:
-                fwd_uid = node.node_meta.get("fwd_uid")
-                if fwd_uid is not None:
-                    forward_uid_by_backward_uid[node.uid] = str(fwd_uid)
-            comm_id = str(node.node_meta.get("comm_id", ""))
-            if node.node_kind == "RECV_COMM" and node.tag.get("PASS") == "F" and comm_id in forward_specs_by_comm_id:
-                forward_specs_by_edge[(str(node.node_meta["from_uid"]), str(node.node_meta["to_uid"]))] = forward_specs_by_comm_id[comm_id]
-    p2p_specs_by_comm_id: dict[str, list[tuple[tuple[int, ...], str]]] = {}
-    for dag in piper_metadata.per_pp_training_dags:
-        for node in dag.nodes.values():
-            if node.node_kind not in {"SEND_COMM", "RECV_COMM"}:
-                continue
-            comm_id = str(node.node_meta["comm_id"])
-            if node.tag.get("PASS") == "F":
-                specs = forward_specs_by_comm_id.get(comm_id)
-            else:
-                source = forward_uid_by_backward_uid.get(str(node.node_meta["from_uid"]))
-                target = forward_uid_by_backward_uid.get(str(node.node_meta["to_uid"]))
-                specs = (
-                    None if source is None or target is None
-                    else forward_specs_by_edge.get((target, source))
-                )
-            if specs is None:
-                raise RuntimeError(f"missing receiver payload metadata for P2P {comm_id}")
-            p2p_specs_by_comm_id[comm_id] = specs
-    # Bucketing can leave large unused cached blocks after the measured
-    # training steps.  Release them before allocating the standalone P2P
-    # payloads so the microprofile does not fail from allocator fragmentation.
-    # This happens outside every measured interval and does not affect either
-    # policy's recorded node times.
-    ray.get([
-        actor.clear_profile_allocator_cache.remote()
-        for actor in actors.values()
-    ])
-    local_p2p_baseline_shards = ray.get([
-        actor.profile_p2p_transfer_baselines.remote(p2p_specs_by_comm_id)
-        for actor in actors.values()
-    ])
-    local_p2p_baselines = {
-        comm_id: max(shard[comm_id] for shard in local_p2p_baseline_shards if comm_id in shard)
-        for comm_id in p2p_specs_by_comm_id
-    }
-
     local_results = []
     local_instrumented_step_samples_us: dict[str, tuple[float, ...]] = {}
     requested_repeat_counts = {
@@ -3784,13 +3746,13 @@ def piper_profile_dags(
     kineto_spare_iters = (
         6
         if set(requested_modes)
-        == {INTERFERENCE_FREE_PROFILE_MODE, NORMAL_PROFILE_MODE}
+        == {ISOLATED_PROFILE_MODE, NORMAL_PROFILE_MODE}
         and len(requested_repeat_counts) == 1
         else 0
     )
     # Every policy must profile the same training state.  Restoring only at a
     # policy boundary is insufficient for data-dependent MoE kernels: small
-    # numerical differences between the normal and IF schedules accumulate
+    # numerical differences between the normal and isolated schedules accumulate
     # across optimizer steps, alter expert token counts, and make grouped GEMM
     # dispatch different CUTLASS kernels.  Capture once, then restore before
     # every warmup/profile occurrence outside its timed interval.  This makes
@@ -3867,7 +3829,6 @@ def piper_profile_dags(
             actor.stop_cupti_profile_result.remote(
                 estimator=mode_config.estimator,
                 profile_mode=mode,
-                p2p_baselines_by_comm_id=local_p2p_baselines,
                 trace_output_dir=trace_output_dir,
                 trace_ranks=(
                     None
@@ -3898,7 +3859,7 @@ def piper_profile_dags(
 
     all_results = local_results
     compare_both_modes = set(requested_modes) == {
-        INTERFERENCE_FREE_PROFILE_MODE,
+        ISOLATED_PROFILE_MODE,
         NORMAL_PROFILE_MODE,
     }
     raw_activity_equivalence = (
@@ -3927,7 +3888,7 @@ def piper_profile_dags(
             "mismatched_nodes": 0,
             "mismatched_node_ranges": 0,
             "missing_mode_ranks": {
-                INTERFERENCE_FREE_PROFILE_MODE: [],
+                ISOLATED_PROFILE_MODE: [],
                 NORMAL_PROFILE_MODE: [],
             },
             "mismatches": [],
@@ -4092,9 +4053,9 @@ def piper_profile_dags(
     if output_path is not None:
         plan.save_json(output_path)
     if not kineto_validation["passed"]:
-        from .profile_validation import ProfileAndSimulateValidationError
+        from .profile_validation import ProfileAndReplayValidationError
 
-        raise ProfileAndSimulateValidationError(
+        raise ProfileAndReplayValidationError(
             "Kineto profile validation failed: "
             + "; ".join(kineto_validation["errors"][:8])
         )
@@ -4108,7 +4069,7 @@ def piper_measure_profile_modes(
     repeat_iters: int,
     block_iters: int = 1,
     profile_modes: Sequence[str] = (
-        INTERFERENCE_FREE_PROFILE_MODE,
+        ISOLATED_PROFILE_MODE,
         NORMAL_PROFILE_MODE,
     ),
 ) -> dict[str, tuple[float, ...]]:
@@ -4184,37 +4145,37 @@ def piper_measure_profile_modes(
     return {mode: tuple(values) for mode, values in samples.items()}
 
 
-def simulate_profiled_dags(
+def replay_profiled_dags(
     plan: ProfiledTrainingPlan | None = None,
     *,
-    profile_mode: str = INTERFERENCE_FREE_PROFILE_MODE,
-    **simulation_kwargs,
+    profile_mode: str = ISOLATED_PROFILE_MODE,
+    **replay_kwargs,
 ):
-    """Run the stream simulator using one named duration dataset."""
+    """Run the stream replay using one named duration dataset."""
     if plan is None:
         plan = getattr(piper_metadata, "profiled_training_plan", None)
     if plan is None:
-        raise RuntimeError("piper_profile_dags() must run before simulation")
-    from .simulator import simulate_training_step
+        raise RuntimeError("piper_profile_dags() must run before replay")
+    from .replay import replay_training_step
 
-    return simulate_training_step(
-        plan, profile_mode=profile_mode, **simulation_kwargs
+    return replay_training_step(
+        plan, profile_mode=profile_mode, **replay_kwargs
     )
 
 
-def simulate_profiled_modes(
+def replay_profiled_modes(
     plan: ProfiledTrainingPlan | None = None,
     *,
     actual_step_samples_s: Sequence[float] | None = None,
-    **simulation_kwargs,
+    **replay_kwargs,
 ):
-    """Replay interference-free/normal timings and validate normal replay."""
+    """Replay isolated/normal timings and validate normal replay."""
 
     if plan is None:
         plan = getattr(piper_metadata, "profiled_training_plan", None)
     if plan is None:
-        raise RuntimeError("piper_profile_dags() must run before simulation")
-    from .profile_validation import ProfileAndSimulateValidationError
+        raise RuntimeError("piper_profile_dags() must run before replay")
+    from .profile_validation import ProfileAndReplayValidationError
 
     kineto_validation = plan.profile_metadata.get(
         "automatic_validations", {}
@@ -4225,34 +4186,34 @@ def simulate_profiled_modes(
     if kineto_validation is not None and not kineto_validation.get(
         "passed", False
     ):
-        raise ProfileAndSimulateValidationError(
+        raise ProfileAndReplayValidationError(
             "saved Kineto activity/timing validation did not pass"
         )
     if activity_equivalence is not None and not activity_equivalence.get(
         "accepted", activity_equivalence.get("exact_match", False)
     ):
-        raise ProfileAndSimulateValidationError(
-            "saved normal/IF Kineto activity-equivalence validation did not pass"
+        raise ProfileAndReplayValidationError(
+            "saved normal/isolated Kineto activity-equivalence validation did not pass"
         )
-    from .simulator import simulate_profile_modes
+    from .replay import replay_profile_modes
 
     actual_us = (
         None
         if actual_step_samples_s is None
         else tuple(float(sample) * 1_000_000.0 for sample in actual_step_samples_s)
     )
-    comparison = simulate_profile_modes(
+    comparison = replay_profile_modes(
         plan,
         actual_step_samples_us=actual_us,
-        **simulation_kwargs,
+        **replay_kwargs,
     )
     from .profile_validation import (
         build_and_validate_attributed_trace,
         validate_measured_normal_samples,
-        validate_simulation_endpoints,
+        validate_replay_endpoints,
     )
 
-    endpoint_validation = validate_simulation_endpoints(comparison)
+    endpoint_validation = validate_replay_endpoints(comparison)
     if endpoint_validation is not None:
         from .attribution import attribute_profile_mode_savings
 
@@ -4265,7 +4226,7 @@ def simulate_profiled_modes(
             permutations=1,
             seed=0,
             antithetic=False,
-            strict=bool(simulation_kwargs.get("strict", True)),
+            strict=bool(replay_kwargs.get("strict", True)),
         )
         endpoint_validation.update({
             "attribution_features": len(attribution.features),
@@ -4277,8 +4238,8 @@ def simulate_profiled_modes(
                 attribution.sample_iteration_ids
             ),
             "normal_step_time_us": attribution.normal_step_time_us,
-            "interference_free_step_time_us": (
-                attribution.interference_free_step_time_us
+            "isolated_step_time_us": (
+                attribution.isolated_step_time_us
             ),
             "attributed_step_savings_us": (
                 attribution.attributed_step_savings_us
@@ -4312,15 +4273,15 @@ def simulate_profiled_modes(
         automatic = plan.profile_metadata.setdefault(
             "automatic_validations", {}
         )
-        automatic["simulation_endpoints"] = endpoint_validation
+        automatic["replay_endpoints"] = endpoint_validation
         automatic["attributed_trace_losslessness"] = trace_validation
-        automatic["measured_vs_simulated_normal"] = measured_validation
+        automatic["measured_vs_replayed_normal"] = measured_validation
 
         warning = measured_validation.get("warning")
         if warning:
-            logger.warning("profile-and-simulate validation: %s", warning)
+            logger.warning("profile-and-replay validation: %s", warning)
             warnings.warn(
-                f"profile-and-simulate validation: {warning}",
+                f"profile-and-replay validation: {warning}",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -4331,7 +4292,7 @@ def simulate_profiled_modes(
             output_dir = profile_path.parent
             attribution_path = output_dir / "savings_attribution.json"
             trace_path = output_dir / "savings_attribution_trace.json"
-            validation_path = output_dir / "profile_and_simulate_validation.json"
+            validation_path = output_dir / "profile_and_replay_validation.json"
             attribution_path.write_text(
                 json.dumps(attribution.to_dict(), indent=2, sort_keys=True)
                 + "\n",

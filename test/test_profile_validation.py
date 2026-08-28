@@ -5,20 +5,20 @@ import pytest
 from src.attribution import attribute_profile_mode_savings
 from src.dag import TrainingDAG, TrainingDAGNode
 from src.profile_validation import (
-    ProfileAndSimulateValidationError,
+    ProfileAndReplayValidationError,
     build_and_validate_attributed_trace,
     validate_kineto_profile_results,
     validate_measured_normal_samples,
-    validate_simulation_endpoints,
+    validate_replay_endpoints,
 )
 from src.profiling import ActorProfileResult, NodeProfile, ProfiledTrainingPlan
-from src.piper import simulate_profiled_modes
+from src.piper import replay_profiled_modes
 from src.piper import (
     _compare_kineto_activity_signatures,
     _filter_kineto_profile_iterations,
     _strip_kineto_comparison_details,
 )
-from src.simulator import simulate_profile_modes
+from src.replay import replay_profile_modes
 
 
 def _profile(duration_us: float) -> NodeProfile:
@@ -37,7 +37,7 @@ def _plan() -> ProfiledTrainingPlan:
             stream="default_stream",
             profile_times_by_mode={
                 "normal": {0: _profile(9.0)},
-                "interference_free": {0: _profile(4.0)},
+                "isolated": {0: _profile(4.0)},
             },
         )
     )
@@ -46,12 +46,12 @@ def _plan() -> ProfiledTrainingPlan:
 
 def test_endpoint_and_trace_validations_preserve_the_normal_timeline() -> None:
     plan = _plan()
-    comparison = simulate_profile_modes(plan)
+    comparison = replay_profile_modes(plan)
     attribution = attribute_profile_mode_savings(
         plan, permutations=2, antithetic=True
     )
 
-    endpoint = validate_simulation_endpoints(comparison)
+    endpoint = validate_replay_endpoints(comparison)
     trace, rendered = build_and_validate_attributed_trace(
         comparison.normal, attribution
     )
@@ -62,7 +62,7 @@ def test_endpoint_and_trace_validations_preserve_the_normal_timeline() -> None:
     assert rendered["source_events"] == rendered["rendered_events"] == 1
     assert len([event for event in trace["traceEvents"] if event["ph"] == "X"]) == 1
     assert rendered["net_exposed_step_savings_us"] == pytest.approx(5.0)
-    assert rendered["simulator_step_savings_us"] == pytest.approx(5.0)
+    assert rendered["replay_step_savings_us"] == pytest.approx(5.0)
     assert rendered["exposed_savings_validation_residual_us"] == pytest.approx(0.0)
     assert rendered["trace_checksum_residual_us"] == pytest.approx(0.0)
 
@@ -74,8 +74,8 @@ def test_kineto_validation_rejects_cross_mode_activity_mismatch() -> None:
         "launch_count": 1,
         "matched_launch_count": 1,
         "unmatched_launch_count": 0,
-        "simulator_duration_source": "correlated_gpu_activity_envelope",
-        "simulator_duration_samples_us": [10.0],
+        "replay_duration_source": "correlated_gpu_activity_envelope",
+        "replay_duration_samples_us": [10.0],
         "range_activity_signatures": [
             {
                 "activity_time_sum_us": 8.0,
@@ -95,7 +95,7 @@ def test_kineto_validation_rejects_cross_mode_activity_mismatch() -> None:
     )
 
     with pytest.raises(
-        ProfileAndSimulateValidationError,
+        ProfileAndReplayValidationError,
         match="activity identity differs",
     ):
         validate_kineto_profile_results(
@@ -128,10 +128,10 @@ def test_kineto_validation_accepts_only_classified_launch_loss() -> None:
                     "launch_count": 1,
                     "matched_launch_count": 0,
                     "unmatched_launch_count": 1,
-                    "simulator_duration_source": (
+                    "replay_duration_source": (
                         "correlated_gpu_activity_envelope"
                     ),
-                    "simulator_duration_samples_us": [0.0],
+                    "replay_duration_samples_us": [0.0],
                     "range_activity_signatures": [occurrence],
                 }
             }
@@ -156,7 +156,7 @@ def test_kineto_validation_accepts_only_classified_launch_loss() -> None:
     assert report["capture_loss_rate"] == pytest.approx(0.0001)
 
     with pytest.raises(
-        ProfileAndSimulateValidationError, match="launch coverage 0/1"
+        ProfileAndReplayValidationError, match="launch coverage 0/1"
     ):
         validate_kineto_profile_results(
             [result],
@@ -188,8 +188,8 @@ def _collective_activity_result(
         "launch_count": activity_count,
         "matched_launch_count": activity_count,
         "unmatched_launch_count": 0,
-        "simulator_duration_source": "correlated_gpu_activity_envelope",
-        "simulator_duration_samples_us": [duration],
+        "replay_duration_source": "correlated_gpu_activity_envelope",
+        "replay_duration_samples_us": [duration],
         "range_activity_signatures": [occurrence],
     }
     return ActorProfileResult(
@@ -224,7 +224,7 @@ def test_kineto_validation_accepts_mixed_routed_activity_presence(
 
 def test_kineto_validation_still_rejects_mixed_nonrouted_activity_presence() -> None:
     with pytest.raises(
-        ProfileAndSimulateValidationError,
+        ProfileAndReplayValidationError,
         match="mix zero and nonzero GPU activity",
     ):
         validate_kineto_profile_results(
@@ -242,7 +242,7 @@ def test_kineto_validation_still_rejects_mixed_nonrouted_activity_presence() -> 
 
 def test_kineto_validation_requires_a2a_comm_id() -> None:
     with pytest.raises(
-        ProfileAndSimulateValidationError, match="collective audit has no comm_id"
+        ProfileAndReplayValidationError, match="collective audit has no comm_id"
     ):
         validate_kineto_profile_results(
             [
@@ -281,10 +281,10 @@ def test_kineto_validation_accepts_all_zero_collective_occurrence() -> None:
                             "launch_count": 0,
                             "matched_launch_count": 0,
                             "unmatched_launch_count": 0,
-                            "simulator_duration_source": (
+                            "replay_duration_source": (
                                 "correlated_gpu_activity_envelope"
                             ),
-                            "simulator_duration_samples_us": [0.0],
+                            "replay_duration_samples_us": [0.0],
                             "range_activity_signatures": [occurrence],
                         }
                     }
@@ -323,7 +323,7 @@ def test_kineto_comparison_rejects_same_multiset_in_different_order() -> None:
         )
 
     summary = _compare_kineto_activity_signatures(
-        [result("normal", "ab"), result("interference_free", "ba")]
+        [result("normal", "ab"), result("isolated", "ba")]
     )
 
     assert summary["exact_match"] is False
@@ -443,7 +443,7 @@ def test_kineto_comparison_applies_capture_loss_threshold(
 ) -> None:
     expected = [{"category": "kernel", "name": "same"}] * expected_count
     summary = _compare_kineto_activity_signatures([
-        _launch_result("interference_free", expected),
+        _launch_result("isolated", expected),
         _launch_result("normal", expected[:-1]),
     ])
 
@@ -464,7 +464,7 @@ def test_kineto_comparison_aggregates_capture_loss_across_ranks() -> None:
     for rank in (0, 1):
         expected = [activity] * 5_000
         results.extend([
-            _launch_result("interference_free", expected, rank=rank),
+            _launch_result("isolated", expected, rank=rank),
             _launch_result(
                 "normal",
                 expected[:-1] if rank == 0 else expected,
@@ -495,7 +495,7 @@ def test_kineto_comparison_applies_cpu_launch_loss_threshold(
     captured_operations = expected_operations[:-1]
     summary = _compare_kineto_activity_signatures([
         _launch_sequence_result(
-            "interference_free", expected_operations, activities
+            "isolated", expected_operations, activities
         ),
         _launch_sequence_result(
             "normal",
@@ -523,7 +523,7 @@ def test_kineto_comparison_accepts_combined_cpu_and_gpu_deletion_loss() -> None:
     ]
     operations = ["kernel"] * expected_count
     summary = _compare_kineto_activity_signatures([
-        _launch_sequence_result("interference_free", operations, activities),
+        _launch_sequence_result("isolated", operations, activities),
         _launch_sequence_result("normal", operations[:-1], activities[:-1]),
     ])
 
@@ -541,7 +541,7 @@ def test_kineto_comparison_rejects_cpu_launch_reordering() -> None:
     ]
     summary = _compare_kineto_activity_signatures([
         _launch_sequence_result(
-            "interference_free", ["kernel", "memcpy"], activities
+            "isolated", ["kernel", "memcpy"], activities
         ),
         _launch_sequence_result(
             "normal", ["memcpy", "kernel"], activities
@@ -592,7 +592,7 @@ def test_kineto_comparison_rejects_non_deletion_differences(
         {"category": "kernel", "name": "b"},
     ] if len(normal_activities) == 2 else normal_activities
     summary = _compare_kineto_activity_signatures([
-        _launch_result("interference_free", expected),
+        _launch_result("isolated", expected),
         _launch_result(
             "normal",
             normal_activities,
@@ -609,7 +609,7 @@ def test_kineto_comparison_rejects_non_deletion_differences(
 def test_kineto_comparison_details_are_stripped_only_after_comparison() -> None:
     activity = {"category": "kernel", "name": "same"}
     results = [
-        _launch_result("interference_free", [activity]),
+        _launch_result("isolated", [activity]),
         _launch_result("normal", []),
     ]
     summary = _compare_kineto_activity_signatures(results)
@@ -628,7 +628,11 @@ def test_kineto_comparison_details_are_stripped_only_after_comparison() -> None:
 
 
 def test_kineto_iteration_filter_keeps_paired_samples_and_audits() -> None:
-    profile = NodeProfile.from_samples((10.0, 20.0, 30.0))
+    profile = NodeProfile.from_samples(
+        (10.0, 20.0, 30.0),
+        start_offset_samples_us=(1.0, 2.0, 3.0),
+        p2p_post_offset_samples_us=(0.5, 1.5, 2.5),
+    )
     signatures = [
         {
             "activity_count": 1,
@@ -652,7 +656,7 @@ def test_kineto_iteration_filter_keeps_paired_samples_and_audits() -> None:
                     "matched_launch_count": 3,
                     "unmatched_launch_count": 3,
                     "range_activity_signatures": signatures,
-                    "simulator_duration_samples_us": [10.0, 20.0, 30.0],
+                    "replay_duration_samples_us": [10.0, 20.0, 30.0],
                 }
             }
         },
@@ -662,13 +666,21 @@ def test_kineto_iteration_filter_keeps_paired_samples_and_audits() -> None:
 
     assert filtered.node_profiles["compute"].samples_us == (10.0, 30.0)
     assert filtered.node_profiles["compute"].sample_iteration_ids == (0, 1)
+    assert filtered.node_profiles["compute"].start_offset_samples_us == (
+        1.0,
+        3.0,
+    )
+    assert filtered.node_profiles["compute"].p2p_post_offset_samples_us == (
+        0.5,
+        2.5,
+    )
     audit = filtered.device_metadata["kineto_attribution_audit"]["compute"]
     assert audit["range_count"] == 2
     assert audit["launch_count"] == 4
     assert audit["matched_launch_count"] == 2
     assert audit["unmatched_launch_count"] == 2
     assert audit["launch_coverage_pct"] == pytest.approx(50.0)
-    assert audit["simulator_duration_samples_us"] == [10.0, 30.0]
+    assert audit["replay_duration_samples_us"] == [10.0, 30.0]
     assert audit["range_activity_signatures"] == [signatures[0], signatures[2]]
 
 
@@ -677,48 +689,48 @@ def test_measured_normal_validation_uses_uninstrumented_truth_and_warns() -> Non
     plan.profile_metadata[
         "instrumented_global_step_samples_us_by_mode"
     ] = {"normal": [8.0, 10.0]}
-    comparison = simulate_profile_modes(
+    comparison = replay_profile_modes(
         plan, actual_step_samples_us=(8.0, 10.0)
     )
 
     result = validate_measured_normal_samples(plan, comparison)
 
     assert result["measured_normal_step_estimate_us"] == pytest.approx(9.0)
-    assert result["simulated_normal_step_estimate_us"] == pytest.approx(10.0)
+    assert result["replayed_normal_step_estimate_us"] == pytest.approx(10.0)
     assert result["median_absolute_step_error_pct"] == pytest.approx(100 / 9)
     instrumentation = result["kineto_cupti_instrumentation_error"]
     assert instrumentation["signed_error_pct"] == pytest.approx(0.0)
     assert "exceeds" in result["warning"]
 
 
-def test_simulate_profiled_modes_runs_all_automatic_validations() -> None:
+def test_replay_profiled_modes_runs_all_automatic_validations() -> None:
     plan = _plan()
     plan.profile_metadata[
         "instrumented_global_step_samples_us_by_mode"
     ] = {"normal": [9.0, 11.0]}
 
-    comparison = simulate_profiled_modes(
+    comparison = replay_profiled_modes(
         plan, actual_step_samples_s=(9e-6, 11e-6)
     )
 
     validations = plan.profile_metadata["automatic_validations"]
     assert comparison.normal_samples_us == pytest.approx((9.0, 11.0))
-    assert validations["simulation_endpoints"]["passed"] is True
-    assert validations["simulation_endpoints"]["additivity_residual_us"] == 0.0
+    assert validations["replay_endpoints"]["passed"] is True
+    assert validations["replay_endpoints"]["additivity_residual_us"] == 0.0
     assert validations["attributed_trace_losslessness"]["passed"] is True
-    measured = validations["measured_vs_simulated_normal"]
+    measured = validations["measured_vs_replayed_normal"]
     assert measured["available"] is True
     assert measured["median_absolute_step_error_pct"] == 0.0
     assert measured["warning"] is None
 
 
-def test_simulate_profiled_modes_accepts_bounded_capture_loss() -> None:
+def test_replay_profiled_modes_accepts_bounded_capture_loss() -> None:
     plan = _plan()
     plan.profile_metadata["kineto_activity_equivalence"] = {
         "exact_match": False,
         "accepted": True,
     }
 
-    comparison = simulate_profiled_modes(plan)
+    comparison = replay_profiled_modes(plan)
 
     assert comparison.normal_samples_us == pytest.approx((9.0, 11.0))

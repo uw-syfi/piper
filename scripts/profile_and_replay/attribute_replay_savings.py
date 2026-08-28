@@ -1,4 +1,4 @@
-"""Attribute normal-to-IF simulator savings to logical profile units."""
+"""Attribute normal-to-isolated replay savings to logical profile units."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def main() -> None:
 
     print(
         f"normal={result.normal_step_time_us / 1000.0:.3f} ms, "
-        f"IF={result.interference_free_step_time_us / 1000.0:.3f} ms, "
+        f"isolated={result.isolated_step_time_us / 1000.0:.3f} ms, "
         f"savings={result.total_step_savings_us / 1000.0:.3f} ms, "
         f"residual={result.additivity_residual_us:.6f} us",
         file=sys.stderr,
