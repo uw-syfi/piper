@@ -1,4 +1,4 @@
-"""Probe TorchTitan's unmodified Qwen3 MoE path under fullgraph compilation.
+"""Run TorchTitan's unmodified Qwen3 MoE path under fullgraph compilation.
 
 This is intentionally separate from Piper's compiler. It establishes whether
 TorchTitan's default GroupedExperts and complete MoE implementations introduce

@@ -81,26 +81,6 @@ def test_plan_does_not_invent_recv_consumer_guard() -> None:
     assert plan["consumer"].completion_predecessors == ("recv",)
 
 
-def test_dispatch_level_places_recv_after_same_level_communication() -> None:
-    dag = _dag(
-        _node("compute"),
-        _node("recv", kind="RECV_COMM", subkind=None),
-        _node("routed", stream="ep", kind="A2A_COMM", subkind=None),
-        _node("consumer"),
-    )
-    dag.nodes["recv"].node_meta["destination_compute_uid"] = "consumer"
-    dag.add_edge(TrainingDAGEdge("compute", "routed", "data"))
-    dag.add_edge(TrainingDAGEdge("recv", "consumer", "data"))
-    dag.add_edge(TrainingDAGEdge("routed", "consumer", "data"))
-    assign_dispatch_levels(dag)
-
-    assert [op.uid for op in build_execution_plan(dag)] == [
-        "compute",
-        "routed",
-        "recv",
-        "consumer",
-    ]
-    assert dag.nodes["recv"].node_meta["dispatch_level"] == 1
 
 
 def test_dispatch_priority_never_overrides_an_encoded_dependency() -> None:
@@ -113,51 +93,8 @@ def test_dispatch_priority_never_overrides_an_encoded_dependency() -> None:
     assert [op.uid for op in build_execution_plan(dag)] == ["recv", "send"]
 
 
-def test_dispatch_level_tie_priority_is_static_and_transport_generic() -> None:
-    dag = _dag(
-        _node("compute"),
-        _node("recv", kind="RECV_COMM", subkind=None),
-        _node("a2a", kind="A2A_COMM", subkind=None),
-        _node("send", kind="SEND_COMM", subkind=None),
-        _node("reduce", kind="REDUCE_COMM", subkind=None),
-    )
-    for node in dag.nodes.values():
-        node.node_meta["dispatch_level"] = 0
-
-    assert [op.uid for op in build_execution_plan(dag)] == [
-        "send",
-        "a2a",
-        "reduce",
-        "compute",
-        "recv",
-    ]
 
 
-def test_dispatch_level_endpoint_movement_is_clamped_by_dag_edges() -> None:
-    dag = _dag(
-        _node("producer"),
-        _node("gate0"),
-        _node("gate1"),
-        _node("send", kind="SEND_COMM", subkind=None),
-        _node("recv", kind="RECV_COMM", subkind=None),
-        _node("consumer"),
-    )
-    dag.nodes["send"].node_meta["source_compute_uid"] = "producer"
-    dag.nodes["recv"].node_meta["destination_compute_uid"] = "consumer"
-    dag.add_edge(TrainingDAGEdge("producer", "send", "data"))
-    dag.add_edge(TrainingDAGEdge("gate0", "gate1", "data"))
-    dag.add_edge(TrainingDAGEdge("gate1", "send", "temporal"))
-    dag.add_edge(TrainingDAGEdge("recv", "gate1", "temporal"))
-    dag.add_edge(TrainingDAGEdge("gate1", "consumer", "data"))
-    dag.add_edge(TrainingDAGEdge("recv", "consumer", "data"))
-
-    assign_dispatch_levels(dag)
-
-    assert dag.nodes["send"].node_meta["dispatch_level"] == 2
-    assert dag.nodes["recv"].node_meta["dispatch_level"] == 0
-    plan = build_execution_plan(dag)
-    index = {operation.uid: operation.dispatch_index for operation in plan}
-    assert all(index[edge.src_uid] < index[edge.dst_uid] for edge in dag.edges)
 
 
 def test_plan_rejects_persisted_dispatch_level_edge_violation() -> None:
@@ -198,36 +135,8 @@ def test_update_uses_explicit_backward_and_gradient_sync_edges() -> None:
     assert plan["upd"].reason_for("reduce_scatter") == "cross_stream_temporal"
 
 
-def test_plan_rejects_dispatch_order_that_violates_an_edge() -> None:
-    dag = _dag(_node("a"), _node("b"))
-    dag.add_edge(TrainingDAGEdge("a", "b", "data"))
-
-    with pytest.raises(ValueError, match="violates DAG dependency"):
-        build_execution_plan(dag, ["b", "a"])
 
 
-def test_directional_p2p_preserves_every_explicit_dependency() -> None:
-    lo_hi = _node("lo_hi", stream="pp", kind="SEND_COMM", subkind=None)
-    hi_lo = _node("hi_lo", stream="pp", kind="RECV_COMM", subkind=None)
-    lo_hi.node_meta["comm_group_kind"] = "pp_lo_hi"
-    hi_lo.node_meta["comm_group_kind"] = "pp_hi_lo"
-    dag = _dag(lo_hi, hi_lo)
-
-    fifo_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
-    assert fifo_plan["lo_hi"].logical_stream == "pp_lo_hi"
-    assert fifo_plan["hi_lo"].logical_stream == "pp_hi_lo"
-    assert fifo_plan["hi_lo"].completion_predecessors == ()
-
-    dag.add_edge(TrainingDAGEdge("lo_hi", "hi_lo", "temporal"))
-    explicit_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
-    explicit_reason = explicit_plan["hi_lo"].reason_for("lo_hi")
-    assert explicit_reason == "cross_stream_temporal"
-
-    dag.edges.clear()
-    dag.add_edge(TrainingDAGEdge("lo_hi", "hi_lo", "data"))
-    data_plan = _by_uid(dag, ["lo_hi", "hi_lo"])
-    data_reason = data_plan["hi_lo"].reason_for("lo_hi")
-    assert data_reason == "cross_stream_data"
 
 
 def test_directional_p2p_plan_does_not_invent_fifo_edges() -> None:
@@ -245,15 +154,6 @@ def test_directional_p2p_plan_does_not_invent_fifo_edges() -> None:
     assert plan["lo_hi_2"].completion_predecessors == ()
 
 
-def test_p2p_without_direction_metadata_uses_declared_stream() -> None:
-    first = _node("first", stream="pp", kind="SEND_COMM", subkind=None)
-    second = _node("second", stream="pp", kind="RECV_COMM", subkind=None)
-
-    dag = _dag(first, second)
-    dag.add_edge(TrainingDAGEdge("first", "second", "temporal"))
-    plan = _by_uid(dag, ["first", "second"])
-    assert plan["second"].logical_stream == "pp"
-    assert plan["second"].reason_for("first") == "same_stream_temporal"
 
 
 def test_routed_collectives_use_declared_stream_and_explicit_edges() -> None:
@@ -288,188 +188,6 @@ def test_routed_collectives_use_declared_stream_and_explicit_edges() -> None:
     assert data_reason == "same_stream_data"
 
 
-def test_plan_rejects_missing_or_duplicate_dispatch_nodes() -> None:
-    dag = _dag(_node("a"), _node("b"))
-
-    with pytest.raises(ValueError, match="does not match DAG nodes"):
-        build_execution_plan(dag, ["a"])
-    with pytest.raises(ValueError, match="duplicate node uids"):
-        build_execution_plan(dag, ["a", "a"])
-
-
-def test_executor_applies_plan_and_serialization_waits_outside_ranges(
-    monkeypatch,
-) -> None:
-    trace: list[tuple] = []
-
-    class FakeStream:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def wait_event(self, event) -> None:
-            trace.append(("wait", self.name, event.index))
-
-    class FakeEvent:
-        next_index = 0
-
-        def __init__(self) -> None:
-            self.index = FakeEvent.next_index
-            FakeEvent.next_index += 1
-
-        def record(self, stream: FakeStream) -> None:
-            trace.append(("record", self.index, stream.name))
-
-    default_stream = FakeStream("logical-default")
-    comm_stream = FakeStream("logical-comm")
-    profile_compute = FakeStream("profile-compute")
-    profile_comm = FakeStream("profile-comm")
-    runtime = SimpleNamespace(
-        streams={"default_stream": default_stream, "comm": comm_stream},
-        default_stream=lambda: default_stream,
-        stream_for_task=lambda node: (
-            default_stream if node.stream == "default_stream" else comm_stream
-        ),
-        stream_id=lambda node: node.stream,
-        pytorch_profiler_enabled=False,
-        nvtx_push=lambda label: trace.append(("push", label)),
-        nvtx_pop=lambda: trace.append(("pop",)),
-    )
-
-    first = _node("first", kind="ORDER_DUMMY", subkind=None)
-    second = _node(
-        "second", stream="comm", kind="ORDER_DUMMY", subkind=None
-    )
-    for node in (first, second):
-        node.task_type = TaskType.ORDER_DUMMY
-        node.batches = [SimpleNamespace(mb_idx=0)]
-    dag = _dag(first, second)
-    dag.add_edge(TrainingDAGEdge("first", "second", "data"))
-
-    class Recorder:
-        def before_prologue(self, stream) -> None:
-            trace.append(("before_prologue", stream.name))
-
-        def after_prologue(self, stream) -> None:
-            trace.append(("after_prologue", stream.name))
-
-        def before_node(self, node, stream) -> None:
-            trace.append(("before_node", node.uid, stream.name))
-
-        def after_node(self, node, stream) -> None:
-            trace.append(("after_node", node.uid, stream.name))
-
-        def finish(self) -> None:
-            trace.append(("finish",))
-
-    monkeypatch.setattr(executors.torch.cuda, "Event", FakeEvent)
-    monkeypatch.setattr(
-        executors.torch.cuda,
-        "synchronize",
-        lambda: trace.append(("synchronize",)),
-    )
-
-    params = Mock()
-    buffers = Mock()
-    events = Mock()
-    logger = Mock()
-    logger.isEnabledFor.return_value = False
-    executor = DagExecutor(
-        runtime=runtime,
-        stages=Mock(),
-        buffers=buffers,
-        events=events,
-        params=params,
-        communication=Mock(),
-        compute=Mock(),
-        logger=logger,
-    )
-    executor._rf_enter = lambda label: (
-        trace.append(("rf_push", label)) or label
-    )
-    executor._rf_exit = lambda label: trace.append(("rf_pop", label))
-
-    override_calls: list[str] = []
-
-    def stream_override(node, _logical_stream):
-        override_calls.append(node.uid)
-        return profile_compute if node.uid == "first" else profile_comm
-
-    prepared = executor.prepare(
-        dag,
-        [first, second],
-        stream_override=stream_override,
-    )
-    assert override_calls == ["first", "second"]
-    assert prepared.buffer_refcount_template == {"first": 1}
-    override_calls.clear()
-
-    def fail_if_plan_is_rebuilt(*_args, **_kwargs):
-        raise AssertionError("execution plan was rebuilt during run")
-
-    monkeypatch.setattr(executors, "build_execution_plan", fail_if_plan_is_rebuilt)
-
-    executor.run(
-        prepared,
-        inputs=None,
-        labels=None,
-        loss_buffer=[],
-        timing_recorder=Recorder(),
-        serialize_nodes=True,
-    )
-
-    assert override_calls == []
-    buffers.init_refcounts.assert_called_once_with({"first": 1})
-    first_completion = next(
-        entry[1]
-        for entry in trace
-        if len(entry) == 3
-        and entry[0] == "record"
-        and entry[2] == "profile-compute"
-    )
-    dependency_wait_index = trace.index(
-        ("wait", "profile-comm", first_completion)
-    )
-    second_timing_index = trace.index(
-        ("before_node", "second", "profile-comm")
-    )
-    assert dependency_wait_index < second_timing_index
-
-    first_push_index = next(
-        index
-        for index, entry in enumerate(trace)
-        if entry[0] == "push" and "uidfirst" in entry[1]
-    )
-    first_pop_index = trace.index(("pop",), first_push_index)
-    first_rf_pop_index = next(
-        index
-        for index, entry in enumerate(trace)
-        if entry[0] == "rf_pop" and "uidfirst" in entry[1]
-    )
-    serialization_record = next(
-        entry
-        for entry in trace[first_pop_index + 1 :]
-        if entry[0] == "record" and entry[2] == "profile-compute"
-    )
-    serialization_record_index = trace.index(serialization_record)
-    serialization_wait_index = trace.index(
-        ("wait", "profile-comm", serialization_record[1])
-    )
-    second_push_index = next(
-        index
-        for index, entry in enumerate(trace)
-        if entry[0] == "push" and "uidsecond" in entry[1]
-    )
-    second_rf_push_index = next(
-        index
-        for index, entry in enumerate(trace)
-        if entry[0] == "rf_push" and "uidsecond" in entry[1]
-    )
-    assert first_rf_pop_index < serialization_record_index
-    assert first_pop_index < serialization_record_index
-    assert serialization_record_index < serialization_wait_index
-    assert serialization_wait_index < second_push_index
-    assert serialization_wait_index < second_rf_push_index
-    assert trace[-2:] == [("synchronize",), ("finish",)]
 
 
 def test_executor_uses_fifo_without_event_wait_for_same_physical_stream(

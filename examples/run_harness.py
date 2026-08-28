@@ -1,4 +1,4 @@
-"""Build a schedule JSON and run a model test with it.
+"""Build a schedule JSON and run a model example with it.
 
 This is a small harness around model example modules such as
 ``examples.test_qwen`` and ``examples.test_llama``. It consumes schedule/runtime
@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# When invoked as ``python examples/test_harness.py``, Python otherwise places
+# When invoked as ``python examples/run_harness.py``, Python otherwise places
 # ``examples/`` (rather than this checkout's root) first on sys.path.  An
 # editable install of another Piper checkout can then satisfy ``import src``.
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])
@@ -111,7 +111,7 @@ def main() -> None:
         "--test",
         required=True,
         help=(
-            "Example file to run directly, e.g. examples/test_qwen.py."
+            "Example file to run directly, e.g. examples/run_qwen.py."
         ),
     )
     parser.add_argument(

@@ -132,7 +132,7 @@ From the repository root:
 
 ```bash
 # Collection through the example harness requires --no-use-inductor.
-python examples/test_harness.py ... --profile-and-replay --no-use-inductor
+python examples/run_harness.py ... --profile-and-replay --no-use-inductor
 
 python scripts/profile_and_replay/replay_step_times.py PROFILE.json
 python scripts/profile_and_replay/export_node_profile_ratios.py PROFILE.json

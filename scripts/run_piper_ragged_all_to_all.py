@@ -1,4 +1,4 @@
-"""Two-rank correctness probe for Piper's executor-native ragged EP boundary."""
+"""Run a two-rank correctness probe for Piper's ragged EP boundary."""
 
 import json
 import os

@@ -73,9 +73,9 @@ def main(argv: list[str]) -> int:
         )
         cmd = [
             python_bin,
-            "examples/test_harness.py",
+            "examples/run_harness.py",
             "--test-file",
-            "examples/test_qwen.py",
+            "examples/run_qwen.py",
             "--base-schedule",
             base_schedule,
             "--schedule",

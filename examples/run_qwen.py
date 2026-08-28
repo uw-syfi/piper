@@ -1,4 +1,4 @@
-"""End-to-end Qwen test for the JSON-driven TrainingDAG backend."""
+"""End-to-end Qwen example for the JSON-driven TrainingDAG backend."""
 import hashlib
 
 import ray

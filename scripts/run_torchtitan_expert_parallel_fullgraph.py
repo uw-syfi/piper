@@ -1,9 +1,9 @@
-"""Probe TorchTitan's actual ragged ExpertParallel wrapper under fullgraph.
+"""Run TorchTitan's actual ragged ExpertParallel wrapper under fullgraph.
 
 Run with:
 
     torchrun --standalone --nproc-per-node=2 \
-        scripts/test_torchtitan_expert_parallel_fullgraph.py
+        scripts/run_torchtitan_expert_parallel_fullgraph.py
 
 Unlike ``test_torchtitan_grouped_experts_fullgraph.py``, this includes the
 count exchange, uneven all-to-all dispatch, expert permutation, grouped GEMM,

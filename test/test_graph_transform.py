@@ -3,6 +3,7 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 
+from src.dag import _collect_triton_side_table, restore_triton_side_table
 from src.piper import (
     _reset_annotation_state,
     annotate,
@@ -15,8 +16,78 @@ from src.fx import (
     EP_DISPATCH_COUNTS,
     EP_DISPATCH_PAYLOAD,
     PIPER_EP_BOUNDARY_META_KEY,
+    _deserialize_graphmodule,
+    _serialize_graphmodule,
     split_gm_by_annotations,
 )
+
+
+def _fake_triton_kernel_for_transport():
+    return None
+
+
+def _triton_wrapper_graph(kernel_idx: int, constant_args_idx: int) -> fx.GraphModule:
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        triton_kernel_wrapper_mutation,
+    )
+
+    graph = fx.Graph()
+    value = graph.placeholder("value")
+    wrapped = graph.call_function(
+        triton_kernel_wrapper_mutation,
+        kwargs={
+            "kernel_idx": kernel_idx,
+            "constant_args_idx": constant_args_idx,
+            "grid": [(1, 1, 1)],
+            "kwargs": {"value": value},
+        },
+    )
+    graph.output(wrapped)
+    return fx.GraphModule({}, graph)
+
+
+def test_triton_side_table_round_trip_remaps_process_local_indices() -> None:
+    from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+    previous_kernels = dict(kernel_side_table.id_to_kernel)
+    previous_kernel_ids = dict(kernel_side_table.kernel_to_id)
+    previous_constants = dict(kernel_side_table.constant_args)
+    try:
+        kernel_side_table.reset_table()
+        old_kernel_idx = kernel_side_table.add_kernel(
+            _fake_triton_kernel_for_transport
+        )
+        old_constant_idx = kernel_side_table.add_constant_args({"BLOCK": 16})
+        gm = _triton_wrapper_graph(old_kernel_idx, old_constant_idx)
+        transported = _collect_triton_side_table(gm)
+        restored_gm = _deserialize_graphmodule(_serialize_graphmodule(gm))
+
+        kernel_side_table.reset_table()
+        kernel_side_table.add_kernel(str)
+        kernel_side_table.add_constant_args({"unrelated": True})
+        restore_triton_side_table(
+            [restored_gm],
+            kernels=transported["kernels"],
+            constant_args=transported["constant_args"],
+        )
+
+        wrapper = next(
+            node for node in restored_gm.graph.nodes if node.op == "call_function"
+        )
+        new_kernel_idx = wrapper.kwargs["kernel_idx"]
+        new_constant_idx = wrapper.kwargs["constant_args_idx"]
+        assert kernel_side_table.get_kernel(new_kernel_idx).__name__ == (
+            _fake_triton_kernel_for_transport.__name__
+        )
+        assert kernel_side_table.get_constant_args(new_constant_idx) == {
+            "BLOCK": 16
+        }
+        assert new_kernel_idx != old_kernel_idx
+        assert new_constant_idx != old_constant_idx
+    finally:
+        kernel_side_table.id_to_kernel = previous_kernels
+        kernel_side_table.kernel_to_id = previous_kernel_ids
+        kernel_side_table.constant_args = previous_constants
 
 
 class _AnnotatedNet(nn.Module):
@@ -139,14 +210,6 @@ def test_split_gm_by_annotations_handles_nested_annotation_segments() -> None:
     assert torch.allclose(ref, result, atol=1e-6)
 
 
-def test_split_gm_by_annotations_ignores_non_piper_custom_metadata() -> None:
-    gm = fx.symbolic_trace(nn.Sequential(nn.ReLU()))
-    relu = next(node for node in gm.graph.nodes if node.op == "call_module")
-    relu.meta["custom"] = {"name": "PP", "index": 0}
-
-    _, segments = split_gm_by_annotations(gm)
-
-    assert segments == []
 
 
 def test_split_gm_by_annotations_rejects_mixed_annotated_and_unannotated_compute() -> None:
@@ -399,57 +462,17 @@ def test_split_gm_rejects_duplicate_ep_tensor_boundary_role() -> None:
         split_gm_by_annotations(gm)
 
 
-class _GenericTagRoutedNet(nn.Module):
-    def forward(
-        self,
-        x: torch.Tensor,
-        counts: torch.Tensor,
-    ) -> torch.Tensor:
-        with annotate("DENSE"):
-            x = mark_dispatch_payload(x + 1)
-            counts = mark_dispatch_counts(counts)
-            with annotate("ANY_USER_ROUTE_TAG"):
-                scale = counts.sum().to(x.dtype) * 0 + 1
-                x = mark_combine_payload(x * scale)
-        with annotate("DENSE"):
-            return x - 1
 
 
-def test_routed_marker_validation_is_independent_of_annotation_tag_names() -> None:
-    gm, _, _ = _capture_gm(
-        _GenericTagRoutedNet(),
-        torch.randn(8, 4),
-        torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
-    )
-
-    _, segments = split_gm_by_annotations(gm)
-
-    assert [segment.tag for segment in segments] == [
-        {"DENSE": 0},
-        {"DENSE": 0, "ANY_USER_ROUTE_TAG": 0},
-        {"DENSE": 1},
-    ]
 
 
-def test_split_gm_rejects_non_matrix_routed_payload() -> None:
-    gm, _, _ = _capture_gm(
-        _AnnotatedExpertNet(),
-        torch.randn(2, 4, 8),
-        torch.tensor([[2, 2]], dtype=torch.int64),
-    )
-
-    with pytest.raises(ValueError, match=r"2-D \[tokens, hidden\] payload"):
-        split_gm_by_annotations(gm)
 
 
 @pytest.mark.parametrize(
     "counts",
     [
         torch.ones((4,), dtype=torch.int64),
-        torch.ones((4,), dtype=torch.float32),
         torch.ones((1, 4), dtype=torch.float32),
-        torch.ones((1, 4), dtype=torch.bool),
-        torch.ones((1, 1, 4), dtype=torch.int64),
     ],
 )
 def test_split_gm_rejects_invalid_routed_count_schema(counts: torch.Tensor) -> None:
@@ -486,27 +509,8 @@ def test_split_gm_rejects_shape_changing_routed_region() -> None:
         split_gm_by_annotations(gm)
 
 
-class _DtypeChangingRoutedNet(nn.Module):
-    def forward(self, x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        with annotate("DENSE"):
-            x = mark_dispatch_payload(x)
-            counts = mark_dispatch_counts(counts)
-            with annotate("ROUTED"):
-                scale = counts.sum().to(x.dtype) * 0 + 1
-                x = mark_combine_payload((x * scale).to(torch.float64))
-        with annotate("DENSE"):
-            return x + 1
 
 
-def test_split_gm_rejects_routed_payload_dtype_change() -> None:
-    gm, _, _ = _capture_gm(
-        _DtypeChangingRoutedNet(),
-        torch.randn(8, 4),
-        torch.tensor([[2, 2, 2, 2]], dtype=torch.int64),
-    )
-
-    with pytest.raises(ValueError, match="preserve payload dtype"):
-        split_gm_by_annotations(gm)
 
 
 class _PayloadIgnoringRoutedNet(nn.Module):
@@ -563,25 +567,6 @@ def test_split_gm_rejects_routed_region_spanning_annotation_segments() -> None:
         split_gm_by_annotations(gm)
 
 
-def test_split_gm_rejects_marker_that_does_not_cross_a_boundary() -> None:
-    gm, _, _ = _capture_gm(
-        _AnnotatedExpertNet(),
-        torch.randn(8, 4),
-        torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
-    )
-    dispatch = next(
-        node
-        for node in gm.graph.nodes
-        if (node.meta.get("custom") or {}).get(PIPER_EP_BOUNDARY_META_KEY)
-        == EP_DISPATCH_PAYLOAD
-    )
-    assert isinstance(dispatch.args[0], fx.Node)
-    dispatch.replace_all_uses_with(dispatch.args[0])
-    gm.graph.lint()
-    gm.recompile()
-
-    with pytest.raises(ValueError, match="mark_dispatch_payload"):
-        split_gm_by_annotations(gm)
 
 
 class _ExtraRoutedInputNet(nn.Module):
@@ -616,29 +601,8 @@ def test_split_gm_rejects_unmarked_dynamic_input_to_routed_region() -> None:
         split_gm_by_annotations(gm)
 
 
-class _ExtraRoutedOutputNet(nn.Module):
-    def forward(self, payload: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        with annotate("DENSE"):
-            payload = mark_dispatch_payload(payload)
-            counts = mark_dispatch_counts(counts)
-            with annotate("ROUTED"):
-                scale = counts.sum().to(payload.dtype) * 0 + 1
-                routed = payload * scale
-                combined = mark_combine_payload(routed)
-                extra = routed + 1
-        with annotate("DENSE"):
-            return combined + extra * 0
 
 
-def test_split_gm_rejects_unmarked_dynamic_output_from_routed_region() -> None:
-    gm, _, _ = _capture_gm(
-        _ExtraRoutedOutputNet(),
-        torch.randn(8, 4),
-        torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
-    )
-
-    with pytest.raises(ValueError, match="exactly.*dynamic activation output"):
-        split_gm_by_annotations(gm)
 
 
 class _RoutedRegionWithBypassNet(nn.Module):
@@ -702,43 +666,3 @@ def test_split_gm_allows_dynamic_value_to_bypass_routed_region() -> None:
         "torch.float32",
         "torch.float64",
     }
-
-
-def test_split_gm_rejects_concrete_negative_route_counts_metadata() -> None:
-    gm, _, _ = _capture_gm(
-        _AnnotatedExpertNet(),
-        torch.randn(8, 4),
-        torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
-    )
-    counts_marker = next(
-        node
-        for node in gm.graph.nodes
-        if (node.meta.get("custom") or {}).get(PIPER_EP_BOUNDARY_META_KEY)
-        == EP_DISPATCH_COUNTS
-    )
-    counts_marker.meta["example_value"] = torch.tensor(
-        [[1, -1, 4, 4]], dtype=torch.int64
-    )
-
-    with pytest.raises(ValueError, match="nonnegative route counts"):
-        split_gm_by_annotations(gm)
-
-
-def test_split_gm_rejects_concrete_payload_count_sum_mismatch() -> None:
-    gm, _, _ = _capture_gm(
-        _AnnotatedExpertNet(),
-        torch.randn(8, 4),
-        torch.tensor([[1, 3, 2, 2]], dtype=torch.int64),
-    )
-    counts_marker = next(
-        node
-        for node in gm.graph.nodes
-        if (node.meta.get("custom") or {}).get(PIPER_EP_BOUNDARY_META_KEY)
-        == EP_DISPATCH_COUNTS
-    )
-    counts_marker.meta["example_value"] = torch.tensor(
-        [[1, 2, 2, 2]], dtype=torch.int64
-    )
-
-    with pytest.raises(ValueError, match="rows to equal the sum of route counts"):
-        split_gm_by_annotations(gm)

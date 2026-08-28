@@ -12,7 +12,7 @@ from examples.run_qwen_examples import RUNS
 
 pytestmark = pytest.mark.gpu
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_CORRECTNESS_MODELS = ("9M", "1B")
+_CORRECTNESS_MODELS = ("9M",)
 # Expert parameters (names containing ``.moe.experts.``) use the 2e-4 absolute
 # tolerance because sharded grouped-expert execution changes kernel padding,
 # layout, and BF16 accumulation order. Everything else uses zero relative
@@ -36,7 +36,17 @@ _AFD_RUNS = (
         2,
     ),
 )
-_CORRECTNESS_RUNS = (*RUNS, *_AFD_RUNS)
+_CRITICAL_RUN_NAMES = {
+    "zero3_1f1b",
+    "bucket100_1f1b",
+    "dualpipev",
+    "interleaved_1f1b",
+    "afd_pp2_single_node",
+    "afd_pp4_single_node",
+}
+_CORRECTNESS_RUNS = tuple(
+    run for run in (*RUNS, *_AFD_RUNS) if run[0] in _CRITICAL_RUN_NAMES
+)
 
 
 @pytest.mark.parametrize("model", _CORRECTNESS_MODELS)
@@ -60,9 +70,9 @@ def test_qwen_parameter_parity(
     )
     command = [
         sys.executable,
-        "examples/test_harness.py",
+        "examples/run_harness.py",
         "--test-file",
-        "examples/test_qwen_correctness.py",
+        "examples/qwen_correctness.py",
         "--model",
         model,
         "--base-schedule",

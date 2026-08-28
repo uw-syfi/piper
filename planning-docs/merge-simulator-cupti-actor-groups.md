@@ -81,7 +81,7 @@ Resolve the current `origin/simulator` merge by integrating CUPTI/Kineto node pr
    - Update the focused test to use ActorGroup terminology and verify allocation stream, `record_stream`, communicator, one-time averaging, and accumulation together.
 
 6. **Reconcile examples, tests, and independent merge additions.**
-   - In `examples/test_qwen.py`, `examples/test_llama.py`, and `examples/test_harness.py`, retain placement-aware schedule visualization, Ray-safe absolute paths, dynamic-input configuration, and model seeding. Direct trace capture defaults to `2/1`; profile-and-simulate remains `5/30`.
+   - In `examples/run_qwen.py`, `examples/run_llama.py`, and `examples/run_harness.py`, retain placement-aware schedule visualization, Ray-safe absolute paths, dynamic-input configuration, and model seeding. Direct trace capture defaults to `2/1`; profile-and-simulate remains `5/30`.
    - Retain both branches' independent routed-boundary and split-backward/bucketing tests. Recompute the conflicted DAG digest only after confirming the resolved DAG is semantically intended.
    - Audit all auto-merged source and example code for legacy DP identifiers; compatibility-only parsing tests may mention old fields, but live runtime/profile/replay code may not.
 

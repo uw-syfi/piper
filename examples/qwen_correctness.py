@@ -1,4 +1,4 @@
-"""Qwen end-to-end parameter parity test for Piper schedules."""
+"""Qwen end-to-end parameter parity runner for Piper schedules."""
 
 from __future__ import annotations
 

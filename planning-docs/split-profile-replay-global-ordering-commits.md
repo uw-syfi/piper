@@ -198,8 +198,8 @@ Stage the profile/replay portions of:
   `src/runtime.py`.
 - Replay/reporting: `src/simulator.py`, `src/profile_validation.py`,
   `src/profile_statistics.py`, and `src/attribution.py`.
-- Harness/tooling: profile portions of `examples/test_harness.py`,
-  `examples/test_qwen.py`, and `examples/test_llama.py`; reusable files directly
+- Harness/tooling: profile portions of `examples/run_harness.py`,
+  `examples/run_qwen.py`, and `examples/run_llama.py`; reusable files directly
   under `scripts/profile_and_replay/`, including its README, simulator CLI,
   attribution/export tools, and savings visualizer. Exclude `diagnostics/`.
 - Tests: actor/profile timing, profiling, profile validation/statistics,

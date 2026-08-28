@@ -135,8 +135,8 @@ python -m pip install -e .
 From the repository root, run the Qwen example with a DualPipeV schedule:
 
 ```bash
-python examples/test_harness.py \
-  --test-file examples/test_qwen.py \
+python examples/run_harness.py \
+  --test-file examples/run_qwen.py \
   --base-schedule examples/base-schedules/pp4_dp2_ep2_v_placement.json \
   --schedule dualpipev \
   --ranks 2 \
@@ -157,8 +157,8 @@ The harness appends DualPipeV `split` and `order` directives for two physical pi
 Run the Qwen example with PP x ZeRO-3 1F1B schedule:
 
 ```bash
-python examples/test_harness.py \
-  --test-file examples/test_qwen.py \
+python examples/run_harness.py \
+  --test-file examples/run_qwen.py \
   --base-schedule examples/base-schedules/pp2_dp2_ep2_zero3.json \
   --schedule 1f1b \
   --ranks 2 \
@@ -293,7 +293,7 @@ Supported directives:
   * Consecutive filter groups create temporal dependencies from one slot to the next.
   * Multiple filters in the same group permit Piper to interleave those sub-DAGs.
 
-In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/test_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
+In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/run_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
 For more detail, see the blog walkthrough sections on [PP x DP x EP placement](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#generating-directives-with-schedule-builders).
 
 ## Overview of Outputs

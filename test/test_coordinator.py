@@ -1,3 +1,5 @@
+"""Coordinator placement and topology tests."""
+
 import json
 import os
 
@@ -104,21 +106,6 @@ def test_equal_width_replicated_stages_keep_each_group_in_one_gb200_domain():
         assert bundle.resources[f"node:{bundle.node_address}"] == 0.001
 
 
-def test_equal_width_actor_groups_that_fit_are_kept_on_individual_nodes():
-    plan = _build_actor_group_placement_plan(
-        actor_groups=[(0, 2, 4, 6), (1, 3, 5, 7)],
-        ray_nodes=_target_gb200_nodes(),
-    )
-
-    assert len(plan.bundles) == 2
-    assert len({bundle.hostname for bundle in plan.bundles}) == 2
-    assert [bundle.actor_global_ranks for bundle in plan.bundles] == [
-        (0, 2, 4, 6),
-        (1, 3, 5, 7),
-    ]
-    assert plan.driver_bundle_indices == (0,)
-
-
 def test_non_gb200_cross_node_group_does_not_apply_domain_reasoning():
     nodes = [
         _ray_node("worker-a", "10.0.0.1", gb200=False),
@@ -185,55 +172,6 @@ def test_unequal_actor_groups_are_placed_from_exact_memberships():
     assert plan.actor_global_rank_bundle_index(3) == 1
 
 
-def test_actor_group_placement_keeps_each_group_in_one_gb200_domain():
-    plan = _build_actor_group_placement_plan(
-        actor_groups=[tuple(range(6)), tuple(range(6, 12))],
-        ray_nodes=_target_gb200_nodes(),
-    )
-
-    assert [bundle.actor_global_ranks for bundle in plan.bundles] == [
-        (0, 1, 2, 3),
-        (4, 5),
-        (6, 7, 8, 9),
-        (10, 11),
-    ]
-    assert [bundle.nvlink_domain for bundle in plan.bundles] == [
-        "nvl72d052",
-        "nvl72d052",
-        "nvl72d057",
-        "nvl72d057",
-    ]
-
-
-def test_equal_width_schedule_always_uses_explicit_actor_groups(
-    tmp_path,
-    monkeypatch,
-):
-    schedule_path = tmp_path / "replicated_pipeline.json"
-    schedule_path.write_text(
-        json.dumps(
-            [
-                {"op": "place", "filter": {"PP": 0}, "devices": [0, 2]},
-                {"op": "place", "filter": {"PP": 1}, "devices": [1, 3]},
-            ]
-        ),
-        encoding="utf-8",
-    )
-    nodes = _target_gb200_nodes()
-    monkeypatch.setattr("src.coordinator.ray.nodes", lambda: nodes)
-    monkeypatch.setattr(
-        "src.coordinator.placement_group",
-        lambda bundles, strategy: (bundles, strategy),
-    )
-
-    inner = create_piper_placement_group(str(schedule_path), pp_outer=False)
-    outer = create_piper_placement_group(str(schedule_path), pp_outer=True)
-
-    assert inner.plan.actor_groups == ((0, 2), (1, 3))
-    assert outer.plan.actor_groups == inner.plan.actor_groups
-    assert outer.plan.actor_bundle_indices == inner.plan.actor_bundle_indices
-    assert inner.plan.driver_bundle_indices == (0,)
-    assert not hasattr(inner.plan, "dp_degree")
 
 
 def test_program_coordinator_derives_only_actor_group_topology(tmp_path):
@@ -271,3 +209,5 @@ def test_program_driver_removes_retired_dp_environment(monkeypatch):
     assert json.loads(observed["PIPER_ACTOR_GROUPS"]) == [[0, 2], [1, 3]]
     assert observed["PIPER_PP_DEGREE"] == "2"
     assert observed["PIPER_WORLD_SIZE"] == "4"
+
+

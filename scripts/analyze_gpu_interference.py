@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize cross-stream GPU overlap across all DP-rank traces in one run.
 
-The input is an output directory produced by ``examples/test_harness.py``.
+The input is an output directory produced by ``examples/run_harness.py``.
 Every ``pytorch_profile_*_dprank*.json`` trace directly inside that directory
 is analyzed. The report pools every qualifying event from every GPU and DP
 rank; no per-GPU or low-count statistics are excluded.
@@ -71,7 +71,7 @@ def gpu_pids(events: list[dict[str, Any]]) -> list[object]:
 def pp_rank_by_pid(events: list[dict[str, Any]], pids: list[object]) -> dict[object, int]:
     """Resolve merged-trace GPU processes to their PP/GPU rank.
 
-    ``examples/test_harness.py`` prefixes ``process_name`` metadata with the
+    ``examples/run_harness.py`` prefixes ``process_name`` metadata with the
     DP and PP rank while merging actor traces. Each GPU process can therefore
     be matched to the PP rank that owns the corresponding local GPU.
     """

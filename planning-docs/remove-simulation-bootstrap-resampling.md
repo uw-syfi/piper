@@ -118,7 +118,7 @@ normal/IF iteration pairing. Retain medians only as secondary diagnostics.
      without changing its capture-integrity or validation policy.
 
 4. Update profile-and-simulate serialization and tabular reporting.
-   - In `examples/test_harness.py`, emit normal/IF mean, sample SD, Student-t
+   - In `examples/run_harness.py`, emit normal/IF mean, sample SD, Student-t
      bounds, median diagnostics, paired absolute savings, ratio-of-means
      percentage savings, and its delta-method bounds; remove simulator
      bootstrap-CI and per-iteration-percentage fields.
@@ -168,7 +168,7 @@ normal/IF iteration pairing. Retain medians only as secondary diagnostics.
    mean endpoint objective and remains additive to the reported absolute
    savings.
 
-4. Add or extend focused output tests for `examples/test_harness.py` and the
+4. Add or extend focused output tests for `examples/run_harness.py` and the
    offline `scripts/profile_and_replay/simulate_step_times.py` serializer to
    assert matching fields, values, unavailable one-sample intervals, and the
    absence of bootstrap/per-iteration-percentage result fields.

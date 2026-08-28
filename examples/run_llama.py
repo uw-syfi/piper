@@ -1,4 +1,4 @@
-"""End-to-end LLaMA test for the JSON-driven TrainingDAG backend."""
+"""End-to-end LLaMA example for the JSON-driven TrainingDAG backend."""
 import argparse
 import os
 import time

@@ -79,8 +79,8 @@ fi
 python /workspace/artifact/scripts/make_piper_base_schedule.py "${BASE_ARGS[@]}"
 
 HARNESS_ARGS=(
-    examples/test_harness.py
-    --test-file examples/test_qwen.py
+    examples/run_harness.py
+    --test-file examples/run_qwen.py
     --base-schedule "$BASE_SCHEDULE"
     --schedule "$HARNESS_SCHEDULE"
     --ranks "$PP"

@@ -97,6 +97,6 @@ Outputs are written under `artifact/out/e2e-eval/<run_id>/`:
   Qwen3 MoE eval configs, mesh ordering, timing/memory logs, dataset retry
   behavior, and small runtime compatibility fixes.
 - The piper runner invokes the current tracked entrypoint:
-  `examples/test_harness.py --test-file examples/test_qwen.py`.
+  `examples/run_harness.py --test-file examples/run_qwen.py`.
 - Piper base schedules are generated per experiment, so the artifact is not
   limited to the checked-in `examples/base-schedules/*.json` files.
