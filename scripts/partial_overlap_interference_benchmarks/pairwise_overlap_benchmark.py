@@ -76,9 +76,15 @@ class MultiCase:
 
 @dataclass(frozen=True)
 class PPOuterTopology:
-    """PP=2 outer, DP=EP=8 inner, on two eight-GPU nodes."""
+    """PP-outer topology with DP=EP=8 on one or two eight-GPU nodes.
 
-    node_ips: tuple[str, str]
+    ``physical_pp=1`` is the single-node projection used when every selected
+    pair is composed only of within-node collectives and compute.  The traced
+    PP coordinate remains attached to each participant as provenance, while
+    runtime placement maps its DP/EP rank onto the sole local node.
+    """
+
+    node_ips: tuple[str, ...]
     gpus_per_node: int = 8
     physical_pp: int = 2
     dp: int = 8
@@ -107,21 +113,22 @@ class PPOuterTopology:
         return self.node_ips[self.physical_pp_rank(global_rank)]
 
     @property
-    def dp_groups(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        groups = tuple(
+    def dp_groups(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(
             tuple(self.global_rank(dp_rank, pp_rank) for dp_rank in range(self.dp))
             for pp_rank in range(self.physical_pp)
         )
-        return (groups[0], groups[1])
 
     @property
-    def ep_groups(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def ep_groups(self) -> tuple[tuple[int, ...], ...]:
         # The traced schedule has DP8 and EP8 over the same physical actors but
         # uses distinct communicators and streams.
         return self.dp_groups
 
     @property
     def pp_pairs(self) -> tuple[tuple[int, int], ...]:
+        if self.physical_pp != 2:
+            return ()
         return tuple(
             (
                 self.global_rank(dp_rank, 0),
@@ -132,7 +139,11 @@ class PPOuterTopology:
 
     def rank_record(self, global_rank: int) -> dict[str, Any]:
         pp_rank = self.physical_pp_rank(global_rank)
-        logical_pp = (0, 3) if pp_rank == 0 else (1, 2)
+        logical_pp = (
+            (0, 1, 2, 3)
+            if self.physical_pp == 1
+            else ((0, 3) if pp_rank == 0 else (1, 2))
+        )
         return {
             "global_rank": global_rank,
             "physical_pp_rank": pp_rank,
@@ -144,10 +155,18 @@ class PPOuterTopology:
         }
 
     def validate(self) -> None:
-        if len(self.node_ips) != 2 or len(set(self.node_ips)) != 2:
-            raise ValueError("PP-outer topology requires two distinct node IPs")
+        if self.physical_pp not in {1, 2}:
+            raise ValueError("physical PP must be one or two")
+        if (
+            len(self.node_ips) != self.physical_pp
+            or len(set(self.node_ips)) != self.physical_pp
+        ):
+            raise ValueError(
+                "PP-outer topology requires one distinct node IP per "
+                "physical PP partition"
+            )
         if self.gpus_per_node != 8 or self.dp != 8 or self.ep != 8:
-            raise ValueError("trace topology is fixed at two nodes and DP=EP=8")
+            raise ValueError("trace topology is fixed at eight GPUs and DP=EP=8")
         expected = set(range(self.world_size))
         for label, groups in (("DP", self.dp_groups), ("EP", self.ep_groups)):
             flattened = [rank for group in groups for rank in group]

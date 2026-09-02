@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run trace-exact pairwise overlap cases on the PP2 x DP/EP8 topology.
 
-The runner consumes the exact kernel execution matrix and extracted ragged-A2A
-split matrices.  Every distributed operation launches all required endpoints,
-uses a distinct trace-role CUDA stream, and retains per-rank completion data.
+The runner consumes the exact kernel execution matrix. A2A uses the fixed
+balanced 384-MiB/rank contract shared by the normal and Zero-CTA backends.
+Every distributed operation launches all required endpoints, uses a distinct
+trace-role CUDA stream, and retains per-rank completion data.
 It is intentionally separate from the report generator: its output is the raw
 timing/correctness corpus used to build the suite CSV tables and figures.
 """
@@ -64,9 +65,22 @@ from scripts.partial_overlap_interference_benchmarks.pairwise_overlap_trace_kern
     make_bf16_add,
     make_swiglu_backward,
 )
+from scripts.partial_overlap_interference_benchmarks.sm_free_collectives.pairwise_overlap.collective_backends import (
+    CollectiveBackendSelection,
+    build_selection as build_collective_backend_selection,
+    collective_backend_worker_environment,
+    configured_zero_cta_environment,
+    create_plugin_buffers,
+    create_plugin_operation,
+    prepare_collective_backend_worker_process,
+    wait_for_result,
+)
 
 
 BASE_SEQ = 12_288
+BALANCED_A2A_BASE_NUMEL = 201_326_592
+BALANCED_A2A_GROUP_SIZE = 8
+MATCHED_PAYLOAD_CATEGORIES = ("a2a", "ag")
 KERNEL_TO_COMPUTE = {
     "K-ff832373130e": "vocab_projection_gemm",
     "K-28e33c0c27e1": "expert_grouped_gemm",
@@ -133,6 +147,7 @@ def implementation_paths() -> list[Path]:
         _PACKAGE_ROOT / "pairwise_overlap_trace_kernels.py",
         _PACKAGE_ROOT / "pairwise_overlap_restart.py",
         _PACKAGE_ROOT / "runtime_health.py",
+        _PACKAGE_ROOT / "sm_free_collectives/pairwise_overlap/collective_backends.py",
     ]
 
 
@@ -164,6 +179,25 @@ def validate_worker_implementation_provenance(
     return {
         "worker_implementation_sha256": dict(expected),
         "worker_implementation_source_match": True,
+    }
+
+
+def validate_worker_collective_backend_selection(
+    placements: list[dict[str, Any]],
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed unless all actors received the driver's exact selection."""
+
+    if not placements or any(
+        row.get("collective_backend_selection") != expected
+        for row in placements
+    ):
+        raise RuntimeError(
+            "driver/worker collective backend selections differ across Ray actors"
+        )
+    return {
+        "worker_collective_backend_selection": expected,
+        "worker_collective_backend_selection_match": True,
     }
 
 
@@ -534,10 +568,7 @@ def focal_start_gap_ms(
 
     starts: dict[int, int] = {}
     for index, participant in enumerate(participants):
-        focal_rank = (
-            int(participant["focal_dp_rank"]) * 2
-            + int(participant["focal_pp_rank"])
-        )
+        focal_rank = participant_focal_global_rank(participant)
         matches = [
             row for row in rows
             if int(row["operation_index"]) == index
@@ -818,8 +849,7 @@ def execute_runtime_start_anchor(
     )
     confirmation_clock_provenance = common_clock_provenance(confirmation_rows)
     focal_ranks = {
-        index: int(participant["focal_dp_rank"]) * 2
-        + int(participant["focal_pp_rank"])
+        index: participant_focal_global_rank(participant)
         for index, participant in enumerate(participants)
     }
     preliminary_focal_rows = [
@@ -2212,10 +2242,7 @@ def measure_runtime_geometry(
         raise ValueError("isolated victim duration must be positive")
     operation_intervals_ns: dict[int, tuple[int, int]] = {}
     for index, participant in enumerate(participants):
-        focal_rank = (
-            int(participant["focal_dp_rank"]) * 2
-            + int(participant["focal_pp_rank"])
-        )
+        focal_rank = participant_focal_global_rank(participant)
         matches = [
             row for row in rows
             if int(row["operation_index"]) == index
@@ -2614,6 +2641,66 @@ def build_overlap_stage_specs(
     return stage_specs
 
 
+def build_zero_gap_order_specs(
+    participants: list[dict[str, Any]],
+    isolated_estimates_ms: dict[int, float],
+    isolated_gate_to_start_ms: dict[int, float],
+) -> list[dict[str, Any]]:
+    """Build the two back-to-back launch orders with no configured delay."""
+
+    if len(participants) != 2:
+        raise ValueError("zero-gap order mode requires exactly two participants")
+    expected = {0, 1}
+    if set(isolated_estimates_ms) != expected:
+        raise ValueError("zero-gap order mode requires two isolated durations")
+    if set(isolated_gate_to_start_ms) != expected:
+        raise ValueError("zero-gap order mode requires two gate-to-start values")
+    if any(value <= 0.0 for value in isolated_estimates_ms.values()):
+        raise ValueError("zero-gap order mode requires positive durations")
+
+    delays_ms = {0: 0.0, 1: 0.0}
+    specs = []
+    for order in ([0, 1], [1, 0]):
+        first, second = order
+        victim_ms = isolated_estimates_ms[first]
+        predicted_overlap_pct = min(
+            100.0, isolated_estimates_ms[second] / victim_ms * 100.0
+        )
+        specs.append({
+            "mode": f"zero_gap_order_{first}_then_{second}",
+            "experiment_mode": "zero_intentional_gap_launch_order_only",
+            "victim_index": first,
+            "aggressor_indices": [second],
+            "dispatch_mode": "victim_first",
+            "requested_overlap_pct": predicted_overlap_pct,
+            "requested_overlap_semantics": (
+                "not_prescribed; predicted value exists only for raw-schema "
+                "compatibility"
+            ),
+            "predicted_max_overlap_pct": predicted_overlap_pct,
+            "predicted_scheduled_overlap_pct": predicted_overlap_pct,
+            "predicted_constraint_error_pct": 0.0,
+            "isolated_estimates_ms": dict(isolated_estimates_ms),
+            "isolated_gate_to_start_ms": dict(isolated_gate_to_start_ms),
+            "natural_group_offsets_ms": {0: 0.0, 1: 0.0},
+            "aggressor_span_ms": isolated_estimates_ms[second],
+            "duration_feasibility_tolerance_pct_points": None,
+            "duration_feasibility_formula": "not_applicable_order_only",
+            "target_feasible_from_duration": True,
+            "dispatch_order_projection_feasible": True,
+            "target_feasible_after_constraints": True,
+            "target_feasible_from_isolated": True,
+            "order": list(order),
+            "delays_ms": dict(delays_ms),
+            "desired_gpu_starts_ms": dict(delays_ms),
+            "predicted_gpu_starts_ms": dict(delays_ms),
+            "unconstrained_host_delays_ms": dict(delays_ms),
+            "host_delay_origin_shift_ms": 0.0,
+            "order_clamped_indices": [],
+        })
+    return specs
+
+
 def parse_event_id(event_id: str) -> tuple[int, int, int]:
     fields = event_id.split(".")
     if len(fields) < 4:
@@ -2625,10 +2712,22 @@ def _participant_id(participant: dict[str, Any]) -> str:
     return f"{participant['event_id']}:{participant['kernel_alias']}"
 
 
+def participant_focal_global_rank(participant: dict[str, Any]) -> int:
+    return (
+        int(participant["focal_dp_rank"])
+        * int(participant.get("runtime_physical_pp", 2))
+        + int(participant["focal_pp_rank"])
+    )
+
+
 def load_cases(
     matrix_path: Path,
     requested: list[str],
+    *,
+    runtime_physical_pp: int = 2,
 ) -> list[dict[str, Any]]:
+    if runtime_physical_pp not in {1, 2}:
+        raise ValueError("runtime physical PP must be one or two")
     matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
     result = []
     for token in requested:
@@ -2652,7 +2751,9 @@ def load_cases(
                 {
                     "participant_id": _participant_id(item),
                     "focal_dp_rank": dp_rank,
-                    "focal_pp_rank": pp_rank,
+                    "trace_focal_pp_rank": pp_rank,
+                    "focal_pp_rank": 0 if runtime_physical_pp == 1 else pp_rank,
+                    "runtime_physical_pp": runtime_physical_pp,
                     "profiler_iteration": iteration,
                 }
             )
@@ -2745,14 +2846,90 @@ def scale_split_matrix(profile: dict[str, Any], seq_len: int) -> dict[int, dict[
     return result
 
 
+def balanced_a2a_numel(seq_len: int) -> int:
+    """Scale the fixed equal-split A2A payload and preserve eight-way divisibility."""
+
+    numel = int(round(BALANCED_A2A_BASE_NUMEL * seq_len / BASE_SEQ))
+    if numel <= 0 or numel % BALANCED_A2A_GROUP_SIZE:
+        raise ValueError(
+            "balanced A2A payload must be positive and divisible by eight: "
+            f"seq_len={seq_len}, numel={numel}"
+        )
+    return numel
+
+
+def collective_payload_overrides(args: argparse.Namespace) -> dict[str, int]:
+    """Return validated per-rank input-element overrides for communication kernels."""
+
+    values = {
+        "a2a": args.a2a_input_numel,
+        "ag": args.ag_input_numel,
+    }
+    result = {
+        category: int(value)
+        for category, value in values.items()
+        if value is not None
+    }
+    for category, value in result.items():
+        if value <= 0:
+            raise ValueError(f"--{category.replace('_', '-')}-input-numel must be positive")
+        if category == "a2a" and value % BALANCED_A2A_GROUP_SIZE:
+            raise ValueError(
+                f"--{category}-input-numel must be divisible by eight: {value}"
+            )
+    return result
+
+
+def apply_collective_payload_overrides(
+    assignments: list[dict[str, Any]], overrides: dict[str, int],
+) -> None:
+    """Apply runtime payload overrides without changing the pinned source matrix."""
+
+    unexpected = sorted(set(overrides) - set(MATCHED_PAYLOAD_CATEGORIES))
+    if unexpected:
+        raise ValueError(f"unsupported collective payload overrides: {unexpected}")
+    for assignment in assignments:
+        for participant in assignment["participants"]:
+            category = str(participant["category"])
+            if category not in overrides:
+                continue
+            signature = dict(participant["signature"])
+            input_numel = int(overrides[category])
+            output_numel = {
+                "a2a": input_numel,
+                "ag": input_numel * BALANCED_A2A_GROUP_SIZE,
+            }[category]
+            participant["payload_override"] = {
+                "reason": "isolated_runtime_matched_to_fixed_grouped_gemm",
+                "category": category,
+                "original_input_numel": int(signature["in_msg_nelems"]),
+                "original_output_numel": int(signature["out_msg_nelems"]),
+                "runtime_input_numel": input_numel,
+                "runtime_output_numel": output_numel,
+                "dtype": str(signature["dtype"]),
+            }
+            signature["in_msg_nelems"] = input_numel
+            signature["out_msg_nelems"] = output_numel
+            participant["signature"] = signature
+
+
 class PairwiseOverlapRank:
     """Fresh one-GPU process with all topology communicators."""
 
-    def __init__(self, global_rank: int, expected_node_ip: str) -> None:
+    def __init__(
+        self,
+        global_rank: int,
+        expected_node_ip: str,
+        collective_backend_selection: dict[str, Any],
+    ) -> None:
         self.environment_audit = sanitize_nccl_environment(
             phase=f"pairwise_worker_rank_{global_rank}_before_torch_import"
         )
         assert_default_nccl_environment()
+        selection = CollectiveBackendSelection.from_dict(
+            collective_backend_selection
+        )
+        prepare_collective_backend_worker_process(selection)
         import ray
         import torch
 
@@ -2760,7 +2937,23 @@ class PairwiseOverlapRank:
         self.torch = torch
         self.global_rank = global_rank
         self.expected_node_ip = expected_node_ip
-        torch.cuda.set_device(0)
+        self.collective_backend_selection = selection
+        self.assigned_gpu_index = parse_assigned_gpu_index(
+            list(ray.get_gpu_ids())
+        )
+        use_physical_cuda_ordinal = (
+            os.environ.get("PIPER_USE_PHYSICAL_CUDA_ORDINAL") == "1"
+        )
+        if use_physical_cuda_ordinal and self.assigned_gpu_index is None:
+            raise RuntimeError(
+                "physical CUDA ordinal mode requires one integral Ray GPU ID"
+            )
+        self.cuda_device_index = (
+            int(self.assigned_gpu_index)
+            if use_physical_cuda_ordinal
+            else 0
+        )
+        torch.cuda.set_device(self.cuda_device_index)
         self.node_id = ray.get_runtime_context().get_node_id()
         self.node_ip = ray.util.get_node_ip_address()
         self.clock_offset_ns = 0
@@ -2769,14 +2962,12 @@ class PairwiseOverlapRank:
         self.clock_calibration_current = None
         self.clock_calibration_history: list[dict[str, Any]] = []
         self.initialized = False
-        self.assigned_gpu_index = parse_assigned_gpu_index(
-            list(ray.get_gpu_ids())
-        )
         self.runtime_health_collector = None
         self.runtime_health_initialization_error = None
+        self.runtime_physical_pp = None
 
     def metadata(self) -> dict[str, Any]:
-        props = self.torch.cuda.get_device_properties(0)
+        props = self.torch.cuda.get_device_properties(self.cuda_device_index)
         clock_metadata = (
             {}
             if self.clock_calibration_current is None
@@ -2790,6 +2981,8 @@ class PairwiseOverlapRank:
             "hostname": socket.gethostname(),
             "ray_gpu_ids": [str(value) for value in self.ray.get_gpu_ids()],
             "runtime_health_assigned_nvml_index": self.assigned_gpu_index,
+            "cuda_device_index": self.cuda_device_index,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "cuda_name": props.name,
             "cuda_total_memory": props.total_memory,
             "cuda_sm_count": props.multi_processor_count,
@@ -2799,6 +2992,9 @@ class PairwiseOverlapRank:
             "environment_audit": self.environment_audit,
             "effective_nccl_overrides": nccl_behavior_environment(),
             "retained_nccl_debug_variables": nccl_debug_environment(),
+            "collective_backend_selection": (
+                self.collective_backend_selection.to_dict()
+            ),
             "imported_worker_implementation_sha256": (
                 implementation_sha256()
             ),
@@ -2860,6 +3056,7 @@ class PairwiseOverlapRank:
             dp=int(topology["dp"]),
             ep=int(topology["ep"]),
         )
+        self.runtime_physical_pp = topo.physical_pp
         dist.init_process_group(
             "gloo",
             init_method=f"tcp://{master_addr}:{master_port}",
@@ -2948,7 +3145,7 @@ class PairwiseOverlapRank:
         return dict(self.clock_calibration_current)
 
     def _compute(self, participant: dict[str, Any], seq_len: int) -> dict[str, Any] | None:
-        if self.global_rank != participant["focal_dp_rank"] * 2 + participant["focal_pp_rank"]:
+        if self.global_rank != participant_focal_global_rank(participant):
             return None
         torch = self.torch
         alias = participant["kernel_alias"]
@@ -3138,18 +3335,46 @@ class PairwiseOverlapRank:
         category = participant["category"]
         focal_dp = participant["focal_dp_rank"]
         focal_pp = participant["focal_pp_rank"]
-        local_dp = self.global_rank // 2
-        local_pp = self.global_rank % 2
+        if self.runtime_physical_pp is None:
+            raise RuntimeError("actor topology is not initialized")
+        local_dp = self.global_rank // self.runtime_physical_pp
+        local_pp = self.global_rank % self.runtime_physical_pp
         signature = participant["signature"]
         dtype = {"BFloat16": torch.bfloat16, "Float": torch.float32}[signature["dtype"]]
         owned = []
+        allocation_metadata: dict[str, Any] = {}
+        plugin_context: dict[str, Any]
+        backend_spec = self.collective_backend_selection.for_category(category)
         if category in {"ag", "rs", "a2a"} and local_pp != focal_pp:
             return None
         if category == "ag":
             input_numel = int(signature["in_msg_nelems"])
-            source = torch.full((input_numel,), local_dp + 1, dtype=dtype, device="cuda")
-            output = torch.empty((input_numel * 8,), dtype=dtype, device="cuda")
-            owned = [source, output]
+            allocation = (
+                None
+                if backend_spec is None
+                else create_plugin_buffers(
+                    backend_spec,
+                    {
+                        "family": "all_gather",
+                        "torch": torch,
+                        "group_rank": local_dp,
+                        "group_size": 8,
+                        "source_numel": input_numel,
+                        "output_numel": input_numel * 8,
+                        "dtype": dtype,
+                    },
+                )
+            )
+            if allocation is None:
+                source = torch.empty((input_numel,), dtype=dtype, device="cuda")
+                output = torch.empty((input_numel * 8,), dtype=dtype, device="cuda")
+                owned = [source, output]
+            else:
+                source = allocation["source"]
+                output = allocation["output"]
+                owned = list(allocation["owned"])
+                allocation_metadata = dict(allocation["metadata"])
+            source.fill_(local_dp + 1)
 
             def launch() -> Any:
                 return dist.all_gather_into_tensor(
@@ -3158,7 +3383,26 @@ class PairwiseOverlapRank:
 
             def validate() -> bool:
                 return all(float(output[index * input_numel].item()) == index + 1 for index in range(8))
-            runtime = {"input_numel": input_numel, "output_numel": input_numel * 8}
+            runtime = {
+                "input_numel": input_numel,
+                "output_numel": input_numel * 8,
+                **allocation_metadata,
+            }
+            plugin_context = {
+                "family": "all_gather",
+                "category": category,
+                "torch": torch,
+                "dist": dist,
+                "participant": participant,
+                "global_rank": self.global_rank,
+                "group_rank": local_dp,
+                "group_size": 8,
+                "group": self.dp_groups[focal_pp],
+                "source": source,
+                "output": output,
+                "input_numel": input_numel,
+                "dtype": dtype,
+            }
         elif category == "rs":
             input_numel = int(signature["in_msg_nelems"])
             if input_numel % 8:
@@ -3175,22 +3419,45 @@ class PairwiseOverlapRank:
             def validate() -> bool:
                 return float(output[0].item()) == 36.0
             runtime = {"input_numel": input_numel, "output_numel": input_numel // 8}
+            plugin_context = {}
         elif category == "a2a":
-            if a2a_profile is None:
-                raise ValueError(f"missing A2A profile for {participant['event_id']}")
-            scaled = scale_split_matrix(a2a_profile, seq_len)[local_dp]
-            input_rows = scaled["input_split_rows"]
-            output_rows = scaled["output_split_rows"]
-            dim = MODEL_CONFIG["dim"]
-            source_chunks = [
-                torch.full((rows * dim,), local_dp, dtype=dtype, device="cuda")
-                for rows in input_rows
-            ]
-            source = torch.cat(source_chunks)
-            output = torch.empty((scaled["output_numel"],), dtype=dtype, device="cuda")
-            owned = [source, output, *source_chunks]
-            input_splits = [rows * dim for rows in input_rows]
-            output_splits = [rows * dim for rows in output_rows]
+            input_numel = (
+                int(signature["in_msg_nelems"])
+                if "payload_override" in participant
+                else balanced_a2a_numel(seq_len)
+            )
+            peer_numel = input_numel // 8
+            input_splits = [peer_numel] * 8
+            output_splits = [peer_numel] * 8
+            allocation = (
+                None
+                if backend_spec is None
+                else create_plugin_buffers(
+                    backend_spec,
+                    {
+                        "family": "balanced_a2a",
+                        "torch": torch,
+                        "group_rank": local_dp,
+                        "group_size": 8,
+                        "source_numel": input_numel,
+                        "output_numel": input_numel,
+                        "dtype": dtype,
+                    },
+                )
+            )
+            if allocation is None:
+                source = torch.empty((input_numel,), dtype=dtype, device="cuda")
+                output = torch.empty((input_numel,), dtype=dtype, device="cuda")
+                owned = [source, output]
+            else:
+                source = allocation["source"]
+                output = allocation["output"]
+                owned = list(allocation["owned"])
+                allocation_metadata = dict(allocation["metadata"])
+            for destination in range(8):
+                source[
+                    destination * peer_numel : (destination + 1) * peer_numel
+                ].fill_(local_dp)
 
             def launch() -> Any:
                 return dist.all_to_all_single(
@@ -3207,7 +3474,40 @@ class PairwiseOverlapRank:
                         return False
                     offset += count
                 return True
-            runtime = scaled
+            runtime = {
+                "a2a_semantics": "balanced_equal_split",
+                "input_numel": input_numel,
+                "output_numel": input_numel,
+                "peer_numel": peer_numel,
+                "input_split_sizes": input_splits,
+                "output_split_sizes": output_splits,
+                "base_sequence_length": BASE_SEQ,
+                "base_input_bytes_per_rank_bf16": (
+                    BALANCED_A2A_BASE_NUMEL * 2
+                ),
+                "base_peer_bytes_bf16": (
+                    BALANCED_A2A_BASE_NUMEL * 2 // 8
+                ),
+                "trace_event_id_retained_for_case_identity": participant["event_id"],
+                "ragged_profile_used_for_routing": False,
+                **allocation_metadata,
+            }
+            plugin_context = {
+                "family": "balanced_a2a",
+                "category": category,
+                "torch": torch,
+                "dist": dist,
+                "participant": participant,
+                "global_rank": self.global_rank,
+                "group_rank": local_dp,
+                "group_size": 8,
+                "group": self.ep_groups[focal_pp],
+                "source": source,
+                "output": output,
+                "input_split_sizes": input_splits,
+                "output_split_sizes": output_splits,
+                "dtype": dtype,
+            }
         elif category in {"p2p_send", "p2p_recv"}:
             if local_dp != focal_dp:
                 return None
@@ -3231,8 +3531,33 @@ class PairwiseOverlapRank:
             def validate() -> bool:
                 return sends or float(tensor[0].item()) == float(peer + 11)
             runtime = {"numel": numel, "sends": sends, "peer": peer, "slot": slot}
+            plugin_context = {}
         else:
             raise ValueError(category)
+        operation_wait = None
+        operation_close = None
+        timing_domain = "cuda_event"
+        if backend_spec is not None:
+            plugin = create_plugin_operation(backend_spec, plugin_context)
+            launch = plugin["launch"]
+            operation_wait = plugin.get("wait")
+            operation_close = plugin.get("close")
+            timing_domain = plugin["timing_domain"]
+            owned.extend(plugin["owned"])
+            runtime = {**runtime, **plugin["metadata"]}
+        else:
+            normal_family = (
+                "reduce_scatter"
+                if category == "rs"
+                else "point_to_point"
+                if category in {"p2p_send", "p2p_recv"}
+                else plugin_context["family"]
+            )
+            runtime = {
+                **runtime,
+                "collective_backend_family": normal_family,
+                "collective_backend_selector": "torch.distributed:NCCL",
+            }
         torch.cuda.synchronize()
         return {
             "kind": "communication",
@@ -3241,6 +3566,9 @@ class PairwiseOverlapRank:
             "validate": validate,
             "owned": owned,
             "metadata": runtime,
+            "wait": operation_wait,
+            "close": operation_close,
+            "timing_domain": timing_domain,
         }
 
     def _operation(
@@ -3269,6 +3597,7 @@ class PairwiseOverlapRank:
         geometry_max_relative_shift_ms: float,
         clock_actor: Any,
         adaptive_sampling_config: dict[str, Any] | None = None,
+        zero_gap_order_only: bool = False,
     ) -> dict[str, Any]:
         import torch.distributed as dist
 
@@ -3414,11 +3743,12 @@ class PairwiseOverlapRank:
                 record = records[index]
                 if op["kind"] == "communication":
                     with torch.cuda.stream(stream):
-                        works = record["result"]
-                        if not isinstance(works, (list, tuple)):
-                            works = [works]
-                        for work in works:
-                            work.wait()
+                        operation_wait = op.get("wait")
+                        if operation_wait is None:
+                            wait_for_result(record["result"])
+                        else:
+                            operation_wait(record["result"])
+                        record["host_wait_complete_ns"] = self._global_now_ns()
                         record["end"].record()
             pending = set(records)
             while pending:
@@ -3476,6 +3806,34 @@ class PairwiseOverlapRank:
                 if op is None:
                     continue
                 record = records[index]
+                cuda_event_duration_ms = float(
+                    record["start"].elapsed_time(record["end"])
+                )
+                timing_domain = str(op.get("timing_domain", "cuda_event"))
+                if timing_domain == "host":
+                    interval_start_global_ns = int(record["host_launch_ns"])
+                    interval_end_global_ns = int(record["host_wait_complete_ns"])
+                    duration_ms = (
+                        interval_end_global_ns - interval_start_global_ns
+                    ) / 1e6
+                    gate_to_start_ms = (
+                        interval_start_global_ns - stage_origin_ns
+                    ) / 1e6
+                    gate_to_end_ms = (
+                        interval_end_global_ns - stage_origin_ns
+                    ) / 1e6
+                else:
+                    interval_start_global_ns = int(
+                        anchor_global_ns
+                        + anchor.elapsed_time(record["start"]) * 1e6
+                    )
+                    interval_end_global_ns = int(
+                        anchor_global_ns
+                        + anchor.elapsed_time(record["end"]) * 1e6
+                    )
+                    duration_ms = cuda_event_duration_ms
+                    gate_to_start_ms = float(gate.elapsed_time(record["start"]))
+                    gate_to_end_ms = float(gate.elapsed_time(record["end"]))
                 rows.append(
                     {
                         "operation_index": index,
@@ -3486,9 +3844,11 @@ class PairwiseOverlapRank:
                         "mode": mode,
                         "bracket_for_mode": bracket_for_mode,
                         "configured_delay_ms": float(configured_delays.get(index, 0.0)),
-                        "duration_ms": float(record["start"].elapsed_time(record["end"])),
-                        "gate_to_start_ms": float(gate.elapsed_time(record["start"])),
-                        "gate_to_end_ms": float(gate.elapsed_time(record["end"])),
+                        "duration_ms": duration_ms,
+                        "timing_domain": timing_domain,
+                        "cuda_event_bracket_duration_ms": cuda_event_duration_ms,
+                        "gate_to_start_ms": gate_to_start_ms,
+                        "gate_to_end_ms": gate_to_end_ms,
                         "host_launch_global_ns": record["host_launch_ns"],
                         "stage_origin_global_ns": stage_origin_ns,
                         "launch_origin_global_ns": stage_origin_ns,
@@ -3497,8 +3857,11 @@ class PairwiseOverlapRank:
                                 float(configured_delays.get(index, 0.0)) * 1e6
                             ))
                         ),
-                        "gpu_start_global_ns": int(anchor_global_ns + anchor.elapsed_time(record["start"]) * 1e6),
-                        "gpu_end_global_ns": int(anchor_global_ns + anchor.elapsed_time(record["end"]) * 1e6),
+                        # The legacy field names are retained for the frozen
+                        # converter.  timing_domain states whether their source
+                        # is CUDA events or the calibrated host clock.
+                        "gpu_start_global_ns": interval_start_global_ns,
+                        "gpu_end_global_ns": interval_end_global_ns,
                         "host_complete_global_ns": record["host_complete_ns"],
                         **timebase_metadata,
                         **clock_metadata,
@@ -3573,6 +3936,37 @@ class PairwiseOverlapRank:
                 "all_ranks_agree": True,
             }
 
+        def zero_gap_start_metadata(
+            spec: dict[str, Any], sample_index: int,
+        ) -> dict[str, Any]:
+            clock_metadata = self._clock_row_metadata()
+            evidence = {
+                "policy": "zero_configured_delay_back_to_back_order_v1",
+                "sample_index": int(sample_index),
+                "mode": str(spec["mode"]),
+                "order": [int(index) for index in spec["order"]],
+                "configured_delays_ms": {
+                    str(index): 0.0 for index in range(len(operations))
+                },
+                "clock_calibration_generation": int(
+                    clock_metadata["clock_calibration_generation"]
+                ),
+            }
+            return {
+                "runtime_start_geometry_disposition_explicit": True,
+                "runtime_start_geometry_disposition": (
+                    "zero_gap_order_only_confirmed"
+                ),
+                "runtime_start_geometry_treatment_executed": True,
+                "runtime_start_geometry_scoring_eligible": True,
+                "start_anchor_resolution_status": (
+                    "not_applicable_zero_configured_delay"
+                ),
+                "start_anchor_scoring_allowed": True,
+                "delay_rebase_evidence": evidence,
+                "delay_rebase_evidence_sha256": canonical_sha256(evidence),
+            }
+
         # Prewarm and calibrate isolated critical-path durations.  The final
         # isolated calibration result is sampled after its timed end event and
         # becomes the deterministic per-operation correctness reference.
@@ -3613,10 +4007,7 @@ class PairwiseOverlapRank:
         for index in range(len(operations)):
             per_iteration = []
             per_iteration_gate_to_start = []
-            focal_rank = (
-                int(participants[index]["focal_dp_rank"]) * 2
-                + int(participants[index]["focal_pp_rank"])
-            )
+            focal_rank = participant_focal_global_rank(participants[index])
             for calibration_index in range(calibration_iterations):
                 matches = [
                     row for row in all_calibration_rows
@@ -3642,11 +4033,19 @@ class PairwiseOverlapRank:
                 per_iteration_gate_to_start
             )
 
-        stage_specs = build_overlap_stage_specs(
-            participants,
-            isolated_estimates,
-            isolated_gate_to_start,
-            coverage_targets,
+        stage_specs = (
+            build_zero_gap_order_specs(
+                participants,
+                isolated_estimates,
+                isolated_gate_to_start,
+            )
+            if zero_gap_order_only
+            else build_overlap_stage_specs(
+                participants,
+                isolated_estimates,
+                isolated_gate_to_start,
+                coverage_targets,
+            )
         )
 
         for warmup in range(warmups):
@@ -3678,6 +4077,15 @@ class PairwiseOverlapRank:
             )
             spec["geometry_validity_basis"] = GEOMETRY_VALIDITY_BASIS
             spec["concurrent_overlap_role"] = CONCURRENT_OVERLAP_ROLE
+            if zero_gap_order_only:
+                spec["target_feasible_after_runtime_calibration"] = True
+                spec["geometry_cell_status"] = "zero_gap_order_only"
+                spec["geometry_infeasibility_basis"] = None
+                spec["runtime_geometry_calibration_status"] = (
+                    "not_applicable_zero_gap_order_only"
+                )
+                spec["runtime_relative_shift_ms"] = 0.0
+                continue
             # Only the structural duration bound proves infeasibility. A
             # dispatch-order projection miss and runtime nonconvergence retain
             # explicit unresolved status and receive no acceptance exemption.
@@ -4079,17 +4487,27 @@ class PairwiseOverlapRank:
                         for index in pre_order
                     ]
                     samples.extend(local_pre_stages)
-                    treatment_delays, start_metadata = execute_runtime_start_anchor(
-                        spec,
-                        sample_index,
-                        participants,
-                        len(operations),
-                        geometry_max_relative_shift_ms,
-                        local_pre_stages,
-                        run_stage,
-                        gather_runtime_rows,
-                        runtime_decision_consensus,
-                    )
+                    if zero_gap_order_only:
+                        treatment_delays = {
+                            index: 0.0 for index in range(len(operations))
+                        }
+                        start_metadata = zero_gap_start_metadata(
+                            spec, sample_index
+                        )
+                    else:
+                        treatment_delays, start_metadata = (
+                            execute_runtime_start_anchor(
+                                spec,
+                                sample_index,
+                                participants,
+                                len(operations),
+                                geometry_max_relative_shift_ms,
+                                local_pre_stages,
+                                run_stage,
+                                gather_runtime_rows,
+                                runtime_decision_consensus,
+                            )
+                        )
                     stage = run_stage(
                         list(range(len(operations))), spec["mode"], sample_index,
                         order_override=spec["order"], delays_ms=treatment_delays,
@@ -4457,6 +4875,9 @@ class PairwiseOverlapRank:
         ]
         for op in operations:
             if op is not None:
+                operation_close = op.get("close")
+                if operation_close is not None:
+                    operation_close()
                 op["owned"].clear()
         del operations
         gc.collect()
@@ -4588,10 +5009,7 @@ def aggregate_case(
                 matches = [row for row in mode_rows if row["operation_index"] == index]
                 if not matches:
                     raise ValueError(f"missing concurrent rows for operation {index}")
-                focal = (
-                    participants[index]["focal_dp_rank"] * 2
-                    + participants[index]["focal_pp_rank"]
-                )
+                focal = participant_focal_global_rank(participants[index])
                 focal_rows = [row for row in matches if row["global_rank"] == focal]
                 representative = (
                     focal_rows[0] if focal_rows
@@ -4810,6 +5228,15 @@ def aggregate_case(
                 max(item["end_ms"] for item in op_intervals.values())
                 - min(item["start_ms"] for item in op_intervals.values())
             )
+            overall_start_global_ns = min(
+                int(row["gpu_start_global_ns"]) for row in mode_rows
+            )
+            overall_end_global_ns = max(
+                int(row["gpu_end_global_ns"]) for row in mode_rows
+            )
+            overall_makespan_ms = (
+                overall_end_global_ns - overall_start_global_ns
+            ) / 1e6
             isolated_aggressor_work_ms = sum(
                 (
                     isolated_pre[(int(index), sample_index, mode)]
@@ -5058,6 +5485,13 @@ def aggregate_case(
                 "participant_outcomes": participant_outcomes,
                 "aggressor_group_span_us": aggressor_group_span_ms * 1000.0,
                 "group_makespan_us": group_makespan_ms * 1000.0,
+                "overall_start_global_ns": overall_start_global_ns,
+                "overall_end_global_ns": overall_end_global_ns,
+                "overall_makespan_us": overall_makespan_ms * 1000.0,
+                "overall_makespan_definition": (
+                    "latest_treatment_endpoint_gpu_end_global_ns_minus_"
+                    "earliest_treatment_endpoint_gpu_start_global_ns"
+                ),
                 "isolated_serial_work_us": isolated_serial_work_ms * 1000.0,
                 "ideal_overlap_us": ideal_overlap_ms * 1000.0,
                 "makespan_inflation_over_ideal_pct": (
@@ -5153,12 +5587,14 @@ def default_checkpoint_path(output_path: Path) -> Path:
 def build_restart_configuration_identity(
     args: argparse.Namespace,
     *,
+    collective_backend_selection: CollectiveBackendSelection,
     node_ips: tuple[str, ...],
     world_size: int,
     coverage_targets: list[float],
     adaptive_config: AdaptiveBenchmarkControllerConfig | None,
     assignments: list[dict[str, Any]],
     communicator_plan_payload: dict[str, Any],
+    payload_overrides: dict[str, int],
 ) -> dict[str, Any]:
     """Build the fail-closed identity for checkpoint compatibility.
 
@@ -5183,6 +5619,29 @@ def build_restart_configuration_identity(
             None if adaptive_config is None else adaptive_config.to_dict()
         ),
     }
+    trace_events_used = any(
+        str(assignment["case_id"]).startswith("M")
+        for assignment in assignments
+    )
+    trace_events_artifact = (
+        {**artifact(args.trace_events), "used": True}
+        if trace_events_used
+        else {
+            "path": str(args.trace_events.resolve()),
+            "sha256": None,
+            "used": False,
+            "reason": "no requested multi-aggressor case needs trace start offsets",
+        }
+    )
+    a2a_profiles_artifact = {
+        "path": str(args.a2a_profiles.resolve()),
+        "sha256": None,
+        "used": False,
+        "reason": (
+            "normal and SM-aware modes share the fixed balanced equal-split "
+            "A2A contract; historical ragged splits are not routed"
+        ),
+    }
     return {
         "restart_identity_schema_version": OUTPUT_SCHEMA_VERSION,
         "implementation_sha256": implementation_sha256(),
@@ -5195,16 +5654,21 @@ def build_restart_configuration_identity(
             "node_ips": list(node_ips),
             "world_size": int(world_size),
             "gpus_per_node": 8,
-            "physical_pp": 2,
+            "physical_pp": len(node_ips),
             "dp": 8,
             "ep": 8,
             "placement": "pp_outer",
         },
         "communicator_plan": communicator_plan_payload,
+        "collective_backend_selection": collective_backend_selection.to_dict(),
+        "collective_payload_overrides_input_numel_per_rank": dict(
+            payload_overrides
+        ),
         "sampling": sampling,
         "coverage_targets_pct": coverage_targets,
         "scheduling": {
             "mechanism": "global_clock_aligned_host_launch",
+            "zero_gap_order_only": bool(args.zero_gap_order_only),
             **strict_scheduling_provenance(),
             "baseline_measurement": BASELINE_MEASUREMENT_METHOD,
             "baseline_measurement_repetitions": BASELINE_MEASUREMENT_REPETITIONS,
@@ -5278,8 +5742,8 @@ def build_restart_configuration_identity(
         },
         "inputs": {
             "matrix": artifact(args.matrix),
-            "a2a_profiles": artifact(args.a2a_profiles),
-            "trace_events": artifact(args.trace_events),
+            "a2a_profiles": a2a_profiles_artifact,
+            "trace_events": trace_events_artifact,
         },
         "nccl_behavior": "defaults_only",
         "case_recovery_granularity": "case_boundary",
@@ -5366,6 +5830,17 @@ def parse_args() -> argparse.Namespace:
         default=Path("out/20260809_132048/kernel_overlap_events.csv"),
     )
     parser.add_argument("--seq-len", type=int, default=BASE_SEQ)
+    parser.add_argument(
+        "--a2a-input-numel", type=int,
+        help=(
+            "Override balanced A2A input/output elements per rank; must be "
+            "positive and divisible by eight"
+        ),
+    )
+    parser.add_argument(
+        "--ag-input-numel", type=int,
+        help="Override all-gather input elements per rank",
+    )
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument(
@@ -5429,7 +5904,41 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GEOMETRY_MAX_RELATIVE_SHIFT_MS,
         help="Maximum extra delay applied to the later dispatch group",
     )
+    parser.add_argument(
+        "--zero-gap-order-only",
+        action="store_true",
+        help=(
+            "Run only the two back-to-back participant submission orders with "
+            "zero configured launch delay; skip overlap targeting and runtime "
+            "start adjustment"
+        ),
+    )
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument(
+        "--collective-mode",
+        choices=("nccl", "sm-aware"),
+        default="nccl",
+        help=(
+            "Use the existing torch.distributed NCCL calls or explicitly "
+            "selected SM-aware backend factories"
+        ),
+    )
+    parser.add_argument(
+        "--sm-aware-all-gather",
+        help="All-gather backend selector in python.module:factory form",
+    )
+    parser.add_argument(
+        "--sm-aware-a2a",
+        help="Balanced A2A backend selector in python.module:factory form",
+    )
+    parser.add_argument(
+        "--sm-aware-options",
+        type=Path,
+        help=(
+            "Optional JSON object keyed by all_gather and balanced_a2a; "
+            "valid only in sm-aware mode"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--checkpoint",
@@ -5459,14 +5968,23 @@ def main() -> None:
     driver_audit = sanitize_nccl_environment(phase="pairwise_driver_before_ray_or_torch_import")
     assert_default_nccl_environment()
     args = parse_args()
+    collective_backend_selection = build_collective_backend_selection(
+        mode=args.collective_mode,
+        all_gather=args.sm_aware_all_gather,
+        a2a=args.sm_aware_a2a,
+        options_path=args.sm_aware_options,
+    )
     node_ips = tuple(item.strip() for item in args.node_ips.split(",") if item.strip())
-    if len(node_ips) != 2:
-        raise ValueError("--node-ips requires two IPs")
+    if len(node_ips) not in {1, 2}:
+        raise ValueError("--node-ips requires one or two distinct IPs")
+    if len(set(node_ips)) != len(node_ips):
+        raise ValueError("--node-ips entries must be distinct")
     coverage_targets = [
         float(item.strip()) for item in args.coverage_targets.split(",")
         if item.strip()
     ]
     validate_coverage_targets(coverage_targets)
+    payload_overrides = collective_payload_overrides(args)
     if args.baseline_repetitions != BASELINE_MEASUREMENT_REPETITIONS:
         raise ValueError(
             "--baseline-repetitions must be 3 for the authoritative odd-K policy"
@@ -5475,6 +5993,8 @@ def main() -> None:
         raise ValueError("--geometry-calibration-trials must be nonnegative")
     if args.geometry_max_relative_shift_ms < 0.0:
         raise ValueError("--geometry-max-relative-shift-ms must be nonnegative")
+    if args.zero_gap_order_only and args.adaptive_sampling:
+        raise ValueError("--zero-gap-order-only does not support adaptive sampling")
     adaptive_config = None
     if args.adaptive_sampling:
         # A 100-sample floor applies to kernels at or below 10 ms, so values
@@ -5489,22 +6009,55 @@ def main() -> None:
             max_total_attempt_multiplier=args.adaptive_attempt_multiplier,
             attempt_batch_size=args.adaptive_batch_size,
         )
-    topology = PPOuterTopology(node_ips=node_ips)
+    topology = PPOuterTopology(
+        node_ips=node_ips,
+        physical_pp=len(node_ips),
+    )
     assignments = load_cases(
         args.matrix,
         [item.strip() for item in args.cases.split(",") if item.strip()],
+        runtime_physical_pp=topology.physical_pp,
     )
+    apply_collective_payload_overrides(assignments, payload_overrides)
+    if collective_backend_selection.mode == "sm-aware":
+        unsupported = sorted({
+            str(item["category"])
+            for assignment in assignments
+            for item in assignment["participants"]
+            if str(item["category"]) not in {"compute", "ag", "a2a"}
+        })
+        if unsupported:
+            raise ValueError(
+                "SM-free pairwise mode supports only grouped GEMM, AG, and "
+                f"balanced A2A participants; found {unsupported}"
+            )
+    if topology.physical_pp == 1:
+        p2p_cases = [
+            assignment["case_key"]
+            for assignment in assignments
+            if any(
+                item["category"] in {"p2p_send", "p2p_recv"}
+                for item in assignment["participants"]
+            )
+        ]
+        if p2p_cases:
+            raise ValueError(
+                "single-node execution cannot include P2P cases: "
+                + ", ".join(p2p_cases)
+            )
     attach_trace_start_offsets(assignments, args.trace_events)
-    a2a_profiles = load_a2a_profiles(args.a2a_profiles)
+    a2a_profiles: dict[str, dict[str, Any]] = {}
     comm_plan = communicator_plan(assignments)
     restart_identity = build_restart_configuration_identity(
         args,
+        collective_backend_selection=collective_backend_selection,
         node_ips=node_ips,
         world_size=topology.world_size,
         coverage_targets=coverage_targets,
         adaptive_config=adaptive_config,
         assignments=assignments,
         communicator_plan_payload=comm_plan,
+        payload_overrides=payload_overrides,
     )
     config_id = run_config_id(restart_identity)
     output_path = args.output.resolve()
@@ -5533,14 +6086,19 @@ def main() -> None:
             "node_ips": node_ips,
             "world_size": topology.world_size,
             "gpus_per_node": 8,
-            "physical_pp": 2,
+            "physical_pp": topology.physical_pp,
             "dp": 8,
             "ep": 8,
             "placement": "pp_outer",
         },
         "communicator_plan": comm_plan,
+        "collective_backend_selection": collective_backend_selection.to_dict(),
+        "collective_payload_overrides_input_numel_per_rank": dict(
+            payload_overrides
+        ),
         "scheduling": {
             "mechanism": "global_clock_aligned_host_launch",
+            "zero_gap_order_only": bool(args.zero_gap_order_only),
             **strict_scheduling_provenance(),
             "baseline_measurement": BASELINE_MEASUREMENT_METHOD,
             "baseline_measurement_repetitions": BASELINE_MEASUREMENT_REPETITIONS,
@@ -5692,15 +6250,32 @@ def main() -> None:
                 "node_ip": socket.gethostbyname(socket.gethostname()),
             }
 
+    backend_worker_environment = collective_backend_worker_environment(
+        collective_backend_selection, os.environ
+    )
+    sourced_zero_cta_environment = configured_zero_cta_environment(os.environ)
+    requested_ray_address = args.address.strip()
+    ray_address = (
+        "auto" if requested_ray_address.lower() == "auto"
+        else requested_ray_address
+        if ":" in requested_ray_address
+        else f"{requested_ray_address}:{args.port}"
+    )
     ray.init(
-        address=f"{args.address}:{args.port}",
+        address=ray_address,
         namespace=f"pairwise_overlap_benchmark_{os.getpid()}_{time.time_ns()}",
-        runtime_env={"env_vars": nccl_debug_environment()},
+        runtime_env={
+            "env_vars": {
+                **nccl_debug_environment(),
+                **sourced_zero_cta_environment,
+                **backend_worker_environment,
+            }
+        },
         log_to_driver=False,
     )
     # Reserve no schedulable CPU so publication cannot consume one of the
-    # exact 8-CPU placement bundles used by the 16 GPU rank actors. Pin it to
-    # the first requested cluster node so writable-mount placement is explicit.
+    # Reserve no CPU from the exact 8-CPU placement bundle(s) used by GPU rank
+    # actors. Pin publication to the first requested cluster node.
     publisher_type = ray.remote(num_cpus=0, max_restarts=0)(ArtifactPublisher)
     publisher = publisher_type.options(
         resources={f"node:{node_ips[0]}": 0.001}
@@ -5746,7 +6321,10 @@ def main() -> None:
             ray.shutdown()
         return
 
-    print("Ray connected; reserving two 8-GPU node bundles", flush=True)
+    print(
+        f"Ray connected; reserving {len(node_ips)} 8-GPU node bundle(s)",
+        flush=True,
+    )
     pg = placement_group(
         [
             {"CPU": 8, "GPU": 8, f"node:{node_ip}": 0.001}
@@ -5760,7 +6338,10 @@ def main() -> None:
     clock = None
     try:
         ray.get(pg.ready(), timeout=600)
-        print("Placement group ready; starting 16 GPU actors", flush=True)
+        print(
+            f"Placement group ready; starting {topology.world_size} GPU actors",
+            flush=True,
+        )
         for global_rank in range(topology.world_size):
             pp_rank = topology.physical_pp_rank(global_rank)
             actors.append(
@@ -5768,7 +6349,11 @@ def main() -> None:
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg, placement_group_bundle_index=pp_rank
                     )
-                ).remote(global_rank, topology.node_ip_for_rank(global_rank))
+                ).remote(
+                    global_rank,
+                    topology.node_ip_for_rank(global_rank),
+                    collective_backend_selection.to_dict(),
+                )
             )
         placements = ray.get([actor.metadata.remote() for actor in actors], timeout=300)
         print("Actor placement validated; creating required communicators", flush=True)
@@ -5776,6 +6361,11 @@ def main() -> None:
         placement_validation.update(
             validate_worker_implementation_provenance(
                 placements, restart_identity["implementation_sha256"]
+            )
+        )
+        placement_validation.update(
+            validate_worker_collective_backend_selection(
+                placements, collective_backend_selection.to_dict()
             )
         )
         master_addr, master_port = ray.get(actors[0].rendezvous.remote())
@@ -5815,6 +6405,11 @@ def main() -> None:
         placement_validation.update(
             validate_worker_implementation_provenance(
                 placements, restart_identity["implementation_sha256"]
+            )
+        )
+        placement_validation.update(
+            validate_worker_collective_backend_selection(
+                placements, collective_backend_selection.to_dict()
             )
         )
         checkpoint_state["execution_sessions"].append({
@@ -5867,6 +6462,7 @@ def main() -> None:
                             if adaptive_config is None
                             else adaptive_config.to_dict()
                         ),
+                        bool(args.zero_gap_order_only),
                     )
                     for actor in actors
                 ],
@@ -5915,6 +6511,11 @@ def main() -> None:
             placement_validation.update(
                 validate_worker_implementation_provenance(
                     placements, restart_identity["implementation_sha256"]
+                )
+            )
+            placement_validation.update(
+                validate_worker_collective_backend_selection(
+                    placements, collective_backend_selection.to_dict()
                 )
             )
             current_session["placement"] = {

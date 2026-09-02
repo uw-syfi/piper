@@ -23,6 +23,9 @@ python scripts/partial_overlap_interference_benchmarks/run_pairwise_authoritativ
 python scripts/partial_overlap_interference_benchmarks/benchmark_pairwise_physical_resources.py --help
 ```
 
+The SM-free grouped-GEMM/AG/A2A matrix has its own entry point and
+documentation under `sm_free_collectives/pairwise_overlap/`.
+
 The historical suite manifest in the artifact bundle retains the runner path
 used for the original measurement. The authoritative driver maps that legacy
 path to the reorganized runner when constructing a new command.
