@@ -1121,6 +1121,75 @@ def _bucket_matched_fwd_nodes(
                 return first_bwd
             return uid
 
+        # Runtime value mappings are keyed by peer UID rather than by DAG
+        # edge. Re-key both sides when the original forward node is replaced,
+        # matching the incident-edge remap below. Routed communication lowering
+        # requires the outgoing mapping to remain explicit on the final bucket.
+        runtime_inputs = fwd_node.node_meta.get("runtime_inputs_by_source")
+        if isinstance(runtime_inputs, dict):
+            dag.nodes[first_fwd].node_meta["runtime_inputs_by_source"] = {
+                _remap(peer_uid): list(value_mapping)
+                for peer_uid, value_mapping in runtime_inputs.items()
+            }
+            for peer_uid, value_mapping in runtime_inputs.items():
+                peer = dag.nodes.get(peer_uid)
+                if peer is None:
+                    continue
+                peer_outputs = peer.node_meta.get(
+                    "runtime_outputs_by_destination"
+                )
+                if isinstance(peer_outputs, dict) and fwd_uid in peer_outputs:
+                    peer_outputs[first_fwd] = list(value_mapping)
+                    del peer_outputs[fwd_uid]
+
+        runtime_outputs = fwd_node.node_meta.get(
+            "runtime_outputs_by_destination"
+        )
+        if isinstance(runtime_outputs, dict):
+            dag.nodes[last_fwd].node_meta[
+                "runtime_outputs_by_destination"
+            ] = {
+                _remap(peer_uid): list(value_mapping)
+                for peer_uid, value_mapping in runtime_outputs.items()
+            }
+            for peer_uid, value_mapping in runtime_outputs.items():
+                peer = dag.nodes.get(peer_uid)
+                if peer is None:
+                    continue
+                peer_inputs = peer.node_meta.get("runtime_inputs_by_source")
+                if isinstance(peer_inputs, dict) and fwd_uid in peer_inputs:
+                    peer_inputs[last_fwd] = list(value_mapping)
+                    del peer_inputs[fwd_uid]
+
+        # Backward gradient routing mirrors the forward value mapping but is
+        # stored on the producer's BWD node and keyed by the consumer BWD UID.
+        # The final forward bucket is the first backward bucket to run, so it
+        # inherits mappings owned by the original backward. When this backward
+        # is itself a source in another node's mapping, its replacement is the
+        # last backward bucket (paired with the first forward bucket).
+        runtime_output_grads = bwd_node.node_meta.get(
+            "runtime_output_grads_by_source"
+        )
+        if isinstance(runtime_output_grads, dict):
+            dag.nodes[first_bwd].node_meta[
+                "runtime_output_grads_by_source"
+            ] = {
+                peer_uid: list(value_mapping)
+                for peer_uid, value_mapping in runtime_output_grads.items()
+            }
+        for peer in list(dag.nodes.values()):
+            peer_grad_mappings = peer.node_meta.get(
+                "runtime_output_grads_by_source"
+            )
+            if (
+                isinstance(peer_grad_mappings, dict)
+                and bwd_uid in peer_grad_mappings
+            ):
+                peer_grad_mappings[last_bwd] = list(
+                    peer_grad_mappings[bwd_uid]
+                )
+                del peer_grad_mappings[bwd_uid]
+
         # Remove originals and their incident edges.
         _remove_node_and_incident_edges(dag, fwd_uid)
         _remove_node_and_incident_edges(dag, bwd_uid)

@@ -215,11 +215,104 @@ def _finalize(dags: list[TrainingDAG]):
     order = _order_communication_transactions(dags)
     for dag in dags:
         resolve_total_order_per_stream(dag)
+    order = _order_communication_transactions(dags)
     _materialize_global_communication_issue_edges(dags, order)
     for dag in dags:
         assign_dispatch_levels(dag)
     _validate_global_communication_order(dags, order)
     return order
+
+
+def test_global_order_is_recomputed_after_compute_stream_fifo() -> None:
+    source_dag = TrainingDAG()
+    destination_dag = TrainingDAG()
+
+    source_dag.add_node(_compute("source", 0))
+    destination_dag.add_node(
+        TrainingDAGNode(
+            uid="dummy",
+            node_kind="COMPUTE",
+            compute_subkind="FWD",
+            tag={},
+            device=[1],
+            stream="aux_stream",
+        )
+    )
+    destination_dag.add_node(_compute("a.recv.consumer", 1))
+    destination_dag.add_node(_compute("z.a2a.producer", 1))
+    destination_dag.add_node(
+        TrainingDAGNode(
+            uid="tail",
+            node_kind="COMPUTE",
+            compute_subkind="FWD",
+            tag={},
+            device=[1],
+            stream="tail_stream",
+        )
+    )
+    _send_uid, _recv_uid = _p2p_pair(
+        source_dag,
+        destination_dag,
+        comm_id="pipeline",
+        source_rank=0,
+        destination_rank=1,
+        source_compute_uid="source",
+        destination_compute_uid="a.recv.consumer",
+        channel="pp_lo_hi",
+    )
+    destination_dag.add_edge(
+        TrainingDAGEdge("a.recv.consumer", "tail", "data")
+    )
+    destination_dag.add_edge(
+        TrainingDAGEdge("dummy", "z.a2a.producer", "data")
+    )
+
+    participants = [0, 1]
+    source_dag.add_node(
+        _collective(
+            "a2a.source",
+            "A2A_COMM",
+            "expert",
+            [0],
+            participants,
+            stream="ep_stream",
+        )
+    )
+    destination_dag.add_node(
+        _collective(
+            "a2a.destination",
+            "A2A_COMM",
+            "expert",
+            [1],
+            participants,
+            stream="ep_stream",
+        )
+    )
+    destination_dag.add_edge(
+        TrainingDAGEdge("z.a2a.producer", "a2a.destination", "data")
+    )
+
+    dags = [source_dag, destination_dag]
+    initial = _order_communication_transactions(dags)
+    assert initial.identities.index(("A2A_COMM", "expert")) < (
+        initial.identities.index(("P2P", "pipeline"))
+    )
+
+    for dag in dags:
+        resolve_total_order_per_stream(dag)
+    final = _order_communication_transactions(dags)
+    assert final.identities.index(("P2P", "pipeline")) < (
+        final.identities.index(("A2A_COMM", "expert"))
+    )
+
+    _materialize_global_communication_issue_edges(dags, final)
+    _validate_global_communication_order(dags, final)
+    assert any(
+        edge.src_uid == "a.recv.consumer"
+        and edge.dst_uid == "z.a2a.producer"
+        and edge.dep_kind == "temporal"
+        for edge in destination_dag.edges
+    )
 
 
 def test_mixed_global_order_adds_only_required_cross_stream_issue_edges() -> None:
@@ -650,9 +743,5 @@ def test_routed_collective_sequence_validation_rejects_mismatch() -> None:
 
     with pytest.raises(ValueError, match="call-sequence mismatch"):
         _validate_routed_collective_sequences([dense_dag, expert_dag])
-
-
-
-
 
 

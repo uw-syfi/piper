@@ -52,9 +52,9 @@ from models.llama3 import (
 )
 
 try:
-    from .test_harness import _add_profile_comparison_metrics
+    from .run_harness import _add_profile_comparison_metrics
 except ImportError:
-    from test_harness import _add_profile_comparison_metrics
+    from run_harness import _add_profile_comparison_metrics
 
 logger = create_logger("test_llama", LOG_LEVEL)
 

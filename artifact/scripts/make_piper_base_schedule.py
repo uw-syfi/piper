@@ -70,7 +70,15 @@ def main() -> int:
             devices = devices_for_stage(stage, args.pp, args.dp, args.layout)
             directive = {
                 "op": "replicate",
-                "filter": {"PP": stage},
+                # DP-absent regions are the dense replication domain. Qwen's
+                # routed expert regions currently carry EP (but no DP) tags,
+                # so retain EP-absence as a compatibility guard when expert
+                # sharding is enabled.
+                "filter": {
+                    "PP": stage,
+                    "DP": "-",
+                    **({"EP": "-"} if args.ep else {}),
+                },
                 "devices": devices,
                 "reduce_stream": "reduce_stream",
             }
@@ -80,7 +88,8 @@ def main() -> int:
                 directive["gather_stream"] = "gather_stream"
                 directive["shard_grads"] = True
                 directive["shard_params"] = True
-                directive["bucket_size"] = int(args.bucket_size or 1000)
+                if args.bucket_size is not None:
+                    directive["bucket_size"] = int(args.bucket_size)
             elif args.bucket_size is not None:
                 directive["bucket_size"] = int(args.bucket_size)
             directives.append(directive)

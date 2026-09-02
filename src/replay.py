@@ -30,10 +30,10 @@ timings can include time spent waiting for other ranks to arrive.  The
 replay therefore separates rank-local endpoint arrival and completion with
 a shared zero-duration rendezvous. For each policy it derives every endpoint's
 post-rendezvous service time from that policy's observed, cross-actor-aligned
-timeline. Symmetric collectives use an
-all-participant rendezvous.  Routed A2A, M-to-N, and N-to-M nodes use one
-logical rendezvous per DAG node followed by rank-local aggregate envelope
-tails; internal metadata/payload phases are not modeled separately.
+timeline. Symmetric collectives and A2A use an all-participant rendezvous
+followed by rank-local aggregate envelope tails. M-to-N and N-to-M nodes are
+not replayed because their aggregate node envelopes do not identify the
+service times of their internal peer transfers.
 Communication profiles with observed cross-actor offsets fail closed when
 timeline alignment is unavailable.
 
@@ -89,8 +89,9 @@ from .profile_statistics import (
 
 _PROLOGUE_UID = "__step_prologue__"
 _P2P_KINDS = frozenset({"SEND_COMM", "RECV_COMM"})
-_ROUTED_COLLECTIVE_KINDS = frozenset(
-    {"A2A_COMM", "M_TO_N_COMM", "N_TO_M_COMM"}
+_A2A_COLLECTIVE_KINDS = frozenset({"A2A_COMM"})
+_UNSUPPORTED_ROUTED_COMM_KINDS = frozenset(
+    {"M_TO_N_COMM", "N_TO_M_COMM"}
 )
 _SYMMETRIC_COLLECTIVE_KINDS = frozenset(
     {
@@ -99,7 +100,7 @@ _SYMMETRIC_COLLECTIVE_KINDS = frozenset(
         "ALL_GATHER_COMM",
         "REDUCE_SCATTER_COMM",
     }
-) | _ROUTED_COLLECTIVE_KINDS
+) | _A2A_COLLECTIVE_KINDS
 _COLLECTIVE_KINDS = _SYMMETRIC_COLLECTIVE_KINDS
 _COMM_KINDS = _P2P_KINDS | _COLLECTIVE_KINDS
 
@@ -602,7 +603,7 @@ def _communication_observed_services(
         }
         zero_activity_states = {duration == 0.0 for duration in durations.values()}
         permits_zero_activity_endpoints = all(
-            member.node.node_kind in _ROUTED_COLLECTIVE_KINDS
+            member.node.node_kind in _A2A_COLLECTIVE_KINDS
             for member in members
         ) or is_p2p
         if len(zero_activity_states) > 1 and not permits_zero_activity_endpoints:
@@ -1121,6 +1122,7 @@ def replay_training_step(
     profile_mode: str = ISOLATED_PROFILE_MODE,
     sample_iteration_id: int | None = None,
     strict: bool = True,
+    _normal_p2p_post_profiles: Mapping[NodeInstance, Any] | None = None,
 ) -> ReplayResult:
     """Replay one training step using the selected timing profile.
 
@@ -1141,6 +1143,23 @@ def replay_training_step(
 
     profile_mode = normalize_profile_mode(profile_mode)
     dags, topology = _extract_inputs(plan_or_dags)
+    unsupported_routed_nodes = sorted(
+        (pp_index, str(node.uid), str(node.node_kind))
+        for pp_index, dag in enumerate(dags)
+        for node in dag.nodes.values()
+        if node.node_kind in _UNSUPPORTED_ROUTED_COMM_KINDS
+    )
+    if unsupported_routed_nodes:
+        descriptions = ", ".join(
+            f"PP {pp_index} {uid!r} ({node_kind})"
+            for pp_index, uid, node_kind in unsupported_routed_nodes
+        )
+        raise ReplayValidationError(
+            "M-to-N/N-to-M communication replay is unsupported because "
+            "profiles contain only aggregate node service times, not the "
+            "service times of individual peer sends and receives; nodes: "
+            f"{descriptions}"
+        )
     profile_metadata = getattr(plan_or_dags, "profile_metadata", {}) or {}
     alignment = (
         profile_metadata.get("timeline_alignment", {})
@@ -1301,9 +1320,15 @@ def replay_training_step(
                         # different profiling issue order, so it is used only
                         # to derive service, never to schedule P2P posts when a
                         # normal post profile is available.
-                        normal_post_profile = _optional_profile_for_rank(
-                            node, rank, NORMAL_PROFILE_MODE
+                        normal_post_profile = (
+                            _normal_p2p_post_profiles.get(key)
+                            if _normal_p2p_post_profiles is not None
+                            else None
                         )
+                        if normal_post_profile is None:
+                            normal_post_profile = _optional_profile_for_rank(
+                                node, rank, NORMAL_PROFILE_MODE
+                            )
                         post_profile = (
                             normal_post_profile
                             if normal_post_profile is not None
@@ -1409,9 +1434,9 @@ def replay_training_step(
                     f"collective {communication_id!r} endpoints disagree on participants: "
                     f"{sorted(expected_sets)!r}"
                 )
-            if group_key[1] in _ROUTED_COLLECTIVE_KINDS and not expected_sets:
+            if group_key[1] in _A2A_COLLECTIVE_KINDS and not expected_sets:
                 raise ReplayValidationError(
-                    f"routed collective {communication_id!r} has no declared participants"
+                    f"A2A collective {communication_id!r} has no declared participants"
                 )
             if expected_sets and actual != set(next(iter(expected_sets))):
                 raise ReplayValidationError(
@@ -1896,7 +1921,7 @@ def replay_profile_modes(
 
     actual_statistics = None
     normal_error = None
-    reduction_pct = None
+    prediction_error_pct = None
     event_overhead_pct = None
     instrumented_statistics = None
     instrumented_isolated_statistics = None
@@ -1924,8 +1949,9 @@ def replay_profile_modes(
         )
         instrumented_normal_replay_error = prediction_error(
             normal_statistics.estimate,
-            instrumented_statistics.estimate,
+            instrumented_statistics.mean,
         )
+        prediction_error_pct = instrumented_normal_replay_error.signed_pct
     instrumented_isolated_samples = instrumented_by_mode.get(
         ISOLATED_PROFILE_MODE, ()
     )
@@ -2000,9 +2026,6 @@ def replay_profile_modes(
         normal_error = prediction_error(
             normal_statistics.estimate, actual_statistics.estimate
         )
-        reduction_pct = predicted_reduction(
-            isolated_statistics.estimate, actual_statistics.estimate
-        )
 
         if instrumented_samples:
             event_overhead_pct = prediction_error(
@@ -2040,7 +2063,7 @@ def replay_profile_modes(
         instrumented_isolated_replay_error=(
             instrumented_isolated_replay_error
         ),
-        prediction_error_pct=reduction_pct,
+        prediction_error_pct=prediction_error_pct,
         perfect_overlap_absolute_savings_us=(
             perfect_overlap_savings_statistics.absolute_mean
         ),

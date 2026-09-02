@@ -585,9 +585,39 @@ def test_bucket_rewrite_preserves_final_output_schema_and_routed_boundary(
             "routing_counts_idx": 2,
         },
     })
+    routed_mapping = [
+        {
+            "value_id": "routed_payload",
+            "source_output_idx": 3,
+            "destination_input_idx": 0,
+            "is_tensor": True,
+        },
+        {
+            "value_id": "routing_counts",
+            "source_output_idx": 2,
+            "destination_input_idx": 1,
+            "is_tensor": True,
+        },
+    ]
+    fwd.node_meta["runtime_outputs_by_destination"] = {
+        "expert": routed_mapping
+    }
+    expert = _compute("expert", {"PP": 0, "EP": 0, "PASS": "F"})
+    expert.node_meta["runtime_inputs_by_source"] = {"fwd": routed_mapping}
+    bwd = _bwd("bwd", "fwd", {"PP": 0, "PASS": "B"})
+    bwd.node_meta["runtime_output_grads_by_source"] = {
+        "expert.bwd": routed_mapping
+    }
+    expert_bwd = _bwd(
+        "expert.bwd", "expert", {"PP": 0, "EP": 0, "PASS": "B"}
+    )
     dag.add_node(fwd)
-    dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
+    dag.add_node(expert)
+    dag.add_node(bwd)
+    dag.add_node(expert_bwd)
     dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
+    dag.add_edge(TrainingDAGEdge("fwd", "expert", "data"))
+    dag.add_edge(TrainingDAGEdge("expert.bwd", "bwd", "data"))
 
     monkeypatch.setattr(
         directives,
@@ -598,7 +628,11 @@ def test_bucket_rewrite_preserves_final_output_schema_and_routed_boundary(
         ],
     )
 
-    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 25)
+    _bucket_matched_fwd_nodes(
+        dag,
+        [{"PP": 0, "EP": directives._ABSENT_TAG_INDEX}],
+        25,
+    )
 
     final_meta = dag.nodes["fwd.bucket1"].node_meta
     assert final_meta["output_names"] == [
@@ -613,6 +647,72 @@ def test_bucket_rewrite_preserves_final_output_schema_and_routed_boundary(
         "tensor_idx": 3,
         "routing_counts_idx": 2,
     }
+    assert final_meta["runtime_outputs_by_destination"] == {
+        "expert": routed_mapping
+    }
+    assert dag.nodes["expert"].node_meta["runtime_inputs_by_source"] == {
+        "fwd.bucket1": routed_mapping
+    }
+    assert dag.nodes["fwd.bucket1.bwd"].node_meta[
+        "runtime_output_grads_by_source"
+    ] == {"expert.bwd": routed_mapping}
+
+
+def test_bucket_rewrite_rekeys_backward_gradient_mapping_source(
+    monkeypatch,
+) -> None:
+    dag = TrainingDAG()
+    producer = _compute("producer", {"PP": 0, "PASS": "F"})
+    consumer = _compute("consumer", {"PP": 0, "PASS": "F"})
+    for segment_id, node in enumerate((producer, consumer)):
+        node.node_meta.update(
+            {
+                "stage_id": 0,
+                "segment_id": segment_id,
+                "gm": _dummy_gm(),
+                "graphargs": [],
+                "input_idxs": [],
+                "param_idxs": [],
+            }
+        )
+    mapping = [
+        {
+            "value_id": "activation",
+            "source_output_idx": 2,
+            "destination_input_idx": 1,
+            "is_tensor": True,
+        }
+    ]
+    producer_bwd = _bwd(
+        "producer.bwd", "producer", {"PP": 0, "PASS": "B"}
+    )
+    producer_bwd.node_meta["runtime_output_grads_by_source"] = {
+        "consumer.bwd": mapping
+    }
+    consumer_bwd = _bwd(
+        "consumer.bwd", "consumer", {"PP": 0, "PASS": "B"}
+    )
+    for node in (producer, consumer, producer_bwd, consumer_bwd):
+        dag.add_node(node)
+    dag.add_edge(TrainingDAGEdge("producer", "consumer", "data"))
+    dag.add_edge(
+        TrainingDAGEdge("consumer.bwd", "producer.bwd", "data")
+    )
+
+    monkeypatch.setattr(
+        directives,
+        "bucket_stage",
+        lambda *_args, **_kwargs: [
+            (_dummy_gm(), [], [], []),
+            (_dummy_gm(), [], [], []),
+        ],
+    )
+
+    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 25)
+
+    assert dag.nodes["producer.bucket1.bwd"].node_meta[
+        "runtime_output_grads_by_source"
+    ] == {"consumer.bucket0.bwd": mapping}
 
 
 
@@ -805,6 +905,4 @@ def test_apply_schedule_directives_rejects_unmatched_place_directive() -> None:
             dag,
             [{"op": "place", "filter": {"PP": 1}, "devices": [0]}],
         )
-
-
 

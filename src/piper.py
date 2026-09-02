@@ -2850,6 +2850,16 @@ def piper(gm, example_inputs, **kwargs):
     )
     for subdag in per_pp_training_dags:
         resolve_total_order_per_stream(subdag)
+    # Default-stream FIFO materialization can create new reachability between
+    # communication nodes on otherwise independent streams (for example, a
+    # pipeline RECV and a later expert A2A bridged by two compute nodes). Re-run
+    # global ordering against the finalized stream DAGs so issue order honors
+    # that newly explicit precedence. The first pass remains necessary to give
+    # shared communication streams one cross-actor-consistent FIFO before local
+    # stream serialization.
+    communication_order = _order_communication_transactions(
+        per_pp_training_dags
+    )
     _materialize_global_communication_issue_edges(
         per_pp_training_dags, communication_order
     )

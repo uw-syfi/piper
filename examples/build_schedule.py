@@ -584,7 +584,7 @@ def _validate_positive(name: str, value: int) -> None:
 
 
 def main() -> None:
-    from test_harness import main as harness_main
+    from run_harness import main as harness_main
 
     harness_main()
 

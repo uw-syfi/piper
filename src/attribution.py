@@ -36,6 +36,7 @@ from .profiling import (
     get_prologue_profile_times,
 )
 from .replay import (
+    NodeInstance,
     ReplayValidationError,
     _comm_id,
     profile_iteration_ids,
@@ -405,6 +406,7 @@ def _replay_step_objective(
     profile_mode: str,
     sample_iteration_ids: tuple[int, ...],
     strict: bool,
+    normal_p2p_post_profiles: Mapping[NodeInstance, Any],
 ) -> float:
     """Evaluate the same mean step estimator reported by the comparison."""
 
@@ -413,6 +415,7 @@ def _replay_step_objective(
             plan_or_dags,
             profile_mode=profile_mode,
             strict=strict,
+            _normal_p2p_post_profiles=normal_p2p_post_profiles,
         ).step_time_us
     return float(
         statistics.fmean(
@@ -421,6 +424,7 @@ def _replay_step_objective(
                 profile_mode=profile_mode,
                 sample_iteration_id=iteration_id,
                 strict=strict,
+                _normal_p2p_post_profiles=normal_p2p_post_profiles,
             ).step_time_us
             for iteration_id in sample_iteration_ids
         )
@@ -452,17 +456,28 @@ def attribute_profile_mode_savings(
 
     features = _build_features(plan_or_dags)
     sample_iteration_ids = _shared_profile_iteration_ids(plan_or_dags)
+    normal_p2p_post_profiles = {
+        NodeInstance(int(rank), str(node.uid)): profile
+        for dag in _per_pp_dags(plan_or_dags)
+        for node in dag.nodes.values()
+        if node.node_kind in _P2P_KINDS
+        for rank, profile in get_node_profile_times(
+            node, NORMAL_PROFILE_MODE
+        ).items()
+    }
     normal = _replay_step_objective(
         plan_or_dags,
         profile_mode=NORMAL_PROFILE_MODE,
         sample_iteration_ids=sample_iteration_ids,
         strict=strict,
+        normal_p2p_post_profiles=normal_p2p_post_profiles,
     )
     canonical_isolated = _replay_step_objective(
         plan_or_dags,
         profile_mode=ISOLATED_PROFILE_MODE,
         sample_iteration_ids=sample_iteration_ids,
         strict=strict,
+        normal_p2p_post_profiles=normal_p2p_post_profiles,
     )
 
     try:
@@ -473,6 +488,7 @@ def attribute_profile_mode_savings(
             profile_mode=NORMAL_PROFILE_MODE,
             sample_iteration_ids=sample_iteration_ids,
             strict=strict,
+            normal_p2p_post_profiles=normal_p2p_post_profiles,
         )
     finally:
         for feature in features:
@@ -509,6 +525,7 @@ def attribute_profile_mode_savings(
                     profile_mode=NORMAL_PROFILE_MODE,
                     sample_iteration_ids=sample_iteration_ids,
                     strict=strict,
+                    normal_p2p_post_profiles=normal_p2p_post_profiles,
                 )
                 marginal_samples[feature_index].append(current - updated)
                 current = updated

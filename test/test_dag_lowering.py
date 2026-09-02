@@ -441,6 +441,7 @@ def _case_digest(
     communication_order = _order_communication_transactions(per_rank)
     for rank_dag in per_rank:
         resolve_total_order_per_stream(rank_dag)
+    communication_order = _order_communication_transactions(per_rank)
     _materialize_global_communication_issue_edges(
         per_rank, communication_order
     )
@@ -550,6 +551,7 @@ def _lower_afd_schedule(base_name: str, *, actor_groups: int) -> tuple[TrainingD
     communication_order = _order_communication_transactions(local_dags)
     for local_dag in local_dags:
         resolve_total_order_per_stream(local_dag)
+    communication_order = _order_communication_transactions(local_dags)
     _materialize_global_communication_issue_edges(
         local_dags, communication_order
     )

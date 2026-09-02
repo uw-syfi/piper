@@ -219,16 +219,17 @@ out/<timestamp>/
 `results.csv` contains a row for each SPMD rank (e.g., each DP rank), including
 raw-distribution summaries and percentage uncertainty for iteration time,
 training throughput, and per-PP-rank peak memory. With
-`--profile-and-simulate`, the run directory also contains the reusable
-multi-mode profile JSON and normal/interference-free simulation statistics.
+`--profile-and-replay`, the run directory also contains the reusable
+multi-mode profile JSON and normal/perfect-overlap replay statistics.
 
 Optional artifact generation flags:
 
 * `--viz` renders the generated pipeline schedule and per-PP-rank DAG IRs under the run directory.
 * `--pytorch-profiler --pytorch-profiler-iters <n>` runs extra profiled iterations and writes combined Chrome trace files per SPMD rank; Piper annotates GPU events with DAG IR node labels.
-* `--profile-and-simulate` collects interference-free and normal node profiles,
-  replays both, and reports normal-replay prediction error. `--profile-iters`
-  sets the exact measured iteration count for each mode and
+* `--profile-and-replay` collects isolated and normal node profiles, replays
+  both, and reports prediction error as `(normal replay - instrumented normal
+  step) / instrumented normal step`. `--profile-iters` sets the exact measured
+  iteration count for each mode and
   `--profile-warmup-iters` sets its warmup count.
 * Normal hardware timing runs exactly `--iters` measured iterations after
   `--warmup` warmup iterations.

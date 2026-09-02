@@ -51,9 +51,9 @@ sys.path.insert(0, _REPO_ROOT)
 
 # Model example modules import shared harness helpers.  Reuse this module when
 # the harness is launched as a script instead of loading a second copy under
-# the ``test_harness`` name.
+# the ``run_harness`` name.
 if __name__ == "__main__":
-    sys.modules.setdefault("test_harness", sys.modules[__name__])
+    sys.modules.setdefault("run_harness", sys.modules[__name__])
 
 import ray
 from ray.util.placement_group import placement_group_table

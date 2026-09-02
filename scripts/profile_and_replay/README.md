@@ -53,10 +53,8 @@ one communication transaction still rendezvous together.
 
 This policy removes overlap between otherwise-independent node work while
 retaining stream-specific kernel behavior and the actual runtime protocol. Its
-CUPTI envelopes are used as the isolated service measurements. A
-routed communication node may internally issue several metadata and payload
-collectives, but capture currently stores their combined envelope as one node
-measurement.
+CUPTI envelopes are used as the isolated service measurements. Capture stores
+each communication node's combined activity envelope as one node measurement.
 
 ### DAG replay
 
@@ -74,12 +72,16 @@ Replayed completion is determined by node family:
 - **Compute and other non-communication nodes:** completion is the maximum end
   of the node's data, temporal, and DAG-encoded same-stream predecessors plus
   the selected profile's complete CUDA activity-envelope duration.
-- **Ordinary and routed collectives** (`all-reduce`, `all-gather`,
-  `reduce-scatter`, `A2A`, `M-to-N`, and `N-to-M`): every participant first
-  reaches an all-participant GPU rendezvous. Each endpoint completes after its
-  policy-specific post-rendezvous service tail. "Symmetric" means every
-  participant must arrive; it does not require equal payloads or equal endpoint
-  durations.
+- **Ordinary collectives and A2A** (`all-reduce`, `all-gather`,
+  `reduce-scatter`, and `A2A`): every participant first reaches an
+  all-participant GPU rendezvous. Each endpoint completes after its
+  policy-specific post-rendezvous service tail. Every participant must arrive;
+  payloads and endpoint durations need not be equal.
+- **M-to-N and N-to-M routed communication:** replay rejects these nodes. A
+  node may issue an asymmetric or compound set of peer sends and receives, but
+  its whole-node activity envelope does not expose their matching structure,
+  per-transfer service times, issue order, or overlap. Those details are
+  required for accurate peerwise replay.
 - **P2P send/receive:** a matched SEND/RECV node pair is one compound
   transaction, including any internal header, payload, or batched operations.
   Send completion adds its aggregate profiled tail after its own first-call
@@ -94,6 +96,16 @@ are used only to remove matching and local-readiness wait from isolated P2P
 service measurements. Issue-only DAG edges do not become GPU timing
 predecessors. The replayed step time is the makespan of the resulting event
 graph.
+
+Reported metrics use these signed formulas:
+
+- prediction error = `(normal replay - instrumented normal step) / instrumented normal step`;
+- interference overhead = `(normal replay - perfect-overlap replay) / normal replay`.
+
+The prediction-error endpoints are arithmetic means across their respective
+normal-replay and synchronized instrumented-normal samples. The ordinary
+uninstrumented step time remains a separate reported measurement and is not the
+prediction-error reference.
 
 Durable Kineto profiles containing P2P nodes must include these host post
 timestamps. Replay fails closed with a re-profile error for older P2P artifacts
@@ -112,12 +124,13 @@ model SM or memory-bandwidth contention, network links/NIC capacity,
 communicator occupancy, general CPU launch latency beyond the captured P2P post
 releases, allocator behavior outside the attributed CUDA ranges, or
 interference created by a different schedule.
-Otherwise-independent streams overlap without resource limits. Routed nodes
-and ordinary A2A nodes are modeled with one all-participant entry rendezvous
-and one aggregate tail even when the runtime issues multiple internal
-collectives. Replay does not model their underlying peer-to-peer transfer
-graph, nonzero split pattern, or independent peer progress. Dense-state P2P
-headers and multiple tensors are also not separate replay phases.
+Otherwise-independent streams overlap without resource limits. A2A nodes are
+modeled with one all-participant entry rendezvous and one aggregate tail;
+replay does not model their underlying peer-to-peer transfer graph, nonzero
+split pattern, or independent peer progress. M-to-N and N-to-M nodes are
+unsupported because their potentially asymmetric, compound transfers cannot
+be reconstructed from whole-node timing alone. Dense-state P2P headers and
+multiple tensors are also not separate replay phases.
 Consequently, results should not be extrapolated to a different topology,
 tensor shape, routing distribution, or kernel selection without collecting
 new profiles.

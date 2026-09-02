@@ -51,9 +51,9 @@ from models.qwen3 import (
 from torchtitan.models.qwen3.model.model import precompute_rope_cache
 
 try:
-    from .test_harness import _add_profile_comparison_metrics
+    from .run_harness import _add_profile_comparison_metrics
 except ImportError:
-    from test_harness import _add_profile_comparison_metrics
+    from run_harness import _add_profile_comparison_metrics
 
 logger = create_logger("test_qwen", LOG_LEVEL)
 
