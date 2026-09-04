@@ -31,15 +31,11 @@ Figure 1 uses pairwise chunks 1 and 2 from the fixed-20, 12,288-token suite:
 - the five rendered victim/aggressor kernels are grouped GEMM, P2P send, A2A,
   all-gather, and reduce-scatter.
 
-The authoritative suite manifest identifies the benchmark command and immutable
+The frozen authoritative suite manifest identifies the benchmark command and immutable
 matrix/profile/trace inputs. The benchmark runner records hashes of its imported
-implementation modules. The committed
-`scripts/partial_overlap_interference_benchmarks/benchmark_pairwise_overlap_cases.py`,
-`scripts/partial_overlap_interference_benchmarks/run_pairwise_authoritative_12k_coretrend_fixed20.py`,
-and their hash-bound support modules in the same package match that recorded
-implementation. The preserved historical suite manifest retains the runner path
-used during original collection; the reorganized driver maps it to the current
-package path when constructing a new run.
+implementation modules. The preserved manifest and frozen pipeline retain the
+paths and hashes used during the original collection; they are provenance, not
+a supported launcher for a new run.
 
 The raw chunk corpora are deliberately not duplicated (they total more than 12
 GB). Their durable paths and SHA-256 values are recorded in `manifest.json`. The

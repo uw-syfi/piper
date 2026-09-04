@@ -1,1 +1,1 @@
-"""Diagnostics for profiled simulator inputs and trace counterfactuals."""
+"""Diagnostics for profile-and-replay inputs and trace analysis."""
