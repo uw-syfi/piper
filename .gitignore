@@ -8,3 +8,7 @@ out/
 .codex
 .gb200_tmux_state/
 ec2-trust-policy.json
+scripts/partial_overlap_interference_benchmarks/sm_free_collectives/**/.runtime/
+benchmark_data/partial_overlap_interference/mode_runs/
+benchmark_data/partial_overlap_interference/sm_free_collectives/
+benchmark_data/partial_overlap_interference/zero_cta_gemm_investigation/

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "scope": "Pairwise benchmark Figure 1 timing plot and its resource-usage table",
+  "timing_source": {
+    "sequence_length": 12288,
+    "sampling": "fixed 20 issued records per nominal stratum",
+    "chunks_used": [
+      {
+        "id": "coretrend_fixed20_v3_01_pairwise_compute",
+        "raw_path": "/lustre/fsw/portfolios/coreai/projects/coreai_dlcompiler_agent/users/mfrisella/piper/out/20260809_pairwise_overlap_benchmark/authoritative_12k_coretrend_fixed20_v3/chunk01_pairwise_compute.json",
+        "raw_sha256": "30b009ed63a0a4651528d614e964b81bb33a832f26dacdc5fbecb2aa3659dcac",
+        "estimator_valid_samples_used_by_figure1": 3068
+      },
+      {
+        "id": "coretrend_fixed20_v3_02_pairwise_aux_comm",
+        "raw_path": "/lustre/fsw/portfolios/coreai/projects/coreai_dlcompiler_agent/users/mfrisella/piper/out/20260809_pairwise_overlap_benchmark/authoritative_12k_coretrend_fixed20_v3/chunk02_pairwise_aux_comm.json",
+        "raw_sha256": "f9121807ed675de67ff10b8fb2d5d4f422da2f78d344b39e2d6365bfbe8d688f",
+        "estimator_valid_samples_used_by_figure1": 2088
+      }
+    ],
+    "lossless_three_chunk_merge_sha256": "4ebea032c4de18f92ccb80b6143fd61882b48c7b72e87992f86300746e292672",
+    "note": "The validation receipts cover the full three-chunk merge; Figure 1 selects only pairwise chunks 1 and 2. The multi-aggressor chunk is not plotted."
+  },
+  "figure1_validation": {
+    "combined_directed_dispatch_lines": 64,
+    "combined_points": 272,
+    "combined_samples": 5156,
+    "source_victim_kernels": [
+      "C-BW",
+      "C-DENSE",
+      "C-GROUPED",
+      "a2a",
+      "ag",
+      "p2p_recv",
+      "p2p_send",
+      "rs"
+    ],
+    "rendered_directed_dispatch_lines": 36,
+    "rendered_points": 168,
+    "rendered_samples": 3294,
+    "historical_png_sha256": "0511a3ccbc5631314646d619d4e348c108ed8456a8d5719feefb4fe3aa905886",
+    "historical_svg_sha256": "c7d1d02cdc45aa8b5b1f70437a65383bcff3081c2ccde3b77a7189152f9e7b"
+  },
+  "artifact_sha256": {
+    "README.md": "c7a3b982c1f73f284873f1df7cb43328020e0d6ea8b934a1d56c05b863b91a7c",
+    "data/figure1_overlap_response_by_victim_source.csv": "1ac22c5e5b347c4b8bd58f4ed650d18e0b610f0248855267f04d96045b03cc88",
+    "generate_factor_figures.py": "14ccaf0ce031a46c5e3f490b5d378dd399bc63e5414d3461c5033f5c55e0d3fd",
+    "provenance/AUTHORITATIVE_12K_CORETREND_FIXED20_SUITE_MANIFEST_V3.json": "179ae1fe55af97739a05f673e644d979c1bf3ed18036a05082fcf5c69700e7c7",
+    "provenance/acceptance_v3.json": "82dc2632c42fee0e97e04ac3049801d6ab26b68618e786221e4665af1bd041a0",
+    "provenance/conversion_manifest.json": "a13906b119b5d44974778ee1841d40f680ce0b30c66ae5b1dbd912b7d8f7af4d",
+    "provenance/frozen_pipeline/scripts/convert_pairwise_case_results.py": "4059f9e06501520083f28f1b8e4d181d854e667833e71f720df66177f38d5af0",
+    "provenance/frozen_pipeline/scripts/merge_pairwise_overlap_results.py": "d219cbf82f5fca5abaa01d68c5f77a47331ef974b42fc7708fb76c2101d8ac35",
+    "provenance/frozen_pipeline/scripts/validate_pairwise_overlap_corpus.py": "8988b479d8d81d6d86a9c87cb12c66e0b6cf11d5eaf8d7cc88be1b81e27d7520",
+    "provenance/frozen_pipeline/src/pairwise_overlap_analysis_filter.py": "04d330e90436ca6d30666343f70acdb10ed26f1f40f07c649e36c465463553f7",
+    "provenance/frozen_pipeline/src/pairwise_overlap_corpus_validation.py": "d2528a3af3a4f81ffcc14473b7e46869d1b054f04a1ded56163080b60a92e4f4",
+    "provenance/frozen_pipeline/src/pairwise_overlap_correctness.py": "db639906bec54e338e3848196dc497402876fa4b87d1e08425a3956647aa50b3",
+    "provenance/frozen_pipeline/src/pairwise_overlap_identity.py": "eea3225d1cd4da56b6acf585db82c51ee66822f3b6a1380cf62ce7ebd3f29748",
+    "provenance/frozen_pipeline/test/test_pairwise_overlap_corpus_validation.py": "9f71b605b37ca9b8ad9660442eb74f931f0af505da8fba9b946cf19ef37aa22c",
+    "provenance/frozen_pipeline_files_sha256.json": "1085401f3177bdb63ac14e2559de2eda222554b97818b2a43701505ae8b1e727",
+    "provenance/postprocessing_receipt.json": "5ace3c1ac9e84f1c939b5c6c47122e051f4b295710f08ca7a4fa43c22e5b7940",
+    "render_figure1.py": "e142da10c2e715070af3b509068aee1626602c7cba417b0ff1364ec236ad036b",
+    "resource_usage/RESOURCE_METRICS_REPORT.md": "85cf4616e43b1e107505a797c26479885d34a60bc34054d39a83f6e059b3f979",
+    "resource_usage/RESOURCE_METRICS_TABLE.tex": "f196d5fe517bc924278b45653df33a5ad0a1ff442e04758e265bbe1889b7c4e2",
+    "resource_usage/figure1_kernel_launch_geometry.csv": "021fb06dbaa55aeff9616f945210b67b4db99bfac1e3f1b2b719db45967c0b1d",
+    "resource_usage/resource_metrics_summary.csv": "c03ca6266b0f48f31cc733d21c6504b5985745a8e2344202b3b36fd598392f1a",
+    "resource_usage/resource_metrics_trials.csv": "c80eeb00b621e18bc5d270de233b857f563abc6a2b13c229cd4d7895deb344ad",
+    "resource_usage/resource_metrics_validation.json": "2a24ecb924eb7fb4fbdb9039d62f6b38aa0e487b72ab4f56ce2f1982f003d730",
+    "validate_bundle.py": "087f197af0cc008e76726ddb8981cd09852658e1df4b12854ef2981a1aefd7ef"
+  },
+  "repository_sha256": {
+    "scripts/partial_overlap_interference_benchmarks/__init__.py": "3230fd63f18d3b8a34a5821226c6aa92755bdcb83f16cea3596228f7d71559f7",
+    "scripts/partial_overlap_interference_benchmarks/README.md": "e61aa2b8e9bb290c3b24957ce88fc7c3637f60ad1f8887708d2de95b549e631a",
+    "scripts/partial_overlap_interference_benchmarks/PAIRWISE_OVERLAP_BENCHMARK_PLAN.md": "324a9f23d63ab41b43b3f9bf0b3d5baf7eac9fe39933ba22e7d56ca1343e883d",
+    "scripts/partial_overlap_interference_benchmarks/benchmark_pairwise_overlap_cases.py": "dec6a58f8af4b1010082147498481a5619a7b84fc8877a5a0f262ac2ddceaf59",
+    "scripts/partial_overlap_interference_benchmarks/derive_figure1_peak_sm_footprint.py": "777d889654873acda9e7dd12e6c5b2247cfce25b7b50ef00624959e7a4574d2e",
+    "scripts/partial_overlap_interference_benchmarks/run_pairwise_authoritative_12k_coretrend_fixed20.py": "1d70bae2a2c2485a4b1ad8cbfb360b0c9dddfd4c22d973def350ad3186389453",
+    "scripts/partial_overlap_interference_benchmarks/summarize_figure1_isolated_resources.py": "4c5a271c133ff24611db1b9ec1fa06da80428dd90ff6057e50cac35d1312c734",
+    "scripts/partial_overlap_interference_benchmarks/pairwise_overlap_adaptive_controller.py": "1e884ac05724df2433d48ba40f8605bec4ea4486b482c4c1d28f328874dbf1e3",
+    "scripts/partial_overlap_interference_benchmarks/pairwise_overlap_benchmark.py": "838fb7ff60a4dee296b4c7b9945b458c2f6da1fc7fda617def414a91f6526622",
+    "scripts/partial_overlap_interference_benchmarks/pairwise_overlap_restart.py": "8051174e16cca01716797deb27f8452ccedf2a1b9de6c3fd8fdd10606f46db6e",
+    "scripts/partial_overlap_interference_benchmarks/pairwise_overlap_sampling.py": "d94207d98be909c48f5c5771502d3c7fae50ee272c8bebb909c3ca2369406712",
+    "scripts/partial_overlap_interference_benchmarks/pairwise_overlap_trace_kernels.py": "d314e0ccd7d4c116577574b56b43912912b4d4adb368fc429df83e37ff1786f1",
+    "scripts/partial_overlap_interference_benchmarks/runtime_health.py": "0a9dff5278e8f602fddc1d03a350026700642b2caffbb4f23fe01b4bc3c21733",
+    "test/test_pairwise_authoritative_coretrend_fixed20_driver.py": "b22df1fcef5730c3657052eab64021f8131b9fa142a36964d49deec9dbdbd4a3",
+    "test/test_pairwise_overlap_cases.py": "2fe4181bea16507af834aeb89770e366ef3d5a3c17dbefb25b5e9bc740d4dae4"
+  }
+}
