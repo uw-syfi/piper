@@ -404,7 +404,16 @@ def _placeholder_is_runtime_input(node: fx.Node) -> bool:
         return False
     if bool(getattr(ex, "requires_grad", False)):
         return False
-    if "self" in node.name or "grapharg" in node.meta:
+    # Dynamo attaches meta["grapharg"] to *every* placeholder while the backend
+    # is running (checked on torch 2.10.0), and clears it afterwards. Testing for
+    # it here therefore rejected the real model input as well as the lifted
+    # parameters, so seg 0 got input_idxs=[] and _load_stage zero-filled the
+    # input slot: the model trained on zeros and load_input's data was ignored.
+    # The three checks above already exclude parameters and anything requiring
+    # grad, and the name check excludes lifted module attributes such as
+    # l_self_freqs_cis and l_self_mask, which must stay graphargs so that
+    # load_const_attrs can fill them.
+    if "self" in node.name:
         return False
     return True
 
