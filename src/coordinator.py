@@ -1,3 +1,4 @@
+import asyncio
 import ray
 from typing import Callable
 import os
@@ -6,6 +7,7 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .state import create_logger, LOG_LEVEL
+from . import state as piper_state
 from .schedule import load_schedule_info
 
 
@@ -14,7 +16,10 @@ from .schedule import load_schedule_info
 
 # Use manual stage annotations- more stable
 @ray.remote(num_gpus=0.1)
-def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callable, *args, **kwargs):
+def run_dp_rank(
+    dp_rank, dp_degree, pp_degree, world_size, training_func: Callable, *args,
+    coordinator=None, **kwargs,
+):
     logger = create_logger("coordinator", LOG_LEVEL)
     logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
 
@@ -23,12 +28,17 @@ def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callab
     os.environ["PIPER_PP_DEGREE"] = str(pp_degree)
     os.environ["PIPER_WORLD_SIZE"] = str(world_size)
     os.environ["TORCH_LOGS"] = "+graph_breaks"
+    # Via the module: Ray ships this function by value, so a directly
+    # referenced `piper_metadata` would be a pickled copy, not the singleton.
+    piper_state.piper_metadata.coordinator = coordinator
     return training_func(*args, **kwargs)
 
 
 @ray.remote
 class PiperProgramCoordinator:
-    """Central Actor that Coordinates all the DP replicas of a single pipeline"""
+    """Central actor that coordinates all the DP replicas of a single
+    pipeline: spawns and supervises the dp_rank driver tasks.
+    """
 
     def __init__(
         self,
@@ -45,7 +55,7 @@ class PiperProgramCoordinator:
         # pp_rank). In that mode DP drivers are spread across the pp bundles.
         self.pp_outer = pp_outer
 
-    def run_program(self, training_func: Callable, pg, *args, **kwargs):
+    async def run_program(self, training_func: Callable, pg, *args, **kwargs):
         from .compile import _RANK0_ADDR_ACTOR, _COMPILED_DATA_ACTOR
         logger = create_logger("coordinator", LOG_LEVEL)
         try:
@@ -65,27 +75,47 @@ class PiperProgramCoordinator:
             logger.exception("Failed to kill stale Ray actor named %s", _COMPILED_DATA_ACTOR)
             raise
 
-        return ray.get(
-            [
-                run_dp_rank.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=(
-                            dp_rank % self.pp_degree if self.pp_outer else dp_rank
-                        ),
-                    )
-                ).remote(
-                    dp_rank,
-                    self.dp_degree,
-                    self.pp_degree,
-                    self.world_size,
-                    training_func,
-                    *args,
-                    **kwargs,
+        self_handle = ray.get_runtime_context().current_actor
+
+        refs = [
+            run_dp_rank.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=(
+                        dp_rank % self.pp_degree if self.pp_outer else dp_rank
+                    ),
                 )
-                for dp_rank in range(self.dp_degree)
-            ]
-        )
+            ).remote(
+                dp_rank,
+                self.dp_degree,
+                self.pp_degree,
+                self.world_size,
+                training_func,
+                *args,
+                coordinator=self_handle,
+                **kwargs,
+            )
+            for dp_rank in range(self.dp_degree)
+        ]
+        tasks = [asyncio.ensure_future(ref) for ref in refs]
+
+        pending = set(tasks)
+        results = []
+        failures = 0
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    results.append(task.result())
+                except Exception:
+                    failures += 1
+                    logger.exception(
+                        f"a dp_rank task failed ({failures}/{self.dp_degree})"
+                    )
+                    raise
+        return results
 
 
 def create_piper_placement_group(schedule_directives_file: str, pp_outer: bool = False):

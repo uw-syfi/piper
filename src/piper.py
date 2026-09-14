@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import contextmanager
 from typing import Iterator
@@ -242,6 +243,24 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
                 f"step exceeded step_timeout={step_timeout:.1f}s; "
                 "still waiting on in-flight step (peer may be down)"
             )
+        except ray.exceptions.RayTaskError as e:
+            # ray.get raises a dual instance exposing only .cause and str();
+            # the first line of str() names the actor (pid, ip, actor_id).
+            logger.error(
+                f"run_dag raised on dp_rank {os.environ.get('PIPER_DP_RANK')}: "
+                f"{str(e).splitlines()[0]}: {e.cause!r}"
+            )
+            raise
+        except ray.exceptions.RayActorError as e:
+            # ActorDiedError or ActorUnavailableError: the process, not the step.
+            logger.error(
+                f"actor failure on dp_rank {os.environ.get('PIPER_DP_RANK')} "
+                f"during step: {e}"
+            )
+            raise
+        except ray.exceptions.RayError as e:
+            logger.error(f"ray error during step: {e}")
+            raise
     step_time = time.perf_counter() - t0
 
     if log_stats:
