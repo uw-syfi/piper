@@ -147,6 +147,7 @@ class RuntimeState:
     ep_group: Any = None
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
+    tied_param_group: Any = None
     streams: dict[str, AbstractContextManager] = field(default_factory=dict)
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None

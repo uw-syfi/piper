@@ -196,6 +196,24 @@ class PiperActor:
                     continue
                 dist.broadcast(param.data, src=src_global_rank, group=group)
 
+    def sync_tied_params(self, param_names: list[str], src_pp_rank: int) -> None:
+        """Broadcast tied parameters from *src_pp_rank* to all other PP ranks.
+
+        Each rank calls this; the rank matching *src_pp_rank* sends, others
+        receive.  Uses ``tied_param_group`` which spans all PP ranks.
+        """
+        group = self.runtime.tied_param_group
+        if group is None:
+            return
+        for ubid, bucket in self.stages.buckets.items():
+            for idx, name in zip(bucket.param_idxs, bucket.param_names):
+                if name not in param_names:
+                    continue
+                param = bucket.forward_args[idx]
+                if param is None:
+                    continue
+                dist.broadcast(param.data, src=src_pp_rank, group=group)
+
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
         if is_cuda():
@@ -334,6 +352,28 @@ class PiperActor:
             if self.runtime.global_rank in group_ranks:
                 self.runtime.pp_lo_hi = lo_hi_group
                 self.runtime.pp_hi_lo = hi_lo_group
+
+    def create_tied_param_groups(self, pp_rank_sets: list[list[int]]) -> None:
+        """Create process groups for tied-parameter gradient sync.
+
+        *pp_rank_sets* is a list of PP-rank groups that share a tied parameter.
+        For each set, a process group is created spanning those PP ranks within
+        every DP replica.  This is called after the DAG is loaded so we know
+        exactly which PP ranks share which parameters.
+        """
+        if not pp_rank_sets:
+            return
+        dist_backend = "nccl" if is_cuda() else "gloo"
+        num_dp_replicas = self.runtime.world_size // self.runtime.pp_degree
+        for pp_ranks in pp_rank_sets:
+            for dp_replica in range(num_dp_replicas):
+                group_ranks = [
+                    dp_replica * self.runtime.pp_degree + pp
+                    for pp in pp_ranks
+                ]
+                group = dist.new_group(ranks=group_ranks, backend=dist_backend)
+                if self.runtime.global_rank in group_ranks:
+                    self.runtime.tied_param_group = group
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()

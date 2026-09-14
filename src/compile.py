@@ -90,6 +90,67 @@ def _prepare_training_dags_for_rpc(per_pp_training_dags: list) -> list:
     return rpc_dags
 
 
+def _tied_param_pp_rank_sets(per_pp_training_dags: list) -> tuple[list[list[int]], list[str]]:
+    """Detect which PP ranks share tied parameters.
+
+    Returns ``(pp_rank_sets, tied_param_names)`` where *pp_rank_sets* is a
+    list of PP-rank groups (e.g. ``[[0, 2]]`` if PP 0 and PP 2 share a param)
+    and *tied_param_names* is the union of all tied parameter names.
+    """
+    # param_name -> set of pp_ranks that hold it
+    param_pp_ranks: dict[str, set[int]] = {}
+    for pp_rank, dag in enumerate(per_pp_training_dags):
+        for node in dag.nodes.values():
+            meta = getattr(node, "node_meta", None) or {}
+            names = meta.get("tied_param_names")
+            if names:
+                for name in names:
+                    param_pp_ranks.setdefault(name, set()).add(pp_rank)
+
+    # Group params that span the same set of PP ranks.
+    seen_sets: dict[tuple[int, ...], list[int]] = {}
+    all_tied_names: set[str] = set()
+    for name, pp_ranks in param_pp_ranks.items():
+        if len(pp_ranks) <= 1:
+            continue
+        all_tied_names.add(name)
+        key = tuple(sorted(pp_ranks))
+        if key not in seen_sets:
+            seen_sets[key] = sorted(pp_ranks)
+
+    return list(seen_sets.values()), sorted(all_tied_names)
+
+
+def _sync_tied_params(per_pp_training_dags: list, actors: dict) -> None:
+    """Create tied-param process groups and broadcast initial weights.
+
+    Detects which PP ranks share tied parameters, creates a process group
+    for each such set (so the all-reduce is as small as possible), then
+    broadcasts the tied weights from the lowest PP rank in each group.
+    """
+    pp_rank_sets, tied_names = _tied_param_pp_rank_sets(per_pp_training_dags)
+    if not pp_rank_sets:
+        return
+
+    # Create per-pair process groups on every actor (dist.new_group is a
+    # collective — all ranks in the world must participate).
+    ray.get([
+        actor.create_tied_param_groups.remote(pp_rank_sets)
+        for actor in actors.values()
+    ])
+
+    # Broadcast tied params from the lowest PP rank in each group.
+    src_pp_rank = min(pp_rank_sets[0])  # lowest PP rank across all groups
+    ray.get([
+        actor.sync_tied_params.remote(tied_names, src_pp_rank=src_pp_rank)
+        for actor in actors.values()
+    ])
+    logger.debug(
+        "Synchronized tied params across PP rank sets %s: %s",
+        pp_rank_sets, tied_names,
+    )
+
+
 def _compute_loss_pp_ranks(per_pp_training_dags: list) -> list[int]:
     ranks: list[int] = []
     for pp_rank, dag in enumerate(per_pp_training_dags):
@@ -328,6 +389,10 @@ def piper_setup(
             piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
             for pp_rank, pp_dag in enumerate(per_pp_training_dags)
         ])
+
+    # Synchronize tied parameters: detect params shared across PP ranks
+    # and broadcast from the lowest-rank holder.
+    _sync_tied_params(per_pp_training_dags, piper_metadata.actors)
 
     # Synchronize all DP replicas: broadcast parameters from dp_rank=0 so
     # every replica starts with identical weights.

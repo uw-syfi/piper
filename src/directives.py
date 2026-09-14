@@ -467,6 +467,120 @@ def _insert_send_recv_comm_nodes(dag: TrainingDAG, comm_stream: str | None = Non
         dag.add_edge(TrainingDAGEdge(src_uid=recv_uid, dst_uid=dst.uid, dep_kind="data", tensor_name=edge.tensor_name))
 
 
+def _fwd_param_names(node: TrainingDAGNode) -> list[str]:
+    """Return parameter placeholder names for a FWD compute node."""
+    meta = node.node_meta
+    gm = meta.get("gm")
+    param_idxs = meta.get("param_idxs")
+    if gm is None or param_idxs is None:
+        return []
+    names = [n.name for n in gm.graph.nodes if n.op == "placeholder"]
+    return [names[i] for i in param_idxs if 0 <= i < len(names)]
+
+
+def _insert_tied_param_reduce_nodes(
+    dag: TrainingDAG,
+    comm_stream: str | None = None,
+) -> None:
+    """Insert ALL_REDUCE nodes for parameters shared across devices.
+
+    When the same parameter (identified by placeholder name) appears in FWD
+    nodes placed on different devices, both devices accumulate independent
+    gradients during the backward pass.  This inserts a REDUCE_COMM node after
+    each BWD that touches such a parameter so the gradients are summed before
+    the optimizer step.
+    """
+    # Build param_name -> set of devices.
+    param_devices: dict[str, set[int]] = {}
+    # Also track param_name -> list of fwd_uids that use it.
+    param_fwd_uids: dict[str, list[str]] = {}
+    for node in dag.nodes.values():
+        if node.node_kind != "COMPUTE" or node.compute_subkind != "FWD":
+            continue
+        if node.device is None:
+            continue
+        for pname in _fwd_param_names(node):
+            param_devices.setdefault(pname, set()).update(node.device)
+            param_fwd_uids.setdefault(pname, []).append(node.uid)
+
+    # Find params that span multiple devices.
+    tied_params = {
+        pname for pname, devices in param_devices.items()
+        if len(devices) > 1
+    }
+    if not tied_params:
+        return
+
+    # Collect BWD nodes whose FWD counterpart uses a tied param.
+    tied_fwd_uids: set[str] = set()
+    for pname in tied_params:
+        tied_fwd_uids.update(param_fwd_uids[pname])
+
+    # Collect BWD nodes whose FWD counterpart uses a tied param, grouped by
+    # the set of tied param names they touch.  Multiple BWD nodes may share
+    # the same tied-param group (e.g. the same weight used in two stages).
+    bwd_nodes_needing_sync: list[TrainingDAGNode] = []
+    for node in dag.nodes.values():
+        if node.node_kind != "COMPUTE" or not _is_backward_weight_subkind(node.compute_subkind):
+            continue
+        fwd_uid = node.node_meta.get("fwd_uid")
+        if fwd_uid in tied_fwd_uids:
+            bwd_nodes_needing_sync.append(node)
+
+    # Each device that holds a BWD touching tied params gets its own
+    # REDUCE_COMM node.  The nodes are **not** connected to each other —
+    # just like SEND/RECV pairs — so ``_split_global_training_dag_by_pp_rank``
+    # keeps them in separate per-device components.  The runtime executes
+    # them as a collective via ``tied_param_group``.
+    reduce_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "REDUCE_COMM")
+    inserted = 0
+    for bwd_node in bwd_nodes_needing_sync:
+        fwd_uid = bwd_node.node_meta.get("fwd_uid")
+        fwd_node = dag.nodes.get(fwd_uid)
+        if fwd_node is None:
+            continue
+        bwd_device = bwd_node.device
+        if bwd_device is None:
+            continue
+
+        tied_pnames = [p for p in _fwd_param_names(fwd_node) if p in tied_params]
+
+        reduce_uid = f"tied_reduce.{reduce_idx}"
+        reduce_idx += 1
+        inserted += 1
+
+        reduce_node = TrainingDAGNode(
+            uid=reduce_uid,
+            node_kind="REDUCE_COMM",
+            compute_subkind=None,
+            tag=dict(bwd_node.tag),
+            device=list(bwd_device),
+            stream=comm_stream if comm_stream is not None else _DEFAULT_STREAM,
+            node_meta={
+                "bwd_uid": bwd_node.uid,
+                "bucket_key": bwd_node.node_meta.get("bucket_key"),
+                "tied_param_sync": True,
+                "tied_param_names": tied_pnames,
+            },
+        )
+        dag.add_node(reduce_node)
+        dag.add_edge(
+            TrainingDAGEdge(
+                src_uid=bwd_node.uid,
+                dst_uid=reduce_uid,
+                dep_kind="data",
+                tensor_name=None,
+            )
+        )
+        _rewire_bwd_successors_through_sync(dag, bwd_node.uid, reduce_uid)
+
+    logger.debug(
+        "Inserted %d tied-param REDUCE_COMM nodes for params: %s",
+        inserted,
+        sorted(tied_params),
+    )
+
+
 def _replicate_update_nodes_by_device(dag: TrainingDAG) -> None:
     """Replicate UPD nodes per upstream device set so split components stay homogeneous."""
     upd_nodes = [n for n in list(dag.nodes.values()) if n.node_kind == "UPD" and ".rep" not in n.uid]
@@ -1598,6 +1712,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         place_stream = next(iter(place_streams))
     else:
         place_stream = None
+    _insert_tied_param_reduce_nodes(training_dag, comm_stream=place_stream)
     _replicate_update_nodes_by_device(training_dag)
     _insert_send_recv_comm_nodes(training_dag, comm_stream=place_stream)
 

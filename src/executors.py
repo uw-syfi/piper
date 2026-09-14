@@ -95,6 +95,31 @@ class CommunicationExecutor:
                 dist.all_reduce(grad, group=self.runtime.dp_group)
         return total_bytes
 
+    def tied_param_all_reduce_grads(self, ubid: Any, param_names: list[str], stream_ctx: AbstractContextManager) -> int:
+        """All-reduce gradients for tied parameters across PP ranks.
+
+        Only reduces gradients for parameters whose FX placeholder name is in
+        *param_names*, so that both ranks in the collective reduce the same
+        number of tensors with matching shapes.
+        """
+        bucket = self.stages.get_bucket(ubid)
+        if bucket is None:
+            return 0
+        grad_tensors = []
+        for idx, name in zip(bucket.param_idxs, bucket.param_names):
+            if name not in param_names:
+                continue
+            param = bucket.forward_args[idx]
+            if param is not None and param.grad is not None:
+                grad_tensors.append(param.grad)
+        if not grad_tensors:
+            return 0
+        total_bytes = sum(grad.numel() * grad.element_size() for grad in grad_tensors)
+        with stream_ctx:
+            for grad in grad_tensors:
+                dist.all_reduce(grad, group=self.runtime.tied_param_group)
+        return total_bytes
+
     def reduce_scatter(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
         assert ubid is not None, "reduce_scatter requires a non-None ubid"
         if not self.has_trainable_params_for_collective(ubid, "reduce_scatter"):
@@ -652,8 +677,14 @@ class DagExecutor:
                         f"ALL_REDUCE node uid={node.uid} has no sync_payload_ubids"
                     )
                     wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
+                    tied_names = self._node_meta(node).get("tied_param_names")
                     for ar_ubid in ar_ubids:
-                        self.communication.all_reduce_grads(ar_ubid, stream_ctx=node_stream_ctx)
+                        if tied_names:
+                            self.communication.tied_param_all_reduce_grads(
+                                ar_ubid, tied_names, stream_ctx=node_stream_ctx,
+                            )
+                        else:
+                            self.communication.all_reduce_grads(ar_ubid, stream_ctx=node_stream_ctx)
                     self.events.all_reduce[node.uid] = record_event(node_stream_ctx)
                     self.buffers.release(bwd_node.uid)
 
