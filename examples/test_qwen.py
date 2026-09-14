@@ -7,7 +7,7 @@ import time
 import os
 
 from src.compile import piper_setup
-from src.piper import piper_exec_dag
+from src.piper import piper_exec_dag, PiperFencedError
 from src.schedule import load_schedule_directives
 from src.state import piper_metadata, create_logger, LOG_LEVEL
 
@@ -97,6 +97,29 @@ def _train_step(args, it, data_rank, dp_degree, loss_fn, **kw):
     return losses
 
 
+def _run_standby(dp_rank):
+    """Park until promoted or shut down; on promotion, join the survivor's
+    new NCCL group and return.
+
+    dp_rank: this standby's dp_rank (>= dp_degree).
+    """
+    coordinator = piper_metadata.coordinator
+    actor = piper_metadata.actors[0] # pp_degree == 1
+    logger.info(f"standby dp_rank {dp_rank}: initialized and parked; "
+                "waiting for promotion or shutdown")
+    cmd = ray.get(coordinator.wait_for_cmd.remote())
+    if cmd.get("op") == "promote":
+        ray.get(
+            actor.join_standby_group.remote(cmd["new_ranks"]),
+            timeout=180,
+        )
+        logger.info(f"standby dp_rank {dp_rank}: joined NCCL group "
+                    f"{cmd['new_ranks']}")
+    else:
+        logger.info(f"standby dp_rank {dp_rank}: shutdown received; exiting")
+    return None
+
+
 def main(args, pg):
     batch_size = args.batch_size
 
@@ -140,32 +163,54 @@ def main(args, pg):
 
     actors = piper_metadata.actors
 
-    logger.info(f"Running {args.warmup} warmup iterations")
-    last_warmup_time = None
-    for it in range(args.warmup):
-        t0 = time.perf_counter()
-        _train_step(args, it, dp_rank, dp_degree, loss_fn)
-        last_warmup_time = time.perf_counter() - t0
-        if args.iteration_sleep > 0:
-            time.sleep(args.iteration_sleep)
+    # Standby ranks never train: park until promoted or shut down.
+    if dp_rank >= dp_degree:
+        return _run_standby(dp_rank)
 
     # No step_timeout during warmup; afterward 5x the last warmup step
     # (~steady step time), floored at 5s.
-    step_timeout = (
-        max(5.0, 5 * last_warmup_time) if last_warmup_time is not None else None
-    )
-
-    logger.info(f"Running {args.iters} timed iterations")
-    ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+    logger.info(f"Running {args.warmup} warmup iterations")
+    last_warmup_time = None
+    step_timeout = None
     iter_times = []
-    for it in range(args.warmup, args.warmup + args.iters):
-        start = time.perf_counter()
-        _train_step(args, it, dp_rank, dp_degree, loss_fn,
-                    log_stats=True, step_timeout=step_timeout)
-        end = time.perf_counter()
-        iter_times.append(end - start)
-        if args.iteration_sleep > 0:
-            time.sleep(args.iteration_sleep)
+    fenced = False
+    total = args.warmup + args.iters
+    it = 0
+    while it < total:
+        try:
+            if it < args.warmup:
+                t0 = time.perf_counter()
+                _train_step(args, it, dp_rank, dp_degree, loss_fn)
+                last_warmup_time = time.perf_counter() - t0
+                if args.iteration_sleep > 0:
+                    time.sleep(args.iteration_sleep)
+                it += 1
+                if it == args.warmup:
+                    step_timeout = (
+                        max(5.0, 5 * last_warmup_time)
+                        if last_warmup_time is not None
+                        else None
+                    )
+                    logger.info(f"Running {args.iters} timed iterations")
+                    ray.get([
+                        actor.reset_peak_memory.remote()
+                        for actor in actors.values()
+                    ])
+            else:
+                start = time.perf_counter()
+                _train_step(args, it, dp_rank, dp_degree, loss_fn,
+                            log_stats=True, step_timeout=step_timeout)
+                end = time.perf_counter()
+                iter_times.append(end - start)
+                if args.iteration_sleep > 0:
+                    time.sleep(args.iteration_sleep)
+                it += 1
+        except PiperFencedError as exc:
+            # Promotion fenced this rank mid-step; end the run cleanly with
+            # the iterations completed so far.
+            fenced = True
+            logger.info(f"run fenced during promotion at iteration {it}: {exc}")
+            break
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
@@ -173,7 +218,7 @@ def main(args, pg):
 
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
 
-    if args.pytorch_profiler:
+    if args.pytorch_profiler and not fenced:
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
             "out", "pytorch_profiles"
         )
