@@ -329,6 +329,14 @@ def piper_setup(
             for pp_rank, pp_dag in enumerate(per_pp_training_dags)
         ])
 
+    # Synchronize all DP replicas: broadcast parameters from dp_rank=0 so
+    # every replica starts with identical weights.
+    if int(os.environ.get("PIPER_DP_DEGREE", "1")) > 1:
+        ray.get([
+            actor.sync_dp_params.remote()
+            for actor in piper_metadata.actors.values()
+        ])
+
     loss_pp_ranks = _compute_loss_pp_ranks(per_pp_training_dags)
     if not loss_pp_ranks:
         loss_pp_ranks = [pp_degree - 1]
