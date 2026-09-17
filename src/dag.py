@@ -31,7 +31,7 @@ class TrainingDAGEdge:
 @dataclass
 class TrainingDAGNode:
     uid: str
-    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "ORDER_DUMMY"
+    node_kind: str  # "COMPUTE" | "SEND_COMM" | "RECV_COMM" | "REDUCE_COMM" | "ALL_GATHER_COMM" | "REDUCE_SCATTER_COMM" | "A2A_COMM" | "TP_COMM" | "ORDER_DUMMY"
     compute_subkind: str | None  # "FWD" | "BWD" | "BWD_I" | "BWD_W" when node_kind == "COMPUTE"
     tag: dict[str, int | None]
     device: list[int] | None

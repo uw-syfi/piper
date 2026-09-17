@@ -129,7 +129,7 @@ def _normalize_filter_devices_directive(
 ) -> tuple[str, list[dict[str, Any]], list[int], str | None, str | None, str | None, bool, bool, int | None]:
     if isinstance(directive, dict):
         op = directive.get("op")
-        if op not in ("place", "replicate", "shard"):
+        if op not in ("place", "replicate", "shard", "shard_tensor"):
             raise ValueError(f"Unsupported directive op: {op}")
         if "filter" not in directive:
             raise ValueError(f"{op} directive requires current API field 'filter': {directive}")
@@ -954,6 +954,46 @@ def _insert_reduce_scatter_comm_nodes(
         _rewire_bwd_successors_through_sync(dag, node.uid, rs_uid)
 
 
+def _boundary_info_for_edge(
+    dag: TrainingDAG,
+    src_node: TrainingDAGNode,
+    dst_node: TrainingDAGNode,
+    kind: str,
+) -> dict[str, Any]:
+    """Resolve the boundary-tensor position for a compute->compute data edge.
+
+    Backward data edges are reversed from the forward graph:
+        FWD: B -> A    becomes    BWD: A.bwd -> B.bwd
+    The tensor position is defined by the original forward producer, which is the
+    fwd node paired with the backward edge destination. Forward edges use the
+    edge source directly.
+
+    Both the EP all-to-all pass and the TP all-reduce pass need exactly this
+    mapping, so it lives here rather than being re-derived per pass.
+    """
+    if (
+        _is_backward_activation_subkind(src_node.compute_subkind)
+        and _is_backward_activation_subkind(dst_node.compute_subkind)
+    ):
+        fwd_producer_uid = dst_node.node_meta.get("fwd_uid")
+        if not isinstance(fwd_producer_uid, str) or fwd_producer_uid not in dag.nodes:
+            raise ValueError(
+                f"{kind} could not resolve forward producer for BWD edge "
+                f"{src_node.uid}->{dst_node.uid}: fwd_uid={fwd_producer_uid!r}"
+            )
+        producer = dag.nodes[fwd_producer_uid]
+    else:
+        producer = src_node
+
+    binfo = producer.node_meta.get("a2a_boundary_after")
+    if not isinstance(binfo, dict) or binfo.get("tensor_idx") is None:
+        raise ValueError(
+            f"{kind} missing tensor_idx for edge {src_node.uid}->{dst_node.uid}; "
+            f"producer={producer.uid} boundary_info={binfo!r}"
+        )
+    return binfo
+
+
 def _insert_shard_a2a_comm_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -967,33 +1007,6 @@ def _insert_shard_a2a_comm_nodes(
         uid for uid, node in dag.nodes.items()
         if node.node_kind == "COMPUTE" and any(_match_filter(node.tag, flt) for flt in filters)
     ]
-
-    def _a2a_boundary_for_edge(src_node: TrainingDAGNode, dst_node: TrainingDAGNode) -> dict[str, Any]:
-        # Backward data edges are reversed from the forward graph:
-        #     FWD: B -> A    becomes    BWD: A.bwd -> B.bwd
-        # The A2A tensor position is defined by the original forward producer,
-        # which is the fwd node paired with the backward edge destination.
-        if (
-            _is_backward_activation_subkind(src_node.compute_subkind)
-            and _is_backward_activation_subkind(dst_node.compute_subkind)
-        ):
-            fwd_producer_uid = dst_node.node_meta.get("fwd_uid")
-            if not isinstance(fwd_producer_uid, str) or fwd_producer_uid not in dag.nodes:
-                raise ValueError(
-                    f"A2A_COMM could not resolve forward producer for BWD edge "
-                    f"{src_node.uid}->{dst_node.uid}: fwd_uid={fwd_producer_uid!r}"
-                )
-            producer = dag.nodes[fwd_producer_uid]
-        else:
-            producer = src_node
-
-        binfo = producer.node_meta.get("a2a_boundary_after")
-        if not isinstance(binfo, dict) or binfo.get("tensor_idx") is None:
-            raise ValueError(
-                f"A2A_COMM missing tensor_idx for edge {src_node.uid}->{dst_node.uid}; "
-                f"producer={producer.uid} boundary_info={binfo!r}"
-            )
-        return binfo
 
     for uid in matched_uids:
         if uid not in dag.nodes:
@@ -1107,7 +1120,7 @@ def _insert_shard_a2a_comm_nodes(
 
         for e in incoming:
             src_node = dag.nodes[e.src_uid]
-            binfo = _a2a_boundary_for_edge(src_node, node)
+            binfo = _boundary_info_for_edge(dag, src_node, node, "A2A_COMM")
             a2a_tensor_idx = binfo["tensor_idx"]
             comm_uid = f"a2a.{a2a_idx}"
             a2a_idx += 1
@@ -1132,7 +1145,7 @@ def _insert_shard_a2a_comm_nodes(
 
         for e in outgoing:
             dst_node = dag.nodes[e.dst_uid]
-            binfo = _a2a_boundary_for_edge(node, dst_node)
+            binfo = _boundary_info_for_edge(dag, node, dst_node, "A2A_COMM")
             a2a_tensor_idx = binfo["tensor_idx"]
             comm_uid = f"a2a.{a2a_idx}"
             a2a_idx += 1
@@ -1154,6 +1167,160 @@ def _insert_shard_a2a_comm_nodes(
             _remove_edge(dag, e)
             dag.add_edge(TrainingDAGEdge(src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
+
+
+def _is_boundary_activation_edge_static(
+    dag: TrainingDAG,
+    e: TrainingDAGEdge,
+    node: TrainingDAGNode,
+    matched: set[str],
+) -> bool:
+    """Does this edge leave `node` for compute outside the matched region?"""
+    if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
+        return False
+    dst = dag.nodes[e.dst_uid]
+    if dst.node_kind != "COMPUTE":
+        return False
+    if node.compute_subkind == "FWD":
+        return dst.compute_subkind == "FWD"
+    if _is_backward_activation_subkind(node.compute_subkind):
+        return _is_backward_activation_subkind(dst.compute_subkind)
+    return False
+
+
+def _insert_tp_all_reduce_comm_nodes(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+    devices: list[int],
+    comm_stream: str | None = None,
+) -> None:
+    """Insert TP activation all-reduces at the boundary of a tensor-parallel region.
+
+    Tensor parallelism needs Megatron's f/g conjugate pair. In this IR both halves
+    land on *outgoing* compute->compute data edges of the matched region:
+
+      * forward (g): the region's output is a partial sum, so all-reduce it on the
+        FWD edge leaving the region;
+      * backward (f): the gradient w.r.t. the region's input is a partial sum, and
+        backward edges are reversed, so it is likewise the BWD edge leaving the
+        region.
+
+    Only edges that *leave* the matched set get a collective. Edges internal to the
+    region carry tensors that are sharded on purpose (a column-parallel output feeding
+    a row-parallel input) and must not be reduced.
+
+    Unlike ``replicate``, no parameter-gradient collective is inserted: TP weight
+    gradients are already shard-local. Composing this with ``replicate`` on the same
+    region is rejected rather than silently resolved.
+    """
+    expected = sorted(int(d) for d in devices)
+    if len(set(expected)) < 2:
+        # dp_degree and pp_degree are both 1 for a single-device group, so
+        # _join_process_groups never calls init_process_group and ep_group stays
+        # None. The all-reduce would then run on an uninitialized default group
+        # and fail deep in the executor with a torch.distributed error that says
+        # nothing about the schedule.
+        raise ValueError(
+            f"shard_tensor needs at least two distinct devices, got {devices}. "
+            f"A single-device tensor-parallel group has nothing to all-reduce; "
+            f"remove the directive to run the region unsharded."
+        )
+    tp_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "TP_COMM")
+
+    matched = {
+        uid for uid, node in dag.nodes.items()
+        if node.node_kind == "COMPUTE" and any(_match_filter(node.tag, flt) for flt in filters)
+    }
+
+    _SYNC_KINDS = {"REDUCE_COMM", "ALL_GATHER_COMM", "REDUCE_SCATTER_COMM"}
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.device is None or sorted(int(d) for d in node.device) != expected:
+            raise ValueError(
+                f"shard_tensor requires matched node {uid} to have devices={devices}, "
+                f"got node_devices={node.device}"
+            )
+        for e in dag.edges:
+            other_uid = e.dst_uid if e.src_uid == uid else (e.src_uid if e.dst_uid == uid else None)
+            if other_uid is None or e.dep_kind != "data":
+                continue
+            if dag.nodes[other_uid].node_kind in _SYNC_KINDS:
+                raise ValueError(
+                    f"shard_tensor cannot compose with replicate on the same region: node "
+                    f"{uid} already has {dag.nodes[other_uid].node_kind} node {other_uid} "
+                    f"attached. TP weight gradients are shard-local and must not be reduced "
+                    f"across the TP group."
+                )
+
+    # A boundary records one tensor index (_select_boundary_tensor_idx picks the
+    # best-scoring tensor), so exactly one of a region's outputs gets reduced. That
+    # is right for a TP region whose single output is a partial sum, and silently
+    # wrong for a region that also emits something replicated -- the replicated
+    # tensor would be summed across ranks, or the partial sum left unreduced,
+    # depending on which one scored higher. Refuse instead of guessing.
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.compute_subkind != "FWD":
+            continue
+        out_names = node.node_meta.get("output_names") or []
+        if len(out_names) > 1 and any(
+            _is_boundary_activation_edge_static(dag, e, node, matched)
+            for e in dag.edges
+        ):
+            raise ValueError(
+                f"shard_tensor matched node {uid}, whose region emits "
+                f"{len(out_names)} tensors {out_names[:4]} across its boundary, but a "
+                f"boundary carries a single tensor index so only one would be "
+                f"all-reduced. Split the region so the tensor needing the collective "
+                f"leaves it alone."
+            )
+
+    def _is_boundary_activation_edge(e: TrainingDAGEdge, node: TrainingDAGNode) -> bool:
+        if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
+            return False
+        dst = dag.nodes[e.dst_uid]
+        if dst.node_kind != "COMPUTE":
+            return False
+        if node.compute_subkind == "FWD":
+            return dst.compute_subkind == "FWD"
+        if _is_backward_activation_subkind(node.compute_subkind):
+            return _is_backward_activation_subkind(dst.compute_subkind)
+        return False
+
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        # BWD_W produces only weight gradients; there is no activation to reduce.
+        if node.compute_subkind == "BWD_W":
+            continue
+        outgoing = [e for e in list(dag.edges) if _is_boundary_activation_edge(e, node)]
+        for e in outgoing:
+            dst_node = dag.nodes[e.dst_uid]
+            binfo = _boundary_info_for_edge(dag, node, dst_node, "TP_COMM")
+            comm_uid = f"tp_all_reduce.{tp_idx}"
+            tp_idx += 1
+            dag.add_node(
+                TrainingDAGNode(
+                    uid=comm_uid,
+                    node_kind="TP_COMM",
+                    compute_subkind=None,
+                    tag=dict(node.tag),
+                    device=list(node.device) if node.device is not None else None,
+                    stream=comm_stream if comm_stream is not None else _DEFAULT_STREAM,
+                    node_meta={
+                        "direction": "outgoing",
+                        "source_uid": uid,
+                        "tp_tensor_idx": binfo["tensor_idx"],
+                        "bucket_key": node.node_meta.get(
+                            "bucket_key", dst_node.node_meta.get("bucket_key")
+                        ),
+                    },
+                )
+            )
+            _remove_edge(dag, e)
+            dag.add_edge(TrainingDAGEdge(
+                src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
+            dag.add_edge(TrainingDAGEdge(
+                src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
 def _apply_split_directive(
@@ -1553,6 +1720,49 @@ def _apply_order_directive(
                 _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
+_BOUNDARY_COMM_OPS = ("shard", "shard_tensor")
+
+
+def _reject_overlapping_boundary_comm_directives(
+    dag: TrainingDAG,
+    directives: list[Any],
+) -> None:
+    """Refuse two boundary-comm directives claiming the same compute node.
+
+    `shard` and `shard_tensor` both rewrite a matched node's activation edges to
+    route through a comm node. Whichever runs second then finds the edge already
+    pointing at a comm node rather than at compute, and skips it -- silently. The
+    outcome depends on the order the directives appear in the JSON:
+
+        shard then shard_tensor  ->  4 A2A_COMM, 0 TP_COMM  (TP dropped entirely)
+        shard_tensor then shard  ->  2 A2A_COMM, 2 TP_COMM  (both incomplete)
+
+    Neither is what the schedule asked for, and the first is wrong arithmetic with
+    no diagnostic. Checked once, before either pass runs, so it does not depend on
+    directive order itself.
+    """
+    claimed: dict[str, tuple[int, str]] = {}
+    for idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") not in _BOUNDARY_COMM_OPS:
+            continue
+        op, filters, *_rest = _normalize_filter_devices_directive(raw)
+        for uid, node in dag.nodes.items():
+            if node.node_kind != "COMPUTE":
+                continue
+            if not any(_match_filter(node.tag, flt) for flt in filters):
+                continue
+            prev = claimed.get(uid)
+            if prev is not None:
+                raise ValueError(
+                    f"directives[{prev[0]}] ({prev[1]}) and directives[{idx}] ({op}) "
+                    f"both match compute node {uid} with tag {node.tag}. Both rewrite "
+                    f"the node's activation edges, so the one applied second is "
+                    f"silently dropped and the result depends on directive order. "
+                    f"Narrow one of the filters so each region is claimed once."
+                )
+            claimed[uid] = (idx, op)
+
+
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:
     if not directives:
         return
@@ -1600,6 +1810,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         place_stream = None
     _replicate_update_nodes_by_device(training_dag)
     _insert_send_recv_comm_nodes(training_dag, comm_stream=place_stream)
+    _reject_overlapping_boundary_comm_directives(training_dag, directives)
 
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
@@ -1628,6 +1839,8 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 _insert_reduce_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
         elif op == "shard":
             _insert_shard_a2a_comm_nodes(training_dag, filters, devices, comm_stream=stream)
+        elif op == "shard_tensor":
+            _insert_tp_all_reduce_comm_nodes(training_dag, filters, devices, comm_stream=stream)
         else:
             raise ValueError(f"Unsupported directive op after normalization: {op}")
 

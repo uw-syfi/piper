@@ -10,6 +10,7 @@ _DEFAULT_STREAM = "default_stream"
 _CRITICAL_PATH_COMM_KINDS = {
     "ALL_GATHER_COMM",
     "A2A_COMM",
+    "TP_COMM",
 }
 _REDUCTION_COMM_KINDS = {
     "REDUCE_COMM",
