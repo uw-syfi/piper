@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import contextmanager
 from typing import Iterator
@@ -225,10 +226,20 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
         is overdue; None disables the overdue check.
     """
     actors = piper_metadata.actors
-    run_refs = [
-        actor.run_dag.remote(loss_fn=loss_fn)
-        for actor in actors.values()
-    ]
+    # Push the loss function once rather than serializing it into every step.
+    # It is typically a closure, so Ray cloudpickles it per call per actor with
+    # the driver doing that work serially.
+    #
+    # PIPER_PUSH_LOSS_FN=0 restores the per-step argument as an escape hatch.
+    if os.environ.get("PIPER_PUSH_LOSS_FN", "1") != "0":
+        if getattr(piper_metadata, "installed_loss_fn", None) is not loss_fn:
+            ray.get([actor.load_loss_fn.remote(loss_fn) for actor in actors.values()])
+            piper_metadata.installed_loss_fn = loss_fn
+        run_refs = [actor.run_dag.remote() for actor in actors.values()]
+    else:
+        run_refs = [
+            actor.run_dag.remote(loss_fn=loss_fn) for actor in actors.values()
+        ]
     t0 = time.perf_counter()
     while True:
         try:
