@@ -113,6 +113,36 @@ def _artifact_dir_for_schedule(schedule_directives_file: str) -> str:
     return str(parent if str(parent) else Path("out"))
 
 
+def _reset_run_state() -> None:
+    """Clear per-run state so a second piper_setup cannot inherit the first's.
+
+    ``installed_loss_fn`` is the subtle one: piper_exec_dag pushes the loss
+    function to the actors once and skips the push while the cached object is
+    identical. A second setup in the same process builds *new* actors, so without
+    this the new actors never receive it and the loss node fails on a None
+    callable.
+    """
+    piper_metadata.training_dag = None
+    piper_metadata.per_pp_training_dags = None
+    piper_metadata.compiled_data_store = None
+    piper_metadata.installed_loss_fn = None
+
+
+def dynamo_param_placeholder_name(param_name: str) -> str:
+    """Map a ``named_parameters()`` key to the FX placeholder Dynamo lifts it to.
+
+    ``pre.weight`` becomes ``l_self_modules_pre_parameters_weight_`` and
+    ``layers.0.attention.wq.weight`` becomes
+    ``l_self_modules_layers_modules_0_modules_attention_modules_wq_parameters_weight_``.
+
+    Callers pass the natural model-side name; this is the only place that has to
+    know Dynamo's lifted-attribute spelling.
+    """
+    *path, attr = param_name.split(".")
+    parts = ["l_self"] + [f"modules_{p}" for p in path] + [f"parameters_{attr}_"]
+    return "_".join(parts)
+
+
 def piper_setup(
     model_class,
     model_args=(),
@@ -130,6 +160,7 @@ def piper_setup(
     temp_dir: str = None,
     visualize_dag: bool = False,
     const_attrs: dict = None,
+    param_overrides: dict | None = None,
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
 ):
@@ -146,6 +177,12 @@ def piper_setup(
         example_outputs: Example outputs (labels) for tracing.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
+        param_overrides: Optional ``{named_parameters() key: CPU tensor}`` used
+            instead of random initialization. Keys are translated with
+            ``dynamo_param_placeholder_name``. Every key must match a lifted
+            parameter on some actor or setup raises. Values are per-rank, so a
+            sharded parameter must be sliced by the caller: Piper's IR carries no
+            partition information, so it cannot do the slicing itself.
         schedule_directives_file: JSON schedule description consumed by the
             TrainingDAG backend. When provided, Piper derives pp/dp/mbs
             schedule metadata internally.
@@ -169,11 +206,7 @@ def piper_setup(
     piper_metadata.schedule_directives_file = schedule_directives_file
     piper_metadata.schedule_info = dict(schedule_info)
 
-    # Reset DAG/compile fields so stale data from a prior run never leaks into
-    # this run if the backend is somehow not re-invoked.
-    piper_metadata.training_dag = None
-    piper_metadata.per_pp_training_dags = None
-    piper_metadata.compiled_data_store = None
+    _reset_run_state()
 
     pp_degree = int(schedule_info["pp_degree"])
 
@@ -247,6 +280,18 @@ def piper_setup(
     if _const_attrs:
         ray.get([
             actor.load_const_attrs.remote(_const_attrs)
+            for actor in piper_metadata.actors.values()
+        ])
+
+    _param_overrides = {
+        dynamo_param_placeholder_name(k): (
+            v.detach().cpu() if isinstance(v, torch.Tensor) else v
+        )
+        for k, v in (param_overrides or {}).items()
+    }
+    if _param_overrides:
+        ray.get([
+            actor.load_param_overrides.remote(_param_overrides)
             for actor in piper_metadata.actors.values()
         ])
 
@@ -328,6 +373,22 @@ def piper_setup(
             piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
             for pp_rank, pp_dag in enumerate(per_pp_training_dags)
         ])
+
+    if _param_overrides:
+        unmatched = [
+            set(names)
+            for names in ray.get([
+                actor.unmatched_param_overrides.remote()
+                for actor in piper_metadata.actors.values()
+            ])
+        ]
+        never_matched = set.intersection(*unmatched) if unmatched else set()
+        if never_matched:
+            raise ValueError(
+                f"param_overrides keys matched no lifted parameter on any actor: "
+                f"{sorted(never_matched)}. Placeholder names present come from "
+                f"dynamo_param_placeholder_name(); check the model attribute path."
+            )
 
     loss_pp_ranks = _compute_loss_pp_ranks(per_pp_training_dags)
     if not loss_pp_ranks:
