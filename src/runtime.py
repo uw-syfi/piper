@@ -46,6 +46,7 @@ class EventStore:
     """CUDA events produced by non-compute DAG tasks during one iteration."""
 
     recv: dict[Any, Any] = field(default_factory=dict)
+    # Boundary-activation comms: EP all-to-all and TP all-reduce both land here.
     a2a: dict[Any, Any] = field(default_factory=dict)
     all_reduce: dict[Any, Any] = field(default_factory=dict)
     reduce_scatter: dict[Any, Any] = field(default_factory=dict)
