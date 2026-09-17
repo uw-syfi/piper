@@ -1,0 +1,29 @@
+[
+  {
+    "op": "place",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      1
+    ]
+  },
+  {
+    "op": "shard_tensor",
+    "filter": {
+      "TP": "*"
+    },
+    "devices": [
+      0,
+      1
+    ],
+    "stream": "tp_stream"
+  },
+  {
+    "op": "split",
+    "filter": {},
+    "dim_name": "MB",
+    "num_microbatches": 8
+  }
+]

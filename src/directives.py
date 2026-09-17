@@ -1323,6 +1323,82 @@ def _insert_tp_all_reduce_comm_nodes(
                 src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
+def _fuse_tp_collectives(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+) -> int:
+    """Merge matched TP collectives into one NCCL call per group.
+
+    A TP all-reduce costs 220-320us inside the DAG but only
+    ~57us back to back, because each one re-pays the two ranks' arrival
+    difference created by the compute between them. Issuing several as one call
+    pays that once.
+
+    The nodes are *not* merged. Each microbatch's TP_COMM keeps its own
+    successors, because they consume different microbatches' activations; instead
+    one member of the group is the leader that performs the combined collective
+    and the others read their slice of the result. So the DAG keeps its shape and
+    only the runtime behaviour changes.
+
+    **`order` wins.** Fusing forces every member's producer to complete before any
+    of them runs, which contradicts a schedule that deliberately interleaves
+    microbatches (1F1B runs microbatch i's backward before i+1's forward). Any
+    group whose fusion would contradict an existing edge is left unfused rather
+    than reordered, and this pass runs after `order` so those edges are present.
+    """
+    matched = [
+        uid for uid, node in dag.nodes.items()
+        if node.node_kind == "TP_COMM"
+        and any(_match_filter(node.tag, flt) for flt in filters)
+    ]
+    if len(matched) < 2:
+        return 0
+
+    order = {uid: i for i, uid in enumerate(_topological_order(dag))}
+    groups: dict[tuple, list[str]] = {}
+    for uid in matched:
+        n = dag.nodes[uid]
+        key = (n.tag.get("PASS"), n.stream, tuple(n.device or ()))
+        groups.setdefault(key, []).append(uid)
+
+    fused = 0
+    for key, members in sorted(groups.items()):
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda u: order[u])
+        leader, rest = members[0], members[1:]
+        sources = {u: dag.nodes[u].node_meta.get("source_uid") for u in members}
+        if any(s is None or s not in dag.nodes for s in sources.values()):
+            continue
+
+        # The leader must wait for every member's producer, and every member must
+        # wait for the leader. Either can contradict `order`; check before adding.
+        wanted = [(sources[u], leader) for u in rest] + [(leader, u) for u in rest]
+        if any(_has_path(dag, dst, src) for src, dst in wanted):
+            logger.debug("fuse_collectives: group %s left unfused; order forbids it", key)
+            continue
+
+        for src, dst in wanted:
+            dag.add_edge(TrainingDAGEdge(src_uid=src, dst_uid=dst,
+                                         dep_kind="temporal", tensor_name=None))
+        gid = f"fuse.{fused}"
+        # (producer uid, tensor index) per member, in fusion_index order. The
+        # leader reads these directly rather than walking the DAG at runtime.
+        fusion_sources = [
+            (sources[u], dag.nodes[u].node_meta["tp_tensor_idx"]) for u in members
+        ]
+        for i, u in enumerate(members):
+            meta = dag.nodes[u].node_meta
+            meta["fusion_group"] = gid
+            meta["fusion_index"] = i
+            meta["fusion_size"] = len(members)
+            meta["fusion_leader"] = leader
+            meta["fusion_members"] = list(members)
+            meta["fusion_sources"] = list(fusion_sources)
+        fused += 1
+    return fused
+
+
 def _apply_split_directive(
     dag: TrainingDAG,
     flt: dict[str, Any],
@@ -1813,7 +1889,9 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
     _reject_overlapping_boundary_comm_directives(training_dag, directives)
 
     for i, raw in enumerate(directives):
-        if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
+        if isinstance(raw, dict) and raw.get("op") in (
+            "place", "split", "order", "fuse_collectives"
+        ):
             continue
         op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
         logger.debug(
@@ -1851,3 +1929,12 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         filter_groups = _parse_order_directive(raw)
         logger.debug("Applying directive[%d]: order(filters=%s)", i, filter_groups)
         _apply_order_directive(training_dag, filter_groups, directive_idx=i)
+
+    # After order, so a group that order deliberately interleaved stays unfused.
+    for i, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") != "fuse_collectives":
+            continue
+        flt = _normalize_filter_spec(raw.get("filter", {}), raw)
+        n = _fuse_tp_collectives(training_dag, [flt])
+        logger.debug("Applying directive[%d]: fuse_collectives(filter=%s) -> %d group(s)",
+                     i, flt, n)

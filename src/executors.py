@@ -144,6 +144,29 @@ class CommunicationExecutor:
             dist.all_reduce(out, group=self.runtime.ep_group)
         return out
 
+    def all_reduce_fused(
+        self,
+        tensors: list[torch.Tensor],
+        stream: torch.cuda.Stream,
+    ) -> list[torch.Tensor]:
+        """One all-reduce covering several boundary activations.
+
+        Each collective in the DAG re-pays the two ranks' arrival difference,
+        because compute sits between them; issuing several as
+        one call pays it once. Returns views into the reduced buffer, in input
+        order, so callers can hand each producer back its own slice.
+        """
+        shapes = [t.shape for t in tensors]
+        with torch.cuda.stream(stream):
+            flat = torch.cat([t.detach().reshape(-1) for t in tensors])
+            dist.all_reduce(flat, group=self.runtime.ep_group)
+            out, offset = [], 0
+            for t, shape in zip(tensors, shapes):
+                n = t.numel()
+                out.append(flat[offset:offset + n].view(shape))
+                offset += n
+        return out
+
     def all_reduce_grads(self, ubid: Any, stream: torch.cuda.Stream) -> int:
         assert ubid is not None, "all_reduce_grads requires a non-None ubid"
         if not self.has_trainable_params_for_collective(ubid, "all_reduce_grads"):
@@ -642,6 +665,7 @@ class DagExecutor:
         update_results: list[dict] = []
 
         self.buffers.init_refcounts(dag)
+        fusion_results: dict[str, list] = {}
         last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
 
         for node in sorted_dag_nodes:
@@ -742,13 +766,33 @@ class DagExecutor:
                     # pre-all-reduce output.
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
                     node_stream.wait_event(comp_events[fwd_pred.uid])
-                    tensor_idx = self._node_meta(node)["tp_tensor_idx"]
+                    meta = self._node_meta(node)
+                    tensor_idx = meta["tp_tensor_idx"]
+                    gid = meta.get("fusion_group")
+                    if gid is not None and meta["fusion_leader"] == node.uid:
+                        # Collect every member's tensor before releasing anything:
+                        # a member's buffer is released by that member's own node.
+                        for src_uid, _idx in meta["fusion_sources"]:
+                            evt = comp_events.get(src_uid)
+                            if evt is not None:
+                                node_stream.wait_event(evt)
+                        parts = [
+                            self.buffers.task[src_uid]["detached_outs"][idx]
+                            for src_uid, idx in meta["fusion_sources"]
+                        ]
+                        fusion_results[gid] = self.communication.all_reduce_fused(
+                            parts, node_stream
+                        )
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
                     detached_outs = list(fwd_buf["detached_outs"])
-                    detached_outs[tensor_idx] = self.communication.all_reduce_activation(
-                        detached_outs[tensor_idx], node_stream
-                    ).requires_grad_(True)
+                    reduced = (
+                        fusion_results[gid][meta["fusion_index"]]
+                        if gid is not None
+                        else self.communication.all_reduce_activation(
+                            detached_outs[tensor_idx], node_stream)
+                    )
+                    detached_outs[tensor_idx] = reduced.requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.buffers.task[node.uid] = fwd_buf
                     tp_evt = torch.cuda.Event()
@@ -763,7 +807,24 @@ class DagExecutor:
                         if p.task_type in (TaskType.BWD, TaskType.BWD_I)
                     )
                     node_stream.wait_event(comp_events[bwd_pred.uid])
-                    tensor_idx = self._node_meta(node)["tp_tensor_idx"]
+                    meta = self._node_meta(node)
+                    tensor_idx = meta["tp_tensor_idx"]
+                    gid = meta.get("fusion_group")
+                    if gid is not None and meta["fusion_leader"] == node.uid:
+                        for src_uid, _idx in meta["fusion_sources"]:
+                            evt = comp_events.get(src_uid)
+                            if evt is not None:
+                                node_stream.wait_event(evt)
+                        parts = [
+                            self.buffers.task[src_uid]["inp_grads"][idx]
+                            for src_uid, idx in meta["fusion_sources"]
+                        ]
+                        assert all(p is not None for p in parts), (
+                            f"BWD_TP_ALL_REDUCE fused group {gid}: a member's grad is None"
+                        )
+                        fusion_results[gid] = self.communication.all_reduce_fused(
+                            parts, node_stream
+                        )
                     bwd_buf = dict(self.buffers.task[bwd_pred.uid])
                     self.buffers.release(bwd_pred.uid)
                     inp_grads = list(bwd_buf["inp_grads"])
@@ -772,8 +833,10 @@ class DagExecutor:
                         f"BWD_TP_ALL_REDUCE tag={node_tag}: grad at "
                         f"tp_tensor_idx={tensor_idx} is None"
                     )
-                    inp_grads[tensor_idx] = self.communication.all_reduce_activation(
-                        grad_tp, node_stream
+                    inp_grads[tensor_idx] = (
+                        fusion_results[gid][meta["fusion_index"]]
+                        if gid is not None
+                        else self.communication.all_reduce_activation(grad_tp, node_stream)
                     )
                     bwd_buf["inp_grads"] = inp_grads
                     self.buffers.task[node.uid] = bwd_buf
