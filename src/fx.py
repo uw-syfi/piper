@@ -684,6 +684,15 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
             boundary_after = {
                 "tensor_idx": _select_boundary_tensor_idx(seg_cross_in[seg + 1]),
+                # Every boundary output, and whether this segment produced it or
+                # merely forwards it (its node in the sub-graph is a placeholder).
+                # A collective on a forwarded tensor is ready at segment *start*,
+                # not end, a distinction the hoist depends on.
+                "outputs": [
+                    {"idx": i, "name": r.name, "src_name": n.name,
+                     "forwarded": r.op == "placeholder"}
+                    for i, (n, r) in enumerate(zip(seg_cross_in[seg + 1], out_nodes))
+                ],
                 "reshape_input": None,
                 "reshape_output": None,
                 "from_tag": _tag_from_stack(segment_stacks[seg]),
