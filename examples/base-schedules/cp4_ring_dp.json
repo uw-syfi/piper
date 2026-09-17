@@ -1,0 +1,55 @@
+[
+  {
+    "op": "place",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "stream": "default_stream"
+  },
+  {
+    "op": "replicate",
+    "filter": {
+      "PP": 0
+    },
+    "devices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "reduce_stream": "dp_stream",
+    "shard_grads": false,
+    "shard_params": false
+  },
+  {
+    "op": "ring_exchange",
+    "filter": {
+      "CP": "*"
+    },
+    "devices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "tensors": [
+      "k",
+      "v"
+    ],
+    "stream": "cp_stream",
+    "hoist": false,
+    "distance": 1
+  },
+  {
+    "op": "split",
+    "filter": {},
+    "dim_name": "MB",
+    "num_microbatches": 1
+  }
+]

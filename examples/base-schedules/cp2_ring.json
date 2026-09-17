@@ -1,0 +1,6 @@
+[
+  {"op": "place", "filter": {"PP": 0}, "devices": [0, 1], "stream": "default_stream"},
+  {"op": "ring_exchange", "filter": {"CP": "*"}, "devices": [0, 1],
+   "tensors": ["k", "v"], "stream": "cp_stream"},
+  {"op": "split", "filter": {}, "dim_name": "MB", "num_microbatches": 1}
+]
