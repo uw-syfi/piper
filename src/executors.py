@@ -15,6 +15,23 @@ from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
 
+# An A2A and a TP all-reduce are the same structural class of node: a comm that
+# sits on an activation boundary, replaces one tensor of its producer's buffer and
+# passes the rest through. Consumer arms therefore have to treat them alike, or a
+# compute node silently falls through to the wrong inputs.
+_FWD_BOUNDARY_COMM_TASKS = (TaskType.FWD_A2A, TaskType.FWD_TP_ALL_REDUCE)
+_BWD_BOUNDARY_COMM_TASKS = (TaskType.BWD_A2A, TaskType.BWD_TP_ALL_REDUCE)
+
+
+def _drain_losses(loss_buffer: list) -> list[float]:
+    """Empty the loss buffer into plain floats. Call only after a synchronize."""
+    losses = [
+        float(item.item() if isinstance(item, torch.Tensor) else item)
+        for item in loss_buffer
+    ]
+    loss_buffer.clear()
+    return losses
+
 
 def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
     """Raise or sleep if a PIPER_FAULT spec matches this execution point.
@@ -103,6 +120,29 @@ class CommunicationExecutor:
         with torch.cuda.stream(stream):
             dist.all_to_all_single(output_buf, input_tensor, group=self.runtime.ep_group)
         return output_buf
+
+    def all_reduce_activation(
+        self,
+        input_tensor: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        """Sum a boundary activation (or its gradient) across the TP group.
+
+        Returns a fresh contiguous leaf rather than reducing in place: the input is
+        an entry of the producer's ``detached_outs``/``inp_grads``, which the
+        producer's own backward still reads, and an in-place op on a leaf that
+        requires grad is an autograd error.
+
+        # ponytail: rides on ep_group, which is idle whenever a region is TP-sharded
+        # rather than EP-sharded, and is already a separate communicator from
+        # dp_group so the collective gets its own NCCL proxy stream. Valid only while
+        # tp_degree equals the place-group size; a real tp_group is needed to compose
+        # TP with DP.
+        """
+        with torch.cuda.stream(stream):
+            out = input_tensor.detach().clone(memory_format=torch.contiguous_format)
+            dist.all_reduce(out, group=self.runtime.ep_group)
+        return out
 
     def all_reduce_grads(self, ubid: Any, stream: torch.cuda.Stream) -> int:
         assert ubid is not None, "all_reduce_grads requires a non-None ubid"
@@ -575,8 +615,12 @@ class DagExecutor:
         labels: Any,
         loss_buffer: list,
         loss_fn=None,
-    ) -> None:
-        """Run one iteration of the loaded TrainingDAG."""
+    ) -> dict:
+        """Run one iteration of the loaded TrainingDAG.
+
+        Returns ``{"losses": [...]}`` for the microbatches whose backward computed
+        the loss on this rank. Empty when the loss lives on another PP rank.
+        """
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
 
@@ -595,6 +639,7 @@ class DagExecutor:
             if stream is not default_stream:
                 stream.wait_event(zero_evt)
         comp_events: dict[Any, torch.cuda.Event] = {}
+        update_results: list[dict] = []
 
         self.buffers.init_refcounts(dag)
         last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
@@ -690,6 +735,52 @@ class DagExecutor:
                     a2a_evt.record(node_stream)
                     self.events.a2a[node.uid] = a2a_evt
 
+                case TaskType.FWD_TP_ALL_REDUCE:
+                    # g of Megatron's f/g pair: the region's output is a partial
+                    # sum. Backward is identity, so no paired node is needed -- the
+                    # consumer's BWD arm wires the gradient straight onto the
+                    # pre-all-reduce output.
+                    fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
+                    node_stream.wait_event(comp_events[fwd_pred.uid])
+                    tensor_idx = self._node_meta(node)["tp_tensor_idx"]
+                    fwd_buf = dict(self.buffers.task[fwd_pred.uid])
+                    self.buffers.release(fwd_pred.uid)
+                    detached_outs = list(fwd_buf["detached_outs"])
+                    detached_outs[tensor_idx] = self.communication.all_reduce_activation(
+                        detached_outs[tensor_idx], node_stream
+                    ).requires_grad_(True)
+                    fwd_buf["detached_outs"] = detached_outs
+                    self.buffers.task[node.uid] = fwd_buf
+                    tp_evt = torch.cuda.Event()
+                    tp_evt.record(node_stream)
+                    self.events.a2a[node.uid] = tp_evt
+
+                case TaskType.BWD_TP_ALL_REDUCE:
+                    # f of Megatron's f/g pair: the gradient w.r.t. the region's
+                    # input is a partial sum. Forward is identity.
+                    bwd_pred = next(
+                        p for p in node.data_preds
+                        if p.task_type in (TaskType.BWD, TaskType.BWD_I)
+                    )
+                    node_stream.wait_event(comp_events[bwd_pred.uid])
+                    tensor_idx = self._node_meta(node)["tp_tensor_idx"]
+                    bwd_buf = dict(self.buffers.task[bwd_pred.uid])
+                    self.buffers.release(bwd_pred.uid)
+                    inp_grads = list(bwd_buf["inp_grads"])
+                    grad_tp = inp_grads[tensor_idx]
+                    assert grad_tp is not None, (
+                        f"BWD_TP_ALL_REDUCE tag={node_tag}: grad at "
+                        f"tp_tensor_idx={tensor_idx} is None"
+                    )
+                    inp_grads[tensor_idx] = self.communication.all_reduce_activation(
+                        grad_tp, node_stream
+                    )
+                    bwd_buf["inp_grads"] = inp_grads
+                    self.buffers.task[node.uid] = bwd_buf
+                    tp_evt = torch.cuda.Event()
+                    tp_evt.record(node_stream)
+                    self.events.a2a[node.uid] = tp_evt
+
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
                     ar_ubids = self._sync_payload_ubids(node)
@@ -739,14 +830,16 @@ class DagExecutor:
                         node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
 
                     a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
+                        (p for p in node.data_preds
+                         if p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
                         node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_data_pred = next(
                         (p for p in node.data_preds
-                         if p.task_type in (TaskType.FWD, TaskType.FWD_A2A)), None
+                         if p.task_type == TaskType.FWD
+                         or p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
                     )
                     if fwd_data_pred is not None:
                         input_tensors = self.buffers.task[fwd_data_pred.uid]["detached_outs"]
@@ -783,7 +876,8 @@ class DagExecutor:
                     self._wait_for_all_gather(node)
 
                     a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
+                        (p for p in node.data_preds
+                         if p.task_type in _BWD_BOUNDARY_COMM_TASKS), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
                         node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
@@ -894,6 +988,7 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
                             stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        loss_buffer.append(stage_outputs_or_loss[0].detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
@@ -907,7 +1002,8 @@ class DagExecutor:
                         output_grads = None
 
                     bwd_a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
+                        (p for p in node.data_preds
+                         if p.task_type in _BWD_BOUNDARY_COMM_TASKS), None
                     )
                     if (
                         bwd_a2a_pred is not None
@@ -1003,6 +1099,12 @@ class DagExecutor:
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
         return step_result
+
+        return {
+            "losses": [
+                loss for result in update_results for loss in result["losses"]
+            ],
+        }
 
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
