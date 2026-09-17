@@ -17,6 +17,7 @@ from .state import (
 from .fx import _deserialize_graphmodule, _serialize_graphmodule
 from .executors import CommunicationExecutor, ComputeExecutor, DagExecutor
 from .ordering import _serial_topological_order
+from .device import get_device
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import training_dag_task_type as _training_dag_task_type
 
@@ -76,14 +77,18 @@ def _create_actors(
         # [{"GPU": dp}] * pp). Otherwise one bundle is one DP replica holding
         # all PP ranks (shape is [{"GPU": pp}] * dp).
         bundle_index = pp_rank if pp_outer else dp_rank
-        actor = PiperActor.options(
-            num_gpus=0.6,
-            runtime_env={**nsight_env, **nccl_env},
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
+        actor_options = {
+            "runtime_env": {**nsight_env, **nccl_env},
+        }
+        accel = get_device().accelerator_resource
+        if accel == "GPU":
+            actor_options["num_gpus"] = 0.6
+        if pg is not None:
+            actor_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_bundle_index=bundle_index,
-            ),
-        ).remote(
+            )
+        actor = PiperActor.options(**actor_options).remote(
             pp_rank,
             optim_class,
             world_size,
@@ -130,7 +135,7 @@ class PiperActor:
         )
 
         self.logger.debug(
-            f"Initializing Ray actor {self.runtime.global_rank} GPU {os.environ['CUDA_VISIBLE_DEVICES']}"
+            f"Initializing Ray actor {self.runtime.global_rank} GPU {os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}"
         )
 
         self.inputs = None
@@ -165,14 +170,25 @@ class PiperActor:
         # instead of zero-initializing.  Keyed by bare attribute name (e.g. "freqs_cis").
         self.model_const_attrs: dict = {}
 
+    def get_params_cpu(self) -> dict:
+        """Return all trainable parameters as CPU tensors, keyed by name."""
+        params = {}
+        for ubid, bucket in self.stages.buckets.items():
+            for idx, name in zip(bucket.param_idxs, bucket.param_names):
+                p = bucket.forward_args[idx]
+                if p is not None:
+                    params[name] = p.detach().cpu().clone()
+        return params
+
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
-        max_alloc = torch.cuda.max_memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
+        max_alloc = get_device().get_and_reset_peak_memory()
+        if max_alloc is None:
+            max_alloc = 0
         return self.runtime.global_rank, max_alloc
 
     def reset_peak_memory(self):
-        torch.cuda.reset_peak_memory_stats()
+        get_device().reset_peak_memory()
 
     def _nvtx_push(self, label: str) -> None:
         self.runtime.nvtx_push(label)
@@ -187,11 +203,9 @@ class PiperActor:
         labelled the same as its NVTX range, so the resulting trace identifies
         per-node work.
         """
+        activities = get_device().profiler_activities()
         self.runtime.torch_profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
         )
         self.runtime.torch_profiler.__enter__()
         self.runtime.pytorch_profiler_enabled = True
@@ -242,16 +256,17 @@ class PiperActor:
 
     def _join_process_groups(self, master_addr, master_port):
 
-        self.logger.debug(f"Actor {self.runtime.global_rank} using GPU {os.environ['CUDA_VISIBLE_DEVICES']}, master addr {master_addr}:{master_port}")
+        self.logger.debug(f"Actor {self.runtime.global_rank} using GPU {os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}, master addr {master_addr}:{master_port}")
 
         init_method = f"tcp://{master_addr}:{master_port}"
 
-        self.runtime.device = f"cuda:{self.runtime.global_rank % torch.cuda.device_count()}"
-        torch.cuda.set_device(self.runtime.device)
+        dev = get_device()
+        self.runtime.device = dev.set_device(self.runtime.global_rank)
+        dist_backend = dev.dist_backend
 
         if self.runtime.pp_degree > 1 or self.runtime.dp_degree > 1:
             dist.init_process_group(
-                "nccl",
+                dist_backend,
                 init_method=init_method,
                 rank=self.runtime.global_rank,
                 world_size=self.runtime.world_size,
@@ -265,29 +280,31 @@ class PiperActor:
             self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
     def _join_dp_process_group(self):
+        dist_backend = get_device().dist_backend
         num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
         for dp_group_id in range(num_dp_groups):
             group_ranks = [
                 (dp_group_id + num_dp_groups * i) for i in range(self.runtime.dp_degree)
             ]
-            # Two separate NCCL communicators over the same ranks: one for allreduce,
+            # Two separate communicators over the same ranks: one for allreduce,
             # one for all2all.  Sharing a communicator causes both op types to run on
-            # the same internal NCCL proxy stream, which prevents true overlap.
-            process_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            ep_process_group = dist.new_group(ranks=group_ranks, backend="nccl")
+            # the same internal proxy stream, which prevents true overlap.
+            process_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
+            ep_process_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
             if self.runtime.global_rank % num_dp_groups == dp_group_id:
                 self.runtime.dp_group = process_group
                 self.runtime.ep_group = ep_process_group
 
     def _join_pp_process_group(self):
+        dist_backend = get_device().dist_backend
         num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
 
         for pp_group_id in range(num_pp_groups):
             group_ranks = [
                 (pp_group_id * self.runtime.pp_degree + i) for i in range(self.runtime.pp_degree)
             ]
-            lo_hi_group = dist.new_group(ranks=group_ranks, backend="nccl")
-            hi_lo_group = dist.new_group(ranks=group_ranks, backend="nccl")
+            lo_hi_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
+            hi_lo_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
 
             if self.runtime.global_rank in group_ranks:
                 self.runtime.pp_lo_hi = lo_hi_group
@@ -597,7 +614,7 @@ class PiperActor:
                 bucket.param_shard_info = None
                 bucket.full_params_fresh = False
                 trainable_for_optim = [realized[i] for i in trainable_idxs]
-                optim = self.optim_class(trainable_for_optim, fused=True) if trainable_for_optim else None
+                optim = self.optim_class(trainable_for_optim) if trainable_for_optim else None
             bucket.optimizer = optim
 
         # Keep first GraphModule for compatibility with external inspection tools.
