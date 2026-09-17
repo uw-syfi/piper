@@ -180,6 +180,24 @@ class PiperActor:
                     params[name] = p.detach().cpu().clone()
         return params
 
+    def sync_dp_params(self) -> None:
+        """Broadcast all parameters from dp_rank=0 to other DP replicas.
+
+        Ensures all DP ranks start with identical weights regardless of
+        per-actor random initialization.
+        """
+        group = self.runtime.dp_group
+        if group is None:
+            return
+        # The source is the global rank of the dp_rank=0 replica for this PP rank.
+        src_global_rank = self.runtime.pp_rank  # dp_rank=0 => global_rank = pp_rank
+        for ubid, bucket in self.stages.buckets.items():
+            for idx in bucket.param_idxs:
+                param = bucket.forward_args[idx]
+                if param is None:
+                    continue
+                dist.broadcast(param.data, src=src_global_rank, group=group)
+
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
         max_alloc = get_device().get_and_reset_peak_memory()
