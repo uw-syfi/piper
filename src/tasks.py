@@ -21,6 +21,8 @@ class TaskType(Enum):
     BWD_A2A = "backward_a2a"
     FWD_TP_ALL_REDUCE = "forward_tp_all_reduce"
     BWD_TP_ALL_REDUCE = "backward_tp_all_reduce"
+    FWD_RING_EXCHANGE = "forward_ring_exchange"
+    BWD_RING_EXCHANGE = "backward_ring_exchange"
     ORDER_DUMMY = "order_dummy"
 
 
@@ -48,6 +50,12 @@ def training_dag_task_type(node: "TrainingDAGNode") -> TaskType:
         return TaskType.ALL_REDUCE
     if node.node_kind == "A2A_COMM":
         return TaskType.FWD_A2A if node.tag.get("PASS") == "F" else TaskType.BWD_A2A
+    if node.node_kind == "RING_COMM":
+        return (
+            TaskType.FWD_RING_EXCHANGE
+            if node.tag.get("PASS") == "F"
+            else TaskType.BWD_RING_EXCHANGE
+        )
     if node.node_kind == "TP_COMM":
         return (
             TaskType.FWD_TP_ALL_REDUCE

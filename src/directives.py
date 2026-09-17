@@ -129,7 +129,7 @@ def _normalize_filter_devices_directive(
 ) -> tuple[str, list[dict[str, Any]], list[int], str | None, str | None, str | None, bool, bool, int | None]:
     if isinstance(directive, dict):
         op = directive.get("op")
-        if op not in ("place", "replicate", "shard", "shard_tensor"):
+        if op not in ("place", "replicate", "shard", "shard_tensor", "ring_exchange"):
             raise ValueError(f"Unsupported directive op: {op}")
         if "filter" not in directive:
             raise ValueError(f"{op} directive requires current API field 'filter': {directive}")
@@ -1323,6 +1323,219 @@ def _insert_tp_all_reduce_comm_nodes(
                 src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
+def _insert_ring_exchange_comm_nodes(
+    dag: TrainingDAG,
+    filters: list[dict[str, Any]],
+    devices: list[int],
+    tensors: list[str] | None,
+    comm_stream: str | None = None,
+    hoist: bool = False,
+    distance: int = 1,
+) -> None:
+    """Rotate forwarded tensors one hop around the group between consecutive matched regions.
+
+    Context parallelism's ring exchange. ``shard_tensor`` acts on edges that *leave*
+    a matched region; this acts on edges *between* two matched regions -- consecutive
+    ring steps -- which is exactly the set the TP pass skips. The tensors named must
+    be ones the source region forwards rather than produces (boundary
+    ``outputs[i].forwarded``): a rotation only makes sense for a value that is the
+    same object on both sides of the boundary. A produced tensor is refused.
+
+    Forward rotates by +1 (send to the next rank, receive from the previous).
+    Backward rotates by -1, so the gradient for a chunk returns along the path the
+    chunk took. No explicit accumulation is needed: the consumer forwards the same
+    placeholder it also reads, and autograd on that segment sums the gradient from
+    both uses.
+
+    With ``hoist=False`` this is the edge-spliced baseline:
+    the comm node waits for the source region to *finish* although its payload
+    was ready when the region *started*.
+
+    With ``hoist=True`` the forward ring node instead depends on whoever supplied
+    the forwarded slots to its source region -- the previous ring node, or the
+    region that defined them -- so it runs concurrently with the source region.
+    The source's direct edge to its successor is kept for the produced slots, and
+    the consumer merges the two (executor FWD arm). Only the forward ring moves:
+    the backward payload is a gradient the source's backward *produces*, so it
+    stays spliced.
+
+    ``distance`` bounds how early a hoisted ring may issue: a temporal edge from
+    the region ``distance`` steps back. Without it every rotation completes
+    before the first step finishes and all chunks are resident --
+    defeating the feature meant to hold 1/n of K/V. ``distance=0`` drops the
+    edge on purpose, for measuring exactly that. At ``distance=1`` the edge is
+    also what orders the ring's buffer reuse after the consumer's read; for
+    larger distances the consumer's ``record_stream`` carries that instead.
+    """
+    expected = sorted(int(d) for d in devices)
+    if len(set(expected)) < 2:
+        raise ValueError(
+            f"ring_exchange requires at least two distinct devices, got devices={devices}; "
+            f"a one-rank ring has nothing to rotate with"
+        )
+    if not isinstance(tensors, list) or not tensors:
+        raise ValueError(
+            "ring_exchange requires a non-empty `tensors` list naming the boundary "
+            "tensors to rotate (their names in the traced graph, e.g. [\"k\", \"v\"])"
+        )
+    wanted = [str(t) for t in tensors]
+    ring_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "RING_COMM")
+
+    matched = {
+        uid for uid, node in dag.nodes.items()
+        if node.node_kind == "COMPUTE" and any(_match_filter(node.tag, flt) for flt in filters)
+    }
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.device is None or sorted(int(d) for d in node.device) != expected:
+            raise ValueError(
+                f"ring_exchange requires matched node {uid} to have devices={devices}, "
+                f"got node_devices={node.device}"
+            )
+
+    def _is_internal_activation_edge(e: TrainingDAGEdge, node: TrainingDAGNode) -> bool:
+        if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid not in matched:
+            return False
+        dst = dag.nodes[e.dst_uid]
+        if dst.node_kind != "COMPUTE":
+            return False
+        if node.compute_subkind == "FWD":
+            return dst.compute_subkind == "FWD"
+        if _is_backward_activation_subkind(node.compute_subkind):
+            return _is_backward_activation_subkind(dst.compute_subkind)
+        return False
+
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.compute_subkind == "BWD_W":
+            continue
+        by_dst: dict[str, list[TrainingDAGEdge]] = {}
+        for e in list(dag.edges):
+            if _is_internal_activation_edge(e, node):
+                by_dst.setdefault(e.dst_uid, []).append(e)
+        for dst_uid, edges in sorted(by_dst.items()):
+            dst_node = dag.nodes[dst_uid]
+            binfo = _boundary_info_for_edge(dag, node, dst_node, "RING_COMM")
+            outputs = binfo.get("outputs") or []
+            by_name: dict[str, dict[str, Any]] = {}
+            for o in outputs:
+                by_name.setdefault(str(o.get("src_name")), o)
+                by_name.setdefault(str(o.get("name")), o)
+            idxs: list[int] = []
+            for name in wanted:
+                o = by_name.get(name)
+                if o is None:
+                    raise ValueError(
+                        f"ring_exchange: tensor {name!r} does not cross the boundary "
+                        f"{uid}->{dst_uid}; crossing tensors are "
+                        f"{[o.get('src_name') for o in outputs]}"
+                    )
+                if not o.get("forwarded"):
+                    raise ValueError(
+                        f"ring_exchange: tensor {name!r} is produced by region {uid}, not "
+                        f"forwarded through it. A ring rotation needs a value that is the "
+                        f"same object on both sides of the boundary; a produced value has "
+                        f"no chunk to hand on."
+                    )
+                idxs.append(int(o["idx"]))
+            is_fwd = node.compute_subkind == "FWD"
+            comm_uid = f"ring_exchange.{ring_idx}"
+            ring_idx += 1
+            dag.add_node(
+                TrainingDAGNode(
+                    uid=comm_uid,
+                    node_kind="RING_COMM",
+                    compute_subkind=None,
+                    tag=dict(node.tag),
+                    device=list(node.device) if node.device is not None else None,
+                    stream=comm_stream if comm_stream is not None else _DEFAULT_STREAM,
+                    node_meta={
+                        "direction": "outgoing",
+                        "source_uid": uid,
+                        "ring_tensor_idxs": sorted(set(idxs)),
+                        "ring_shift": 1 if is_fwd else -1,
+                        "bucket_key": node.node_meta.get(
+                            "bucket_key", dst_node.node_meta.get("bucket_key")
+                        ),
+                    },
+                )
+            )
+            for e in edges:
+                _remove_edge(dag, e)
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=uid, dst_uid=comm_uid, dep_kind="data", tensor_name=e.tensor_name))
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=comm_uid, dst_uid=dst_uid, dep_kind="data", tensor_name=e.tensor_name))
+
+    if not hoist:
+        return
+    if not isinstance(distance, int) or distance < 0:
+        raise ValueError(f"ring_exchange: distance must be a non-negative int, got {distance!r}")
+
+    # ---- G-3: lift the forward ring off its source region ------------------
+    # Ring chains keyed by every tag except CP, so microbatch/stage copies stay
+    # separate; within a chain, CP index orders the steps.
+    def _chain_key(tag: dict[str, Any]) -> tuple:
+        return tuple(sorted((k, v) for k, v in tag.items() if k != "CP"))
+
+    chains: dict[tuple, dict[int, str]] = {}
+    for u in matched:
+        n = dag.nodes[u]
+        if n.compute_subkind == "FWD" and "CP" in n.tag:
+            chains.setdefault(_chain_key(n.tag), {})[int(n.tag["CP"])] = u
+
+    fwd_rings = sorted(
+        (u for u, n in dag.nodes.items()
+         if n.node_kind == "RING_COMM" and n.tag.get("PASS") == "F"
+         and n.node_meta.get("source_uid") in matched and not n.node_meta.get("hoisted")),
+        key=lambda u: (_chain_key(dag.nodes[u].tag), int(dag.nodes[u].tag.get("CP", -1))),
+    )
+    for r_uid in fwd_rings:
+        r = dag.nodes[r_uid]
+        src_uid = r.node_meta["source_uid"]
+        src = dag.nodes[src_uid]
+        in_edges = [e for e in list(dag.edges) if e.dst_uid == r_uid and e.dep_kind == "data"]
+        out_edges = [e for e in list(dag.edges) if e.src_uid == r_uid and e.dep_kind == "data"]
+
+        # Whoever handed the forwarded slots to the source region: an earlier
+        # ring node if there is one (already rewired, since we go in CP order),
+        # otherwise the forward region that defined them.
+        supplier = None
+        for e in dag.edges:
+            if e.dst_uid != src_uid or e.dep_kind != "data":
+                continue
+            p = dag.nodes[e.src_uid]
+            if p.node_kind == "RING_COMM":
+                supplier = p.uid
+                break
+            if p.node_kind == "COMPUTE" and p.compute_subkind == "FWD" and supplier is None:
+                supplier = p.uid
+        if supplier is None:
+            raise ValueError(
+                f"ring_exchange(hoist): region {src_uid} has no upstream supplier of "
+                f"{wanted}; the first ring step must receive its chunk from a region"
+            )
+        for e in in_edges:
+            _remove_edge(dag, e)
+            dag.add_edge(TrainingDAGEdge(
+                src_uid=supplier, dst_uid=r_uid, dep_kind="data", tensor_name=e.tensor_name))
+        # The splice removed source -> destination; the produced slots
+        # (accumulators) still travel that way, so put it back.
+        for oe in out_edges:
+            if not any(x.src_uid == src_uid and x.dst_uid == oe.dst_uid and x.dep_kind == "data"
+                       for x in dag.edges):
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=src_uid, dst_uid=oe.dst_uid, dep_kind="data", tensor_name=oe.tensor_name))
+        # Issue budget.
+        if distance > 0 and "CP" in src.tag:
+            back = chains.get(_chain_key(src.tag), {}).get(int(src.tag["CP"]) - distance)
+            if back is not None:
+                dag.add_edge(TrainingDAGEdge(
+                    src_uid=back, dst_uid=r_uid, dep_kind="temporal", tensor_name=None))
+        r.node_meta["hoisted"] = True
+        r.node_meta["hoist_distance"] = distance
+
+
 def _fuse_tp_collectives(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -1796,7 +2009,10 @@ def _apply_order_directive(
                 _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
-_BOUNDARY_COMM_OPS = ("shard", "shard_tensor")
+# ring_exchange rewrites edges *between* matched nodes where the other two
+# rewrite edges *leaving* them, so TP x CP on one region touches disjoint edge
+# sets and could compose. Rejected anyway until a test shows it does.
+_BOUNDARY_COMM_OPS = ("shard", "shard_tensor", "ring_exchange")
 
 
 def _reject_overlapping_boundary_comm_directives(
@@ -1917,6 +2133,11 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
                 _insert_reduce_comm_nodes(training_dag, filters, devices, comm_stream=reduce_stream)
         elif op == "shard":
             _insert_shard_a2a_comm_nodes(training_dag, filters, devices, comm_stream=stream)
+        elif op == "ring_exchange":
+            _insert_ring_exchange_comm_nodes(
+                training_dag, filters, devices, tensors=raw.get("tensors"), comm_stream=stream,
+                hoist=bool(raw.get("hoist", False)), distance=int(raw.get("distance", 1)),
+            )
         elif op == "shard_tensor":
             _insert_tp_all_reduce_comm_nodes(training_dag, filters, devices, comm_stream=stream)
         else:

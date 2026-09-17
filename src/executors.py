@@ -19,8 +19,8 @@ from .tasks import TaskType
 # sits on an activation boundary, replaces one tensor of its producer's buffer and
 # passes the rest through. Consumer arms therefore have to treat them alike, or a
 # compute node silently falls through to the wrong inputs.
-_FWD_BOUNDARY_COMM_TASKS = (TaskType.FWD_A2A, TaskType.FWD_TP_ALL_REDUCE)
-_BWD_BOUNDARY_COMM_TASKS = (TaskType.BWD_A2A, TaskType.BWD_TP_ALL_REDUCE)
+_FWD_BOUNDARY_COMM_TASKS = (TaskType.FWD_A2A, TaskType.FWD_TP_ALL_REDUCE, TaskType.FWD_RING_EXCHANGE)
+_BWD_BOUNDARY_COMM_TASKS = (TaskType.BWD_A2A, TaskType.BWD_TP_ALL_REDUCE, TaskType.BWD_RING_EXCHANGE)
 
 
 def _drain_losses(loss_buffer: list) -> list[float]:
@@ -143,6 +143,36 @@ class CommunicationExecutor:
             out = input_tensor.detach().clone(memory_format=torch.contiguous_format)
             dist.all_reduce(out, group=self.runtime.ep_group)
         return out
+
+    def ring_exchange(
+        self,
+        tensors: list[torch.Tensor],
+        shift: int,
+        stream: torch.cuda.Stream,
+    ) -> list[torch.Tensor]:
+        """Rotate tensors one hop around the group: send to rank+shift, receive from rank-shift.
+
+        Returns fresh contiguous leaves for the same reason as all_reduce_activation.
+        Sends and receives are issued as one batch so a two-rank ring (where the
+        peer is the same rank both ways) cannot deadlock. Rides on ep_group; see
+        the ponytail note on all_reduce_activation for the limit that implies.
+        """
+        group = self.runtime.ep_group
+        n = dist.get_world_size(group=group)
+        me = dist.get_rank(group=group)
+        dst = dist.get_global_rank(group, (me + shift) % n)
+        src = dist.get_global_rank(group, (me - shift) % n)
+        with torch.cuda.stream(stream):
+            # clone, not contiguous(): a contiguous() that aliases the producer's
+            # buffer would let the default stream free that block under an
+            # in-flight isend on this stream. The clone lives in this stream's pool.
+            sends = [t.detach().clone(memory_format=torch.contiguous_format) for t in tensors]
+            recvs = [torch.empty_like(s) for s in sends]
+            ops = [dist.P2POp(dist.isend, s, dst, group=group) for s in sends]
+            ops += [dist.P2POp(dist.irecv, r, src, group=group) for r in recvs]
+            for work in dist.batch_isend_irecv(ops):
+                work.wait()
+        return recvs
 
     def all_reduce_fused(
         self,
@@ -844,6 +874,74 @@ class DagExecutor:
                     tp_evt.record(node_stream)
                     self.events.a2a[node.uid] = tp_evt
 
+                case TaskType.FWD_RING_EXCHANGE:
+                    # Ring step: hand our chunk to the next rank, take the previous
+                    # rank's. The rotated tensors replace the forwarded slots so the
+                    # consumer region sees the new chunk under the same input index.
+                    meta = self._node_meta(node)
+                    idxs = meta["ring_tensor_idxs"]
+                    # Spliced: the source region is the predecessor. Hoisted: the
+                    # supplier of the forwarded slots is -- the previous ring node
+                    # or the defining region -- and the source region runs alongside.
+                    fwd_pred = next(
+                        p for p in node.data_preds
+                        if p.task_type in (TaskType.FWD, TaskType.FWD_RING_EXCHANGE)
+                    )
+                    if fwd_pred.task_type == TaskType.FWD:
+                        node_stream.wait_event(comp_events[fwd_pred.uid])
+                    else:
+                        ring_pred_evt = self.events.a2a.get(fwd_pred.uid)
+                        if ring_pred_evt is not None:
+                            node_stream.wait_event(ring_pred_evt)
+                    fwd_buf = dict(self.buffers.task[fwd_pred.uid])
+                    self.buffers.release(fwd_pred.uid)  # refcounted by data_succs
+                    detached_outs = list(fwd_buf["detached_outs"])
+                    rotated = self.communication.ring_exchange(
+                        [detached_outs[i] for i in idxs], meta["ring_shift"], node_stream
+                    )
+                    for i, t in zip(idxs, rotated):
+                        detached_outs[i] = t.requires_grad_(True)
+                    if meta.get("hoisted"):
+                        # Only the rotated slots are ours; the consumer takes the
+                        # produced slots from the source region. Blank the rest so
+                        # a wrong merge fails on None instead of using stale data.
+                        detached_outs = [
+                            t if i in idxs else None for i, t in enumerate(detached_outs)
+                        ]
+                    fwd_buf["detached_outs"] = detached_outs
+                    self.buffers.task[node.uid] = fwd_buf
+                    ring_evt = torch.cuda.Event()
+                    ring_evt.record(node_stream)
+                    self.events.a2a[node.uid] = ring_evt
+
+                case TaskType.BWD_RING_EXCHANGE:
+                    # Reverse ring: the gradient for the chunk we consumed goes back
+                    # to the rank that held that chunk one step earlier, where its
+                    # backward accumulates it with the gradient from its own use.
+                    bwd_pred = next(
+                        p for p in node.data_preds
+                        if p.task_type in (TaskType.BWD, TaskType.BWD_I)
+                    )
+                    node_stream.wait_event(comp_events[bwd_pred.uid])
+                    meta = self._node_meta(node)
+                    idxs = meta["ring_tensor_idxs"]
+                    bwd_buf = dict(self.buffers.task[bwd_pred.uid])
+                    self.buffers.release(bwd_pred.uid)
+                    inp_grads = list(bwd_buf["inp_grads"])
+                    parts = [inp_grads[i] for i in idxs]
+                    assert all(g is not None for g in parts), (
+                        f"BWD_RING_EXCHANGE tag={node_tag}: grad at ring_tensor_idxs="
+                        f"{idxs} is None; the forwarded slot did not receive a gradient"
+                    )
+                    rotated = self.communication.ring_exchange(parts, meta["ring_shift"], node_stream)
+                    for i, g in zip(idxs, rotated):
+                        inp_grads[i] = g
+                    bwd_buf["inp_grads"] = inp_grads
+                    self.buffers.task[node.uid] = bwd_buf
+                    ring_evt = torch.cuda.Event()
+                    ring_evt.record(node_stream)
+                    self.events.a2a[node.uid] = ring_evt
+
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
                     ar_ubids = self._sync_payload_ubids(node)
@@ -892,21 +990,53 @@ class DagExecutor:
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
                         node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
 
-                    a2a_pred = next(
-                        (p for p in node.data_preds
-                         if p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
-                    )
-                    if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
+                    comm_preds = [
+                        p for p in node.data_preds if p.task_type in _FWD_BOUNDARY_COMM_TASKS
+                    ]
+                    for p in comm_preds:
+                        evt = self.events.a2a.get(p.uid)
+                        if evt is not None:
+                            node_stream.wait_event(evt)
+                            # A hoisted ring's event is also awaited by the next
+                            # ring node; only the last data successor may drop it.
+                            if len(getattr(p, "data_succs", ())) <= 1:
+                                self.events.a2a.pop(p.uid, None)
 
-                    fwd_data_pred = next(
-                        (p for p in node.data_preds
-                         if p.task_type == TaskType.FWD
-                         or p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
-                    )
+                    # Base input set. Only a *hoisted* ring changes the rule: then
+                    # the compute predecessor carries the produced slots and the
+                    # ring node the rotated ones. Otherwise this is upstream's
+                    # first-match lookup, byte for byte.
+                    hoisted_preds = [
+                        p for p in comm_preds if self._node_meta(p).get("hoisted")
+                    ]
+                    if hoisted_preds:
+                        fwd_data_pred = next(
+                            (p for p in node.data_preds if p.task_type == TaskType.FWD), None
+                        ) or hoisted_preds[0]
+                    else:
+                        fwd_data_pred = next(
+                            (p for p in node.data_preds
+                             if p.task_type == TaskType.FWD
+                             or p.task_type in _FWD_BOUNDARY_COMM_TASKS), None
+                        )
                     if fwd_data_pred is not None:
-                        input_tensors = self.buffers.task[fwd_data_pred.uid]["detached_outs"]
+                        input_tensors = list(self.buffers.task[fwd_data_pred.uid]["detached_outs"])
                         self.buffers.release(fwd_data_pred.uid)
+                        for p in hoisted_preds:
+                            pm = self._node_meta(p)
+                            if p.uid == fwd_data_pred.uid:
+                                continue
+                            ring_outs = self.buffers.task[p.uid]["detached_outs"]
+                            for i in pm["ring_tensor_idxs"]:
+                                t = ring_outs[i]
+                                assert t is not None, (
+                                    f"hoisted ring {p.uid} has no tensor at slot {i}"
+                                )
+                                # Allocated on the comm stream, read here: tell the
+                                # allocator so a later comm-stream reuse waits for us.
+                                t.record_stream(node_stream)
+                                input_tensors[i] = t
+                            self.buffers.release(p.uid)
                     elif recv_pred is not None:
                         input_tensors = self.buffers.task[recv_pred.uid]
                         self.buffers.release(recv_pred.uid)

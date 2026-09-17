@@ -77,6 +77,7 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             "REDUCE_SCATTER_COMM",
             "A2A_COMM",
             "TP_COMM",
+            "RING_COMM",
         ):
             label = (
                 f"{topo_label}\\n{node.node_kind}\\n{_format_tag(node.tag)}\\n"
