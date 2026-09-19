@@ -1169,6 +1169,25 @@ def _insert_shard_a2a_comm_nodes(
             dag.add_edge(TrainingDAGEdge(src_uid=comm_uid, dst_uid=e.dst_uid, dep_kind="data", tensor_name=e.tensor_name))
 
 
+def _is_boundary_activation_edge_static(
+    dag: TrainingDAG,
+    e: TrainingDAGEdge,
+    node: TrainingDAGNode,
+    matched: set[str],
+) -> bool:
+    """Does this edge leave `node` for compute outside the matched region?"""
+    if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
+        return False
+    dst = dag.nodes[e.dst_uid]
+    if dst.node_kind != "COMPUTE":
+        return False
+    if node.compute_subkind == "FWD":
+        return dst.compute_subkind == "FWD"
+    if _is_backward_activation_subkind(node.compute_subkind):
+        return _is_backward_activation_subkind(dst.compute_subkind)
+    return False
+
+
 def _insert_tp_all_reduce_comm_nodes(
     dag: TrainingDAG,
     filters: list[dict[str, Any]],
@@ -1195,6 +1214,17 @@ def _insert_tp_all_reduce_comm_nodes(
     region is rejected rather than silently resolved.
     """
     expected = sorted(int(d) for d in devices)
+    if len(set(expected)) < 2:
+        # dp_degree and pp_degree are both 1 for a single-device group, so
+        # _join_process_groups never calls init_process_group and ep_group stays
+        # None. The all-reduce would then run on an uninitialized default group
+        # and fail deep in the executor with a torch.distributed error that says
+        # nothing about the schedule.
+        raise ValueError(
+            f"shard_tensor needs at least two distinct devices, got {devices}. "
+            f"A single-device tensor-parallel group has nothing to all-reduce; "
+            f"remove the directive to run the region unsharded."
+        )
     tp_idx = sum(1 for n in dag.nodes.values() if n.node_kind == "TP_COMM")
 
     matched = {
@@ -1221,6 +1251,29 @@ def _insert_tp_all_reduce_comm_nodes(
                     f"attached. TP weight gradients are shard-local and must not be reduced "
                     f"across the TP group."
                 )
+
+    # A boundary records one tensor index (_select_boundary_tensor_idx picks the
+    # best-scoring tensor), so exactly one of a region's outputs gets reduced. That
+    # is right for a TP region whose single output is a partial sum, and silently
+    # wrong for a region that also emits something replicated -- the replicated
+    # tensor would be summed across ranks, or the partial sum left unreduced,
+    # depending on which one scored higher. Refuse instead of guessing.
+    for uid in sorted(matched):
+        node = dag.nodes[uid]
+        if node.compute_subkind != "FWD":
+            continue
+        out_names = node.node_meta.get("output_names") or []
+        if len(out_names) > 1 and any(
+            _is_boundary_activation_edge_static(dag, e, node, matched)
+            for e in dag.edges
+        ):
+            raise ValueError(
+                f"shard_tensor matched node {uid}, whose region emits "
+                f"{len(out_names)} tensors {out_names[:4]} across its boundary, but a "
+                f"boundary carries a single tensor index so only one would be "
+                f"all-reduced. Split the region so the tensor needing the collective "
+                f"leaves it alone."
+            )
 
     def _is_boundary_activation_edge(e: TrainingDAGEdge, node: TrainingDAGNode) -> bool:
         if e.dep_kind != "data" or e.src_uid != node.uid or e.dst_uid in matched:
@@ -1667,6 +1720,49 @@ def _apply_order_directive(
                 _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
+_BOUNDARY_COMM_OPS = ("shard", "shard_tensor")
+
+
+def _reject_overlapping_boundary_comm_directives(
+    dag: TrainingDAG,
+    directives: list[Any],
+) -> None:
+    """Refuse two boundary-comm directives claiming the same compute node.
+
+    `shard` and `shard_tensor` both rewrite a matched node's activation edges to
+    route through a comm node. Whichever runs second then finds the edge already
+    pointing at a comm node rather than at compute, and skips it -- silently. The
+    outcome depends on the order the directives appear in the JSON:
+
+        shard then shard_tensor  ->  4 A2A_COMM, 0 TP_COMM  (TP dropped entirely)
+        shard_tensor then shard  ->  2 A2A_COMM, 2 TP_COMM  (both incomplete)
+
+    Neither is what the schedule asked for, and the first is wrong arithmetic with
+    no diagnostic. Checked once, before either pass runs, so it does not depend on
+    directive order itself.
+    """
+    claimed: dict[str, tuple[int, str]] = {}
+    for idx, raw in enumerate(directives):
+        if not isinstance(raw, dict) or raw.get("op") not in _BOUNDARY_COMM_OPS:
+            continue
+        op, filters, *_rest = _normalize_filter_devices_directive(raw)
+        for uid, node in dag.nodes.items():
+            if node.node_kind != "COMPUTE":
+                continue
+            if not any(_match_filter(node.tag, flt) for flt in filters):
+                continue
+            prev = claimed.get(uid)
+            if prev is not None:
+                raise ValueError(
+                    f"directives[{prev[0]}] ({prev[1]}) and directives[{idx}] ({op}) "
+                    f"both match compute node {uid} with tag {node.tag}. Both rewrite "
+                    f"the node's activation edges, so the one applied second is "
+                    f"silently dropped and the result depends on directive order. "
+                    f"Narrow one of the filters so each region is claimed once."
+                )
+            claimed[uid] = (idx, op)
+
+
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:
     if not directives:
         return
@@ -1714,6 +1810,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         place_stream = None
     _replicate_update_nodes_by_device(training_dag)
     _insert_send_recv_comm_nodes(training_dag, comm_stream=place_stream)
+    _reject_overlapping_boundary_comm_directives(training_dag, directives)
 
     for i, raw in enumerate(directives):
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
