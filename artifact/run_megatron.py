@@ -14,8 +14,8 @@ Architecture: Qwen3-30B-A3B MoE
   - QK LayerNorm enabled
 
 Parallelism notes:
-  - EP (expert parallelism) is orthogonal to TP/PP/DP/CP.
-  - Total GPUs = tp * pp * dp * cp * ep.
+  - EP (expert parallelism) divides the DP ranks for the expert weights only.
+  - Total GPUs = tp * pp * dp * cp. DP must divide evenly by EP.
   - With alltoall dispatcher, EP tokens are exchanged across ep ranks within each dp group.
   - Sequence parallelism (--sp) requires --tp > 1.
 

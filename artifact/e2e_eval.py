@@ -343,12 +343,17 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
 
     if exp.system == "torchtitan":
         nnode_value, ngpu_value = backend_layout(exp, args.backend)
-        if exp.ep > 1:
-            dp_replicate_degree = 1
-            dp_shard_degree = exp.ep
+        # zero0 replicates. Every other level shards the dense region over
+        # the full DP degree. EP needs dp_shard >= ep, so zero0 cannot run
+        # with experts.
+        if exp.zero_level == "zero0":
+            if exp.ep > 1:
+                raise ValueError("TorchTitan cannot replicate the dense region under expert parallelism; zero0 needs ep 1")
+            dp_replicate_degree = exp.dp
+            dp_shard_degree = 1
         else:
-            dp_replicate_degree = exp.dp if exp.zero_level == "zero1" else 1
-            dp_shard_degree = 1 if exp.zero_level == "zero1" else exp.dp
+            dp_replicate_degree = 1
+            dp_shard_degree = exp.dp
         tt_args = [
             "--parallelism.pipeline_parallel_degree", str(exp.pp),
             "--parallelism.expert_parallel_degree", str(exp.ep),
@@ -363,7 +368,9 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
         hf_assets_path = torchtitan_hf_assets_path(exp.config)
         if hf_assets_path is not None:
             tt_args.extend(["--hf_assets_path", hf_assets_path])
-        if exp.zero_level == "zero2":
+        # FSDP2 has no optimizer-only mode. Parameters kept gathered is the
+        # nearest to zero1: ZeRO-1 in practice under PP, ZeRO-2 at pp 1.
+        if exp.zero_level in ("zero1", "zero2"):
             tt_args.extend(["--parallelism.fsdp_reshard_after_forward", "never"])
         elif exp.zero_level == "zero3":
             tt_args.extend(["--parallelism.fsdp_reshard_after_forward", "always"])
@@ -388,7 +395,6 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
         return command
 
     if exp.system == "megatron":
-        dp_megatron = exp.dp // exp.ep if exp.ep > 1 else exp.dp
         command = [
             "/workspace/artifact/scripts/run_megatron.sh",
             "--nnode", nnode,
@@ -398,7 +404,7 @@ def in_container_command(exp: Experiment, args: argparse.Namespace, metrics_cont
             "--master-port", "29500",
             "--model", exp.config,
             "--pp", str(exp.pp),
-            "--dp", str(dp_megatron),
+            "--dp", str(exp.dp),
             "--ep", str(exp.ep),
         ]
         if args.nsight:
