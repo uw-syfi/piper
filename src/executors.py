@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ from torch.autograd.graph import GradientEdge, Node
 from torch.nn import Parameter
 
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
+from .device import get_device
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
 
@@ -55,17 +57,17 @@ class CommunicationExecutor:
     stages: StageStore
     logger: Any
 
-    def send(self, send_data: Any, peer_pp_rank: int, stream: torch.cuda.Stream) -> None:
+    def send(self, send_data: Any, peer_pp_rank: int, stream_ctx: AbstractContextManager) -> None:
         global_dst_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             tensors = send_data if isinstance(send_data, (list, tuple)) else [send_data]
             use_lo_hi = global_dst_rank > self.runtime.global_rank
             pp_group = self.runtime.pp_lo_hi if use_lo_hi else self.runtime.pp_hi_lo
             for tensor in tensors:
                 dist.send(tensor, dst=global_dst_rank, group=pp_group)
 
-    def recv_fwd(self, recv_ubid: Any, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
+    def recv_fwd(self, recv_ubid: Any, peer_pp_rank: int, stream_ctx: AbstractContextManager) -> list:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
         buf = [
@@ -77,34 +79,34 @@ class CommunicationExecutor:
             )
             for shape, dtype, requires_grad in self.stages.bucket(recv_ubid).forward_input_meta
         ]
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             use_hi_lo = global_src_rank > self.runtime.global_rank
             pp_group = self.runtime.pp_hi_lo if use_hi_lo else self.runtime.pp_lo_hi
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
-    def recv_bwd(self, shape_meta: list, peer_pp_rank: int, stream: torch.cuda.Stream) -> list:
+    def recv_bwd(self, shape_meta: list, peer_pp_rank: int, stream_ctx: AbstractContextManager) -> list:
         global_src_rank = self.runtime.pipeline_peer_global_rank(peer_pp_rank)
 
         buf = [
             torch.empty(shape, dtype=dtype, device=self.runtime.device)
             for shape, dtype in shape_meta
         ]
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             use_hi_lo = global_src_rank > self.runtime.global_rank
             pp_group = self.runtime.pp_hi_lo if use_hi_lo else self.runtime.pp_lo_hi
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
-    def all_to_all(self, input_tensor: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+    def all_to_all(self, input_tensor: torch.Tensor, stream_ctx: AbstractContextManager) -> torch.Tensor:
         output_buf = torch.empty_like(input_tensor, device=self.runtime.device)
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             dist.all_to_all_single(output_buf, input_tensor, group=self.runtime.ep_group)
         return output_buf
 
-    def all_reduce_grads(self, ubid: Any, stream: torch.cuda.Stream) -> int:
+    def all_reduce_grads(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
         assert ubid is not None, "all_reduce_grads requires a non-None ubid"
         if not self.has_trainable_params_for_collective(ubid, "all_reduce_grads"):
             return 0
@@ -121,12 +123,12 @@ class CommunicationExecutor:
             grad_tensors.append(param.grad)
 
         total_bytes = sum(grad.numel() * grad.element_size() for grad in grad_tensors)
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             for grad in grad_tensors:
                 dist.all_reduce(grad, group=self.runtime.dp_group)
         return total_bytes
 
-    def reduce_scatter(self, ubid: Any, stream: torch.cuda.Stream) -> int:
+    def reduce_scatter(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
         assert ubid is not None, "reduce_scatter requires a non-None ubid"
         if not self.has_trainable_params_for_collective(ubid, "reduce_scatter"):
             return 0
@@ -146,7 +148,7 @@ class CommunicationExecutor:
         assert rs_out is not None, (
             f"reduce_scatter: missing reduce_scatter_grads buffer for ubid={ubid}"
         )
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             total_bytes = flat_grads.numel() * flat_grads.element_size()
             tmp = torch.empty_like(rs_out)
             dist.reduce_scatter_tensor(tmp, flat_grads, group=self.runtime.dp_group)
@@ -208,7 +210,7 @@ class ComputeExecutor:
             _summarize_value(fwd_out.get("send_output")),
         )
 
-    def forward(self, ubid: Any, input_tensors: Any, compute_stream: torch.cuda.Stream) -> dict:
+    def forward(self, ubid: Any, input_tensors: Any, compute_stream_ctx: AbstractContextManager) -> dict:
         bucket = self.stages.bucket(ubid)
         fwd_fn = bucket.forward_fn
         fwd_args = bucket.forward_args
@@ -227,7 +229,7 @@ class ComputeExecutor:
         fwd_inputs = [fwd_args[i] for i in input_idxs]
         inp_with_grad = [t for t in fwd_inputs if t is not None and t.requires_grad]
 
-        with torch.cuda.stream(compute_stream):
+        with compute_stream_ctx:
             output = fwd_fn(fwd_args)
 
         for i in input_idxs:
@@ -263,14 +265,14 @@ class ComputeExecutor:
         detached_outs: Any,
         inp_with_grad: Any,
         out_with_grad: Any,
-        compute_stream: torch.cuda.Stream,
+        compute_stream_ctx: AbstractContextManager,
     ) -> dict | None:
         if pre_detach_outs is None:
             if upstream_grads is not None:
-                with torch.cuda.stream(compute_stream):
+                with compute_stream_ctx:
                     torch.autograd.backward(outputs_or_loss, upstream_grads)
             else:
-                with torch.cuda.stream(compute_stream):
+                with compute_stream_ctx:
                     outputs_or_loss[0].backward()
         else:
             bwd_pairs = [
@@ -285,7 +287,7 @@ class ComputeExecutor:
             if bwd_pairs:
                 outputs_bwd = [p for p, _g in bwd_pairs]
                 grads_bwd = [g for _p, g in bwd_pairs]
-                with torch.cuda.stream(compute_stream):
+                with compute_stream_ctx:
                     torch.autograd.backward(outputs_bwd, grads_bwd)
 
         if inp_with_grad:
@@ -491,6 +493,9 @@ class DagExecutor:
     # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
     _iter_count: int = 0
 
+    def __post_init__(self):
+        self.dev = get_device()
+
     @staticmethod
     def _node_meta(node: Any) -> dict:
         return getattr(node, "node_meta", {}) or {}
@@ -540,18 +545,16 @@ class DagExecutor:
         return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
 
     def _wait_for_all_gather(self, compute_node: Any) -> None:
-        compute_stream = self.runtime.stream_for_task(compute_node)
+        compute_stream_ctx = self.runtime.stream_for_task(compute_node)
         for pred in compute_node.data_preds:
             if pred.task_type == TaskType.ALL_GATHER:
-                ag_evt = self.events.all_gather.get(pred.uid)
-                if ag_evt is not None:
-                    compute_stream.wait_event(ag_evt)
+                self.dev.wait_event(compute_stream_ctx, self.events.all_gather.get(pred.uid))
 
     def _all_to_all_ep_boundary(
         self,
         node: Any,
         tensor: torch.Tensor,
-        stream: torch.cuda.Stream,
+        stream_ctx: AbstractContextManager,
     ) -> torch.Tensor:
         direction = self._node_meta(node).get("direction")
         if direction == "outgoing":
@@ -562,7 +565,7 @@ class DagExecutor:
                 f"direction={direction!r}; expected 'incoming' or 'outgoing'"
             )
 
-        tensor = self.communication.all_to_all(tensor, stream=stream)
+        tensor = self.communication.all_to_all(tensor, stream_ctx=stream_ctx)
         if direction == "incoming":
             tensor = tensor.contiguous()
         return tensor
@@ -586,25 +589,24 @@ class DagExecutor:
         self.buffers.reset()
         self.events.reset()
         self.params.clear_param_grads()
-        default_stream = self.runtime.default_stream()
-        self.params.zero_grad_buffers(default_stream)
-        zero_evt = torch.cuda.Event()
-        zero_evt.record(default_stream)
+        default_stream_ctx = self.runtime.default_stream()
+        self.params.zero_grad_buffers(default_stream_ctx)
+        zero_evt = self.dev.record_event(default_stream_ctx)
         step_result = None
-        for stream in self.runtime.streams.values():
-            if stream is not default_stream:
-                stream.wait_event(zero_evt)
-        comp_events: dict[Any, torch.cuda.Event] = {}
+        for stream_ctx in self.runtime.streams.values():
+            if stream_ctx is not default_stream_ctx:
+                self.dev.wait_event(stream_ctx, zero_evt)
+        comp_events: dict[Any, Any] = {}
 
         self.buffers.init_refcounts(dag)
-        last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
+        last_comp_event_by_stream: dict[str, Any] = {}
 
         for node in sorted_dag_nodes:
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
             ubid = self._node_bucket_key(node)
-            node_stream = self.runtime.stream_for_task(node)
+            node_stream_ctx = self.runtime.stream_for_task(node)
             node_stream_id = self.runtime.stream_id(node)
             node_tag = self._node_tag_str(node)
 
@@ -621,9 +623,9 @@ class DagExecutor:
             match task_type:
                 case TaskType.SEND:
                     compute_node = node.data_preds[0]
-                    node_stream.wait_event(comp_events[compute_node.uid])
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(compute_node.uid))
                     send_data = self.buffers.task[compute_node.uid]["send_output"]
-                    self.communication.send(send_data, node.peer_pp_rank, stream=node_stream)
+                    self.communication.send(send_data, node.peer_pp_rank, stream_ctx=node_stream_ctx)
                     send_buf = self.buffers.task.get(compute_node.uid)
                     if isinstance(send_buf, dict):
                         send_buf["send_output"] = None
@@ -632,47 +634,42 @@ class DagExecutor:
                 case TaskType.RECV:
                     compute_node = node.data_succs[0]
                     comp_evt = last_comp_event_by_stream.get(self.runtime.stream_id(compute_node))
-                    if comp_evt is not None:
-                        node_stream.wait_event(comp_evt)
+                    self.dev.wait_event(node_stream_ctx, comp_evt)
                     if compute_node.task_type == TaskType.FWD:
                         recv_ubid = self._node_bucket_key(compute_node)
                         recv_tensors = self.communication.recv_fwd(
-                            recv_ubid, node.peer_pp_rank, stream=node_stream
+                            recv_ubid, node.peer_pp_rank, stream_ctx=node_stream_ctx
                         )
                     else:
                         fwd_uid = compute_node.node_meta.get("fwd_uid")
                         fwd_key = (compute_node.node_meta.get("bucket_key"), fwd_uid)
                         shape_meta = self.buffers.task[("shape_ref",) + fwd_key]
                         recv_tensors = self.communication.recv_bwd(
-                            shape_meta, node.peer_pp_rank, stream=node_stream
+                            shape_meta, node.peer_pp_rank, stream_ctx=node_stream_ctx
                         )
                     self.buffers.task[node.uid] = recv_tensors
-                    recv_evt = torch.cuda.Event()
-                    recv_evt.record(node_stream)
-                    self.events.recv[node.uid] = recv_evt
+                    self.events.recv[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.FWD_A2A:
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
-                    node_stream.wait_event(comp_events[fwd_pred.uid])
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(fwd_pred.uid))
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
                     detached_outs = list(fwd_buf["detached_outs"])
                     detached_outs[tensor_idx] = self._all_to_all_ep_boundary(
-                        node, detached_outs[tensor_idx], node_stream
+                        node, detached_outs[tensor_idx], node_stream_ctx
                     ).requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.buffers.task[node.uid] = fwd_buf
-                    a2a_evt = torch.cuda.Event()
-                    a2a_evt.record(node_stream)
-                    self.events.a2a[node.uid] = a2a_evt
+                    self.events.a2a[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.BWD_A2A:
                     bwd_pred = next(
                         p for p in node.data_preds
                         if p.task_type in (TaskType.BWD, TaskType.BWD_I)
                     )
-                    node_stream.wait_event(comp_events[bwd_pred.uid])
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_pred.uid))
                     tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     bwd_buf = dict(self.buffers.task[bwd_pred.uid])
                     self.buffers.release(bwd_pred.uid)
@@ -682,13 +679,11 @@ class DagExecutor:
                         f"BWD_A2A tag={node_tag}: grad at a2a_tensor_idx={tensor_idx} is None"
                     )
                     inp_grads[tensor_idx] = self._all_to_all_ep_boundary(
-                        node, grad_a2a_out, node_stream
+                        node, grad_a2a_out, node_stream_ctx
                     )
                     bwd_buf["inp_grads"] = inp_grads
                     self.buffers.task[node.uid] = bwd_buf
-                    a2a_evt = torch.cuda.Event()
-                    a2a_evt.record(node_stream)
-                    self.events.a2a[node.uid] = a2a_evt
+                    self.events.a2a[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
@@ -696,12 +691,10 @@ class DagExecutor:
                     assert ar_ubids, (
                         f"ALL_REDUCE node uid={node.uid} has no sync_payload_ubids"
                     )
-                    node_stream.wait_event(comp_events[bwd_node.uid])
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
                     for ar_ubid in ar_ubids:
-                        self.communication.all_reduce_grads(ar_ubid, stream=node_stream)
-                    ar_evt = torch.cuda.Event()
-                    ar_evt.record(node_stream)
-                    self.events.all_reduce[node.uid] = ar_evt
+                        self.communication.all_reduce_grads(ar_ubid, stream_ctx=node_stream_ctx)
+                    self.events.all_reduce[node.uid] = self.dev.record_event(node_stream_ctx)
                     self.buffers.release(bwd_node.uid)
 
                 case TaskType.REDUCE_SCATTER:
@@ -710,10 +703,9 @@ class DagExecutor:
                     assert rs_ubid is not None, (
                         f"REDUCE_SCATTER node uid={node.uid} has no bucket_key"
                     )
-                    node_stream.wait_event(comp_events[bwd_node.uid])
-                    rs_bytes = self.communication.reduce_scatter(rs_ubid, stream=node_stream)
-                    rs_evt = torch.cuda.Event()
-                    rs_evt.record(node_stream)
+                    self.dev.wait_event(node_stream_ctx, comp_events.get(bwd_node.uid))
+                    rs_bytes = self.communication.reduce_scatter(rs_ubid, stream_ctx=node_stream_ctx)
+                    rs_evt = self.dev.record_event(node_stream_ctx)
                     self.events.reduce_scatter[node.uid] = rs_evt
                     if rs_bytes:
                         self.params.defer_free_full_grads(rs_ubid, rs_evt)
@@ -726,23 +718,21 @@ class DagExecutor:
                     assert ag_ubid is not None, (
                         f"ALL_GATHER node uid={node.uid} has no bucket_key"
                     )
-                    self.params.all_gather_full_params(ag_ubid, stream=node_stream)
-                    ag_evt = torch.cuda.Event()
-                    ag_evt.record(node_stream)
-                    self.events.all_gather[node.uid] = ag_evt
+                    self.params.all_gather_full_params(ag_ubid, stream_ctx=node_stream_ctx)
+                    self.events.all_gather[node.uid] = self.dev.record_event(node_stream_ctx)
 
                 case TaskType.FWD:
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
 
                     a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_data_pred = next(
                         (p for p in node.data_preds
@@ -759,15 +749,14 @@ class DagExecutor:
 
                     self._wait_for_all_gather(node)
 
-                    fwd_out = self.compute.forward(ubid, input_tensors, node_stream)
+                    fwd_out = self.compute.forward(ubid, input_tensors, node_stream_ctx)
                     self.buffers.task[node.uid] = fwd_out
                     fwd_key = (node.node_meta.get("bucket_key"), node.uid)
                     self.buffers.task[("shape_ref",) + fwd_key] = [
                         (t.shape, t.dtype) for t in fwd_out["out_with_grad"]
                     ]
                     self.buffers.task[fwd_key] = fwd_out
-                    evt = torch.cuda.Event()
-                    evt.record(node_stream)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
@@ -779,14 +768,14 @@ class DagExecutor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
                     self._wait_for_all_gather(node)
 
                     a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
                     )
                     if a2a_pred is not None and a2a_pred.uid in self.events.a2a:
-                        node_stream.wait_event(self.events.a2a.pop(a2a_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.a2a.pop(a2a_pred.uid))
 
                     fwd_uid = node.node_meta.get("fwd_uid")
                     fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
@@ -796,7 +785,7 @@ class DagExecutor:
                         assert loss_fn is not None
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
-                        with torch.cuda.stream(node_stream):
+                        with node_stream_ctx:
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
                         loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
@@ -848,13 +837,13 @@ class DagExecutor:
 
                     inp_with_grad = fwd_out.get("inp_with_grad")
                     if self._node_meta(node).get("zero_alloc_full_grads_before"):
-                        self.params.alloc_full_grads(ubid, node_stream)
+                        self.params.alloc_full_grads(ubid, node_stream_ctx)
 
                     bwd_out = self.compute.backward(
                         ubid, mb_idx, outputs_or_loss, upstream_grads,
                         pre_detach_outs, detached_outs, inp_with_grad,
                         fwd_out.get("out_with_grad"),
-                        node_stream,
+                        node_stream_ctx,
                     )
                     buf = bwd_out if bwd_out is not None else {}
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
@@ -864,15 +853,14 @@ class DagExecutor:
                         if fwd_inputs_full is not None
                         else [t.grad for t in (inp_with_grad or [])]
                     )
-                    self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream)
+                    self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream_ctx)
                     self.buffers.task[node.uid] = buf
                     fwd_out.clear()
                     del self.buffers.task[fwd_key]
-                    evt = torch.cuda.Event()
-                    evt.record(node_stream)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
-                    self.events.backward[ubid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
+                    self.events.backward[ubid] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
@@ -881,7 +869,7 @@ class DagExecutor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.events.recv:
-                        node_stream.wait_event(self.events.recv.pop(recv_pred.uid))
+                        self.dev.wait_event(node_stream_ctx, self.events.recv.pop(recv_pred.uid))
                     self._wait_for_all_gather(node)
 
                     fwd_uid = node.node_meta.get("fwd_uid")
@@ -892,7 +880,7 @@ class DagExecutor:
                         assert loss_fn is not None
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
-                        with torch.cuda.stream(node_stream):
+                        with node_stream_ctx:
                             stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
                         output_grads = None
                     elif recv_pred is not None:
@@ -932,7 +920,7 @@ class DagExecutor:
                     input_values = fwd_out.get("inp_with_grad") or []
                     weights = self.stages.bucket(ubid).weights()
 
-                    with torch.cuda.stream(node_stream):
+                    with node_stream_ctx:
                         dinputs, param_groups, output_backward_ctx = self.compute.bucket_backward_input(
                             stage_outputs_or_loss, output_grads, input_values, iter(weights)
                         )
@@ -955,23 +943,22 @@ class DagExecutor:
                     fwd_out.clear()
                     del stage_outputs_or_loss, fwd_out
                     del self.buffers.task[fwd_key]
-                    evt = torch.cuda.Event()
-                    evt.record(node_stream)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
-                    self.events.backward[ubid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
+                    self.events.backward[ubid] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD_W:
                     self._wait_for_all_gather(node)
                     if self._node_meta(node).get("zero_alloc_full_grads_before"):
-                        self.params.alloc_full_grads(ubid, node_stream)
+                        self.params.alloc_full_grads(ubid, node_stream_ctx)
                     bwdi_node = next(p for p in node.data_preds if p.task_type == TaskType.BWD_I)
                     bwdi_buf = self.buffers.task[bwdi_node.uid]
                     param_groups = bwdi_buf["param_groups"]
                     weights = self.stages.bucket(ubid).weights()
-                    with torch.cuda.stream(node_stream):
+                    with node_stream_ctx:
                         output_backward_ctx = bwdi_buf.get("output_backward_ctx")
                         if output_backward_ctx is not None:
                             self.compute.backward_weight_from_outputs(
@@ -983,19 +970,18 @@ class DagExecutor:
                             self.compute.bucket_backward_weight(
                                 iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx
                             )
-                    self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream)
+                    self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream_ctx)
                     self.buffers.task[node.uid] = {}
                     self.buffers.release(bwdi_node.uid)
-                    evt = torch.cuda.Event()
-                    evt.record(node_stream)
+                    evt = self.dev.record_event(node_stream_ctx)
                     comp_events[node.uid] = evt
-                    self.events.backward[ubid] = evt
                     last_comp_event_by_stream[node_stream_id] = evt
+                    self.events.backward[ubid] = evt
                     if self._node_meta(node).get("zero_free_full_params_after"):
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    step_result = self._update(node_stream, loss_buffer)
+                    step_result = self._update(node_stream_ctx, loss_buffer)
 
                 case TaskType.ORDER_DUMMY:
                     pass
@@ -1004,34 +990,32 @@ class DagExecutor:
             self.runtime.nvtx_pop()
         return step_result
 
-    def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
+    def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
             _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
-            self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
+            self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
             losses = list(loss_buffer)
             loss_buffer.clear()
-            torch.cuda.synchronize()
+            self.dev.synchronize()
             return [float(l) for l in losses]
 
         for ar_evt in self.events.all_reduce.values():
-            stream.wait_event(ar_evt)
+            self.dev.wait_event(stream_ctx, ar_evt)
 
         _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
-            bwd_evt = self.events.backward.get(ubid)
-            if bwd_evt is not None:
-                stream.wait_event(bwd_evt)
+            self.dev.wait_event(stream_ctx, self.events.backward.get(ubid))
 
-            with torch.cuda.stream(stream):
+            with stream_ctx:
                 bucket.optimizer.step()
 
         losses = list(loss_buffer)
         loss_buffer.clear()
 
-        torch.cuda.synchronize()
+        self.dev.synchronize()
 
         return {
             "losses": [float(l) for l in losses],

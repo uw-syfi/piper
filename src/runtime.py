@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from concurrent.futures import Future, ThreadPoolExecutor
+
+from .device import get_device
 
 
 @dataclass
@@ -137,12 +140,12 @@ class RuntimeState:
     pp_degree: int
     world_size: int
     no_nvtx: bool = False
-    device: str = "cuda"
+    device: str = "cpu"
     dp_group: Any = None
     ep_group: Any = None
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
-    streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
+    streams: dict[str, AbstractContextManager] = field(default_factory=dict)
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
 
@@ -165,38 +168,32 @@ class RuntimeState:
             if getattr(n, "stream", None) is not None
         }
         stream_ids.add("default_stream")
+        dev = get_device()
         self.streams = {
-            stream_id: torch.cuda.Stream(device=self.device)
+            stream_id: dev.create_stream_context()
             for stream_id in sorted(stream_ids)
         }
 
-        # Force cuBLAS context initialization on every logical stream used by
-        # this DAG so the first backward pass does not hit lazy CUDA warnings.
-        for stream in self.streams.values():
-            with torch.cuda.stream(stream):
-                w = torch.zeros(4, 4, device=self.device)
-                torch.mm(w, w)
-
-    def stream_for_id(self, stream_id: str) -> torch.cuda.Stream:
+    def stream_for_id(self, stream_id: str) -> AbstractContextManager:
         assert stream_id in self.streams, (
             f"TrainingDAG referenced stream={stream_id!r}, but load_training_dag "
             f"initialized only {sorted(self.streams)}"
         )
         return self.streams[stream_id]
 
-    def stream_for_task(self, task: Any) -> torch.cuda.Stream:
+    def stream_for_task(self, task: Any) -> AbstractContextManager:
         return self.stream_for_id(self.stream_id(task))
 
-    def default_stream(self) -> torch.cuda.Stream:
+    def default_stream(self) -> AbstractContextManager:
         return self.stream_for_id("default_stream")
 
     def nvtx_push(self, label: str) -> None:
         if not self.no_nvtx:
-            torch.cuda.nvtx.range_push(label)
+            get_device().nvtx_push(label)
 
     def nvtx_pop(self) -> None:
         if not self.no_nvtx:
-            torch.cuda.nvtx.range_pop()
+            get_device().nvtx_pop()
 
 
 @dataclass
@@ -220,8 +217,8 @@ class ParamStorage:
                 if param is not None:
                     param.grad = None
 
-    def zero_grad_buffers(self, stream: torch.cuda.Stream) -> None:
-        with torch.cuda.stream(stream):
+    def zero_grad_buffers(self, stream_ctx: AbstractContextManager) -> None:
+        with stream_ctx:
             for bucket in self.stages.buckets.values():
                 if bucket.flat_grads is not None:
                     bucket.flat_grads.zero_()
@@ -249,7 +246,7 @@ class ParamStorage:
     def accumulate_zero_param_grads_to_flat(
         self,
         ubid: Any | None,
-        stream: torch.cuda.Stream,
+        stream_ctx: AbstractContextManager,
     ) -> None:
         if ubid is None or ubid not in self.stages.zero_managed_ubids or self.runtime.dp_degree <= 1:
             return
@@ -259,7 +256,7 @@ class ParamStorage:
         specs = bucket.param_view_specs
         if not specs:
             return
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             flat_grads = bucket.flat_grads
             if flat_grads is None:
                 shard_info = bucket.param_shard_info
@@ -281,7 +278,7 @@ class ParamStorage:
                 )
                 param.grad = None
 
-    def defer_free_full_params(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
+    def defer_free_full_params(self, ubid: Any | None, evt: Any) -> None:
         if ubid is None or ubid not in self.stages.param_sharded_ubids:
             return
         self.wait_pending_free(self.pending_param_frees, ubid)
@@ -291,7 +288,7 @@ class ParamStorage:
             evt,
         )
 
-    def defer_free_full_grads(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
+    def defer_free_full_grads(self, ubid: Any | None, evt: Any) -> None:
         if ubid is None or ubid not in self.stages.grad_sharded_ubids:
             return
         self.wait_pending_free(self.pending_grad_frees, ubid)
@@ -301,12 +298,14 @@ class ParamStorage:
             evt,
         )
 
-    def _wait_then_free_full_params(self, ubid: Any, evt: torch.cuda.Event) -> None:
-        evt.synchronize()
+    def _wait_then_free_full_params(self, ubid: Any, evt: Any) -> None:
+        if evt is not None:
+            evt.synchronize()
         self.free_full_params(ubid)
 
-    def _wait_then_free_full_grads(self, ubid: Any, evt: torch.cuda.Event) -> None:
-        evt.synchronize()
+    def _wait_then_free_full_grads(self, ubid: Any, evt: Any) -> None:
+        if evt is not None:
+            evt.synchronize()
         self.free_full_grads(ubid)
 
     def alloc_full_params(self, ubid: Any) -> None:
@@ -370,7 +369,7 @@ class ParamStorage:
         storage.resize_(0)
         bucket.full_params_fresh = False
 
-    def alloc_full_grads(self, ubid: Any, stream: torch.cuda.Stream) -> None:
+    def alloc_full_grads(self, ubid: Any, stream_ctx: AbstractContextManager) -> None:
         assert ubid is not None, "alloc_full_grads requires a non-None ubid"
         assert ubid in self.stages.grad_sharded_ubids, (
             f"alloc_full_grads: ubid={ubid} is not in grad_sharded_ubids="
@@ -385,7 +384,7 @@ class ParamStorage:
             f"alloc_full_grads: missing param_shard_info for ubid={ubid}"
         )
         shard_size = shard_info[1]
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             if bucket.flat_grads is None:
                 bucket.flat_grads = torch.zeros(
                     shard_size * self.runtime.dp_degree,
@@ -412,7 +411,7 @@ class ParamStorage:
             param.grad = None
         bucket.flat_grads = None
 
-    def all_gather_full_params(self, ubid: Any, stream: torch.cuda.Stream) -> int:
+    def all_gather_full_params(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
         assert ubid is not None, "all_gather_full_params requires a non-None ubid"
         if not self._has_trainable_params_for_collective(ubid, "all_gather_full_params"):
             return 0
@@ -434,7 +433,7 @@ class ParamStorage:
             f"all_gather_full_params: ubid={ubid} dispatched but full params are already fresh; "
             "DAG is constructing a redundant ALL_GATHER"
         )
-        with torch.cuda.stream(stream):
+        with stream_ctx:
             self.logger.debug(
                 f"[all_gather_begin] rank={self.runtime.global_rank} ubid={ubid}: "
                 f"flat_numel={flat_params.numel()} flat_storage={flat_params.untyped_storage().size()} "
@@ -453,11 +452,12 @@ class ParamStorage:
 
     def step_zero_shard_optimizers(
         self,
-        stream: torch.cuda.Stream,
-        reduce_scatter_events: dict[Any, torch.cuda.Event],
+        stream_ctx: AbstractContextManager,
+        reduce_scatter_events: dict[Any, Any],
     ) -> None:
+        dev = get_device()
         for evt in reduce_scatter_events.values():
-            stream.wait_event(evt)
+            dev.wait_event(stream_ctx, evt)
 
         for bucket in self.stages.buckets.values():
             shard_optim = bucket.shard_optimizer
@@ -467,7 +467,7 @@ class ParamStorage:
             rs_grad = bucket.reduce_scatter_grads
             if rs_grad is None:
                 continue
-            with torch.cuda.stream(stream):
+            with stream_ctx:
                 shard_param.grad = rs_grad.to(shard_param.dtype)
                 shard_optim.step()
             shard_param.grad = None
