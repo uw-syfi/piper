@@ -3,6 +3,7 @@ import torch
 import copy
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .actor import _create_actors
@@ -11,12 +12,16 @@ from .state import (
     create_logger,
     LOG_LEVEL,
 )
+from .config import ActorConfig
+from .dag import TrainingDAG
 from .fx import _serialize_graphmodule
-from .piper import _reset_annotation_state, piper
+from .piper import DagBackend, _reset_annotation_state
 from .schedule import (
     derive_schedule_info,
     load_schedule_directives,
 )
+from .topology import Topology
+
 logger = create_logger("compile", LOG_LEVEL)
 
 _RANK0_ADDR_ACTOR = "piper_rank0_addr"
@@ -113,6 +118,115 @@ def _artifact_dir_for_schedule(schedule_directives_file: str) -> str:
     return str(parent if str(parent) else Path("out"))
 
 
+@dataclass
+class DagProgram:
+    """Compiled training program: one TrainingDAG shard per PP rank.
+
+    shards: per-PP-rank DAGs, Ray-safe (GraphModules serialized).
+    input_pp_ranks: PP ranks that consume the model inputs.
+    loss_pp_ranks: PP ranks that consume the labels and compute the loss.
+    schedule_info: pp/dp/mbs facts derived from the schedule.
+    schedule_directives: the schedule program that was applied.
+    """
+
+    shards: list[TrainingDAG]
+    input_pp_ranks: list[int]
+    loss_pp_ranks: list[int]
+    schedule_info: dict = field(default_factory=dict)
+    schedule_directives: list[dict] = field(default_factory=list)
+    kind: str = "dag"
+
+    @property
+    def pp(self) -> int:
+        return len(self.shards)
+
+    def shard_for(self, pp_rank: int) -> TrainingDAG:
+        return self.shards[pp_rank]
+
+
+def compile(
+    model_cls,
+    model_args=(),
+    example_inputs=None,
+    schedule_file: str | None = None,
+    dtype=torch.bfloat16,
+    model_kwargs=None,
+    visualize_dag: bool = False,
+    artifact_dir: str | None = None,
+) -> DagProgram:
+    """Trace ``model_cls`` on the meta device and lower the schedule into per-PP DAGs.
+
+    model_cls, model_args, model_kwargs: model constructor; args/kwargs may be
+        callables of the schedule info.
+    example_inputs: example forward inputs (only shapes/dtypes are used).
+    schedule_file: JSON schedule directives.
+    dtype: parameter dtype the model is cast to before tracing.
+    visualize_dag: render per-rank DAG artifacts under ``artifact_dir``.
+    """
+    if schedule_file is None:
+        raise ValueError("compile requires schedule_file")
+    if example_inputs is None:
+        raise ValueError("compile requires example_inputs")
+
+    # Clear Dynamo's global cache so an earlier compile in this process (e.g.
+    # a different model size or schedule) cannot leak in via a stale cache hit.
+    torch._dynamo.reset()
+
+    schedule_directives = load_schedule_directives(schedule_file)
+    schedule_info = derive_schedule_info(schedule_directives, schedule_file)
+    pp_degree = int(schedule_info["pp_degree"])
+
+    resolved_model_args = _resolve_model_constructor_value(model_args, schedule_info)
+    resolved_model_kwargs = _resolve_model_constructor_value(model_kwargs or {}, schedule_info)
+    with torch.device("meta"):
+        model = model_cls(*tuple(resolved_model_args or ()), **dict(resolved_model_kwargs or {}))
+        if dtype is not None:
+            model = model.to(dtype)
+
+    num_params = sum(p.numel() for p in model.parameters())
+    if dtype == torch.bfloat16:
+        param_size_gb = num_params * 2 / (1024**3)
+    elif dtype == torch.float32:
+        param_size_gb = num_params * 4 / (1024**3)
+    else:
+        raise ValueError(f"Unsupported model dtype: {dtype}")
+    logger.info(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_gb:.2f} GB), dtype: {dtype}")
+
+    backend = DagBackend(
+        schedule_directives,
+        visualize_dag=visualize_dag,
+        artifact_dir=artifact_dir or _artifact_dir_for_schedule(schedule_file),
+    )
+    compiled = torch.compile(model, backend=backend, fullgraph=True)
+    compile_inputs = [x.to(device="meta") for x in example_inputs]
+    _reset_annotation_state()
+    _ = compiled(*compile_inputs)
+
+    per_pp_training_dags = backend.per_pp_training_dags
+    if not per_pp_training_dags:
+        raise RuntimeError("piper backend did not produce per_pp_training_dags")
+    if len(per_pp_training_dags) != pp_degree:
+        raise RuntimeError(
+            f"Expected {pp_degree} per-PP DAGs, got {len(per_pp_training_dags)}"
+        )
+    shards = _prepare_training_dags_for_rpc(per_pp_training_dags)
+
+    loss_pp_ranks = _compute_loss_pp_ranks(shards)
+    if not loss_pp_ranks:
+        loss_pp_ranks = [pp_degree - 1]
+        logger.warning(
+            "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
+            loss_pp_ranks[0],
+        )
+    return DagProgram(
+        shards=shards,
+        input_pp_ranks=[0],
+        loss_pp_ranks=loss_pp_ranks,
+        schedule_info=dict(schedule_info),
+        schedule_directives=list(schedule_directives),
+    )
+
+
 def piper_setup(
     model_class,
     model_args=(),
@@ -134,10 +248,8 @@ def piper_setup(
     schedule_directives_file: str | None = None,
 ):
     """
-    Compile a model with the TrainingDAG backend.
-
-    The model and example inputs are always traced on the meta device so the
-    full model is never materialized on the driver GPU at compile time.
+    Compile a model with the TrainingDAG backend and load it onto this DP
+    rank's actors (one driver process per DP rank, launched by the coordinator).
 
     Args:
         model: The model to compile.
@@ -150,18 +262,10 @@ def piper_setup(
             TrainingDAG backend. When provided, Piper derives pp/dp/mbs
             schedule metadata internally.
     """
-
-    # Clear Dynamo's global compilation cache so that a previous piper_setup
-    # call (e.g. with a different model size or schedule) in the same Python
-    # worker process cannot contaminate this compilation via a stale cache hit.
-    torch._dynamo.reset()
-
-    schedule_info = {}
-    if schedule_directives_file is not None:
-        schedule_directives = load_schedule_directives(schedule_directives_file)
-        schedule_info = derive_schedule_info(schedule_directives, schedule_directives_file)
-    else:
+    if schedule_directives_file is None:
         raise ValueError("piper_setup requires schedule_directives_file")
+    schedule_directives = load_schedule_directives(schedule_directives_file)
+    schedule_info = derive_schedule_info(schedule_directives, schedule_directives_file)
 
     piper_metadata.visualize_dag = visualize_dag
     piper_metadata.artifact_dir = _artifact_dir_for_schedule(schedule_directives_file)
@@ -175,20 +279,21 @@ def piper_setup(
     piper_metadata.per_pp_training_dags = None
     piper_metadata.compiled_data_store = None
 
-    pp_degree = int(schedule_info["pp_degree"])
+    topology = Topology(dp=int(schedule_info["dp_degree"]), pp=int(schedule_info["pp_degree"]))
+    pp_degree = topology.pp
+    dp_rank = int(os.environ["PIPER_DP_RANK"])
+    config = ActorConfig(
+        use_inductor=use_inductor,
+        no_nvtx=no_nvtx,
+        nsight=nsight,
+        temp_dir=temp_dir,
+        pp_outer=pp_outer,
+    )
+    _create_actors(topology, dp_rank, optim_fn, config, pg=pg)
 
     # All dp_ranks must agree on a single master_addr: the IP of the actor with
     # global_rank=0 (pp_rank=0, dp_rank=0).  dp_rank=0 publishes it via a named
     # Ray actor; other dp_ranks wait until it's available.
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
-    _create_actors(
-        pp_degree, optim_fn,
-        profile=nsight,
-        no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
-        use_inductor=use_inductor,
-        pp_outer=pp_outer,
-    )
-
     if dp_rank == 0:
         # Create the compiled-data store early so dp_rank>0 can poll for it.
         piper_metadata.compiled_data_store = _CompiledDataStore.options(
@@ -226,7 +331,11 @@ def piper_setup(
 
     logger.debug(f"DP rank {dp_rank}: Master address for process groups: {master_addr}:{master_port}")
 
-    ray.get([actor._join_process_groups.remote(master_addr, master_port) for actor in piper_metadata.actors.values()])
+    groups = topology.groups()
+    ray.get([
+        actor.join_groups.remote(master_addr, master_port, groups)
+        for actor in piper_metadata.actors.values()
+    ])
 
     if dp_rank == 0:
         try:
@@ -251,52 +360,22 @@ def piper_setup(
         ])
 
     if dp_rank == 0:
-        # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---
-
-        # Build the model directly on meta device.
-        resolved_model_args = _resolve_model_constructor_value(model_args, piper_metadata.schedule_info)
-        resolved_model_kwargs = _resolve_model_constructor_value(model_kwargs, piper_metadata.schedule_info)
-        with torch.device("meta"):
-            model = model_class(*tuple(resolved_model_args or ()), **dict(resolved_model_kwargs or {}))
-            if model_dtype is not None:
-                model = model.to(model_dtype)
-
-        num_params = sum(p.numel() for p in model.parameters())
-        if model_dtype == torch.bfloat16:
-            param_size_gb = num_params * 2 / (1024**3)
-        elif model_dtype == torch.float32:
-            param_size_gb = num_params * 4 / (1024**3)
-        else:
-            raise ValueError(f"Unsupported model dtype: {model_dtype}")
-        logger.info(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_gb:.2f} GB), dtype: {model_dtype}")
-
-        compiled = torch.compile(model, backend=piper, fullgraph=True)
-        compile_inputs = [x.to(device="meta") for x in example_inputs]
-        _reset_annotation_state()
-        _ = compiled(*compile_inputs)
-
-        per_pp_training_dags = getattr(piper_metadata, "per_pp_training_dags", None)
-        if not per_pp_training_dags:
-            raise RuntimeError(
-                "piper backend did not produce per_pp_training_dags; backend transition incomplete"
-            )
-        if len(per_pp_training_dags) != pp_degree:
-            raise RuntimeError(
-                f"Expected {pp_degree} per-PP DAGs, got {len(per_pp_training_dags)}"
-            )
-        per_pp_training_dags_rpc = _prepare_training_dags_for_rpc(per_pp_training_dags)
-        piper_metadata.per_pp_training_dags = per_pp_training_dags_rpc
-
-        ray.get([
-            piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
-            for pp_rank, pp_dag in enumerate(per_pp_training_dags_rpc)
-        ])
+        # dp_rank=0 compiles and publishes the program; dp_rank>0 wait for it.
+        program = compile(
+            model_class,
+            model_args=model_args,
+            example_inputs=example_inputs,
+            schedule_file=schedule_directives_file,
+            dtype=model_dtype,
+            model_kwargs=model_kwargs,
+            visualize_dag=visualize_dag,
+            artifact_dir=piper_metadata.artifact_dir,
+        )
         ray.get(
             piper_metadata.compiled_data_store.publish_training_dag_data.remote(
-                {"per_pp_training_dags": per_pp_training_dags_rpc}
+                {"program": program}
             )
         )
-
     else:
         logger.debug(f"DP rank {dp_rank} waiting for dp_rank=0 training-DAG data...")
         training_dag_data = None
@@ -316,28 +395,23 @@ def piper_setup(
                 raise
             if training_dag_data is None:
                 time.sleep(0.2)
-
-        per_pp_training_dags = training_dag_data["per_pp_training_dags"]
-        if len(per_pp_training_dags) != pp_degree:
+        program = training_dag_data["program"]
+        if program.pp != pp_degree:
             raise RuntimeError(
-                f"Expected {pp_degree} per-PP DAGs from dp_rank=0, got {len(per_pp_training_dags)}"
+                f"Expected {pp_degree} per-PP DAGs from dp_rank=0, got {program.pp}"
             )
-        piper_metadata.per_pp_training_dags = per_pp_training_dags
 
-        ray.get([
-            piper_metadata.actors[pp_rank].load_training_dag.remote(pp_dag)
-            for pp_rank, pp_dag in enumerate(per_pp_training_dags)
-        ])
+    piper_metadata.per_pp_training_dags = program.shards
+    ray.get([
+        piper_metadata.actors[pp_rank].load_training_dag.remote(program.shard_for(pp_rank))
+        for pp_rank in range(pp_degree)
+    ])
 
-    loss_pp_ranks = _compute_loss_pp_ranks(per_pp_training_dags)
-    if not loss_pp_ranks:
-        loss_pp_ranks = [pp_degree - 1]
-        logger.warning(
-            "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
-            loss_pp_ranks[0],
-        )
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    ray.get([
+        piper_metadata.actors[pp_rank].load_input.remote(example_inputs)
+        for pp_rank in program.input_pp_ranks
+    ])
     ray.get([
         piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
-        for pp_rank in loss_pp_ranks
+        for pp_rank in program.loss_pp_ranks
     ])

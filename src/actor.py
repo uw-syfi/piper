@@ -32,88 +32,74 @@ def _disable_functorch_donated_buffers() -> None:
     config.donated_buffer = False
 
 
-def _get_rank(pp_rank, dp_rank, pp_degree):
-    return pp_rank + dp_rank * pp_degree
+def _actor_options(config, pg, bundle_index: int) -> dict:
+    """Ray ``options`` for one PiperActor from an ``ActorConfig`` and placement bundle."""
+    nsight_env = {"nsight": {
+        "t": "cuda,cudnn,cublas,nvtx",
+        "sample": "process-tree",
+        "backtrace": "dwarf",
+        "cudabacktrace": "sync:0,memory:0",
+        "python-backtrace": "cuda",
+        "stop-on-exit": "true",
+    }} if config.nsight else {}
+    env_vars = dict(config.env_vars)
+    if config.nsight and config.temp_dir:
+        env_vars["TMPDIR"] = config.temp_dir
+    options = {
+        "runtime_env": {**nsight_env, "env_vars": env_vars},
+        "max_concurrency": config.max_concurrency,
+    }
+    if get_device().accelerator_resource == "GPU":
+        options["num_gpus"] = config.num_gpus
+    if pg is not None:
+        options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=bundle_index,
+        )
+    return options
 
 
-def _create_actors(
-    num_actors,
-    optim_class,
-    profile=False,
-    no_nvtx: bool = False,
-    pg=None,
-    temp_dir: str = None,
-    use_inductor: bool = False,
-    pp_outer: bool = False,
-):
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
-    world_size = int(os.environ["PIPER_WORLD_SIZE"])
-    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
-    pp_degree = int(os.environ["PIPER_PP_DEGREE"])
+def _bundle_index(slot, config) -> int:
+    """Placement bundle of a trainer slot: one bundle per stage when
+    ``pp_outer`` (all DP replicas of a stage colocated), else one per replica."""
+    dp_rank, pp_rank = slot
+    return pp_rank if config.pp_outer else dp_rank
 
+
+def _spawn_actor(slot, global_rank, topology, config, optim_class=None, pg=None, bundle_index=0):
+    actor_cls = config.actor_cls or PiperActor
+    return actor_cls.options(**_actor_options(config, pg, bundle_index)).remote(
+        slot, global_rank, topology, config, optim_class
+    )
+
+
+def _create_actors(topology, dp_rank, optim_class, config, pg=None):
+    """Spawn this DP rank's ``pp`` actors into ``piper_metadata.actors[pp_rank]``."""
     from .state import piper_metadata
 
-    for pp_rank in range(num_actors):
-        global_rank = _get_rank(pp_rank, dp_rank, pp_degree)
-        nsight_env = {"nsight": {
-            "t": "cuda,cudnn,cublas,nvtx",
-            "sample": "process-tree",
-            "backtrace": "dwarf",
-            "cudabacktrace": "sync:0,memory:0",
-            "python-backtrace": "cuda",
-            "stop-on-exit": "true",
-        }} if profile else {}
-        nccl_env = {
-            "env_vars": {
-                # "NCCL_SOCKET_IFNAME": "ens32",
-                # "GLOO_SOCKET_IFNAME": "ens32",
-                # "NCCL_P2P_DISABLE": "1",
-                # "NCCL_DEBUG": "INFO",
-                **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
-            }
-        }
-        # When pp_outer=True, one bundle corresponds to one pipeline stage and
-        # holds all DP replicas for that stage (placement group shape is
-        # [{"GPU": dp}] * pp). Otherwise one bundle is one DP replica holding
-        # all PP ranks (shape is [{"GPU": pp}] * dp).
-        bundle_index = pp_rank if pp_outer else dp_rank
-        actor_options = {
-            "runtime_env": {**nsight_env, **nccl_env},
-        }
-        accel = get_device().accelerator_resource
-        if accel == "GPU":
-            actor_options["num_gpus"] = 0.6
-        if pg is not None:
-            actor_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=bundle_index,
-            )
-        actor = PiperActor.options(**actor_options).remote(
-            pp_rank,
+    for pp_rank in range(topology.pp):
+        slot = (dp_rank, pp_rank)
+        piper_metadata.actors[pp_rank] = _spawn_actor(
+            slot,
+            topology.rank(dp_rank, pp_rank),
+            topology,
+            config,
             optim_class,
-            world_size,
-            dp_rank=dp_rank,
-            dp_degree=dp_degree,
-            pp_degree=pp_degree,
-            no_nvtx=no_nvtx,
-            use_inductor=use_inductor,
+            pg=pg,
+            bundle_index=_bundle_index(slot, config),
         )
-        piper_metadata.actors[pp_rank] = actor
 
 
 @ray.remote
 class PiperActor:
-    def __init__(
-        self,
-        pp_rank,
-        optim_class,
-        world_size,
-        dp_rank=0,
-        dp_degree=1,
-        pp_degree=1,
-        no_nvtx: bool = False,
-        use_inductor: bool = False,
-    ):
+    def __init__(self, slot, global_rank, topology, config, optim_class=None):
+        """
+        slot: ``(dp_rank, pp_rank)`` of a trainer, or None for a standby.
+        global_rank: rank in the torch.distributed world.
+        topology: the job's ``Topology``.
+        config: ``ActorConfig``.
+        optim_class: callable ``(params) -> Optimizer``; may instead be given to ``load_training_dag``.
+        """
         self.logger = create_logger("actor", LOG_LEVEL)
 
         # BWD_I uses torch.autograd.grad (not .backward), so AccumulateGrad nodes are
@@ -122,16 +108,18 @@ class PiperActor:
         set_warn_on_accumulate_grad_stream_mismatch(False)
 
         self.optim_class = optim_class
-        self.use_inductor = bool(use_inductor)
+        self.use_inductor = bool(config.use_inductor)
         if self.use_inductor:
             _disable_functorch_donated_buffers()
+        dp_rank, pp_rank = slot if slot is not None else (-1, 0)
         self.runtime = RuntimeState(
             pp_rank=pp_rank,
             dp_rank=dp_rank,
-            dp_degree=dp_degree,
-            pp_degree=pp_degree,
-            world_size=world_size,
-            no_nvtx=no_nvtx,
+            dp_degree=topology.dp,
+            pp_degree=topology.pp,
+            world_size=topology.world_size,
+            global_rank=global_rank,
+            no_nvtx=config.no_nvtx,
         )
 
         self.logger.debug(
@@ -254,65 +242,48 @@ class PiperActor:
             port = s.getsockname()[1]
         return ray.util.get_node_ip_address(), port
 
-    def _join_process_groups(self, master_addr, master_port):
+    def join_groups(self, master_addr, master_port, groups: dict[str, list[list[int]]]):
+        """Init the world and create every process group in ``groups``.
 
+        groups: ``{"dp": [[ranks], ...], "pp": [[ranks], ...]}``; all ranks
+            create all groups, and this actor keeps the ones it belongs to.
+        """
         self.logger.debug(f"Actor {self.runtime.global_rank} using GPU {os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}, master addr {master_addr}:{master_port}")
-
-        init_method = f"tcp://{master_addr}:{master_port}"
 
         dev = get_device()
         self.runtime.device = dev.set_device(self.runtime.global_rank)
-        dist_backend = dev.dist_backend
+        if self.runtime.world_size <= 1:
+            return
 
-        if self.runtime.pp_degree > 1 or self.runtime.dp_degree > 1:
-            dist.init_process_group(
-                dist_backend,
-                init_method=init_method,
-                rank=self.runtime.global_rank,
-                world_size=self.runtime.world_size,
-            )
-
-            if self.runtime.dp_degree > 1:
-                self._join_dp_process_group()
-            if self.runtime.pp_degree > 1:
-                self._join_pp_process_group()
-
-            self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
-
-    def _join_dp_process_group(self):
-        dist_backend = get_device().dist_backend
-        num_dp_groups = self.runtime.world_size // self.runtime.dp_degree
-        for dp_group_id in range(num_dp_groups):
-            group_ranks = [
-                (dp_group_id + num_dp_groups * i) for i in range(self.runtime.dp_degree)
-            ]
+        dist.init_process_group(
+            dev.dist_backend,
+            init_method=f"tcp://{master_addr}:{master_port}",
+            rank=self.runtime.global_rank,
+            world_size=self.runtime.world_size,
+        )
+        rank = self.runtime.global_rank
+        for group_ranks in groups.get("dp", []):
             # Two separate communicators over the same ranks: one for allreduce,
             # one for all2all.  Sharing a communicator causes both op types to run on
             # the same internal proxy stream, which prevents true overlap.
-            process_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
-            ep_process_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
-            if self.runtime.global_rank % num_dp_groups == dp_group_id:
-                self.runtime.dp_group = process_group
-                self.runtime.ep_group = ep_process_group
-
-    def _join_pp_process_group(self):
-        dist_backend = get_device().dist_backend
-        num_pp_groups = self.runtime.world_size // self.runtime.pp_degree
-
-        for pp_group_id in range(num_pp_groups):
-            group_ranks = [
-                (pp_group_id * self.runtime.pp_degree + i) for i in range(self.runtime.pp_degree)
-            ]
-            lo_hi_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
-            hi_lo_group = dist.new_group(ranks=group_ranks, backend=dist_backend)
-
-            if self.runtime.global_rank in group_ranks:
-                self.runtime.pp_lo_hi = lo_hi_group
-                self.runtime.pp_hi_lo = hi_lo_group
+            dp_group = dist.new_group(ranks=group_ranks, backend=dev.dist_backend)
+            ep_group = dist.new_group(ranks=group_ranks, backend=dev.dist_backend)
+            if rank in group_ranks:
+                self.runtime.dp_group = dp_group
+                self.runtime.ep_group = ep_group
+                self.runtime.dp_group_ranks = list(group_ranks)
+        for group_ranks in groups.get("pp", []):
+            lo_hi = dist.new_group(ranks=group_ranks, backend=dev.dist_backend)
+            hi_lo = dist.new_group(ranks=group_ranks, backend=dev.dist_backend)
+            if rank in group_ranks:
+                self.runtime.pp_lo_hi = lo_hi
+                self.runtime.pp_hi_lo = hi_lo
+        self.logger.debug(f"Actor {rank} joined process groups")
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
         self.stages.grad_sharded_ubids = set()
+        self.stages.replicated_ubids = set()
         for node in training_dag.nodes.values():
             meta = getattr(node, "node_meta", {}) or {}
             ubid = meta.get("bucket_key")
@@ -322,7 +293,17 @@ class PiperActor:
                 self.stages.param_sharded_ubids.add(ubid)
             elif node.node_kind == "REDUCE_SCATTER_COMM":
                 self.stages.grad_sharded_ubids.add(ubid)
+            elif node.node_kind == "REDUCE_COMM":
+                self.stages.replicated_ubids.add(ubid)
         self.stages.zero_managed_ubids = self.stages.param_sharded_ubids | self.stages.grad_sharded_ubids
+
+    def _sync_dp_params(self, tensors: list) -> None:
+        """Broadcast freshly initialized replicated parameters from the DP group's first rank."""
+        if self.runtime.dp_group is None or not tensors:
+            return
+        src = self.runtime.dp_group_ranks[0]
+        for t in tensors:
+            dist.broadcast(t.detach(), src=src, group=self.runtime.dp_group)
 
     def _relocate_meta_devices(self, gm) -> None:
         """Rewrite baked ``torch.device('meta')`` literals to the actor device.
@@ -545,6 +526,11 @@ class PiperActor:
             )
             params_sharded = ubid in self.stages.param_sharded_ubids
             grads_sharded = ubid in self.stages.grad_sharded_ubids
+            # Replicated (DP all-reduced or ZeRO) buckets must start identical on
+            # every replica; EP-sharded buckets hold different experts per rank.
+            replicated = zero_managed or (
+                self.runtime.dp_degree > 1 and ubid in self.stages.replicated_ubids
+            )
 
             if zero_managed:
                 trainable = [realized[i] for i in trainable_idxs]
@@ -558,6 +544,7 @@ class PiperActor:
                     padded = flat_params.new_zeros(padded_numel)
                     padded[:orig_numel].copy_(flat_params)
                     flat_params = padded
+                self._sync_dp_params([flat_params])
 
                 offset = 0
                 view_specs = []
@@ -614,24 +601,32 @@ class PiperActor:
                 bucket.param_shard_info = None
                 bucket.full_params_fresh = False
                 trainable_for_optim = [realized[i] for i in trainable_idxs]
+                if replicated:
+                    self._sync_dp_params(trainable_for_optim)
                 optim = self.optim_class(trainable_for_optim) if trainable_for_optim else None
             bucket.optimizer = optim
 
         # Keep first GraphModule for compatibility with external inspection tools.
         self.stages.graph_modules[stage_id] = first_gm
 
-    def load_training_dag(self, training_dag: Any) -> None:
+    def load_training_dag(self, training_dag: Any, optim_fn=None) -> None:
         """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
 
         This is an adapter for the new TrainingDAG representation where each
         COMPUTE/FWD node with ``node_meta['gm']`` is equivalent to one bucket/module.
         The runtime executes TrainingDAG nodes via ``run_dag``; this method
         only populates actor-side bucket/module state.
+
+        optim_fn: callable ``(params) -> Optimizer``; overrides the constructor's.
         """
         if training_dag is None:
             raise ValueError("load_training_dag requires non-None training_dag")
         if not hasattr(training_dag, "nodes"):
             raise TypeError("load_training_dag expected object with 'nodes' field")
+        if optim_fn is not None:
+            self.optim_class = optim_fn
+        if self.optim_class is None:
+            raise ValueError("load_training_dag requires an optimizer constructor")
 
         self._derive_dag_bucket_modes(training_dag)
         self.runtime.initialize_streams_for_training_dag(training_dag)
@@ -748,9 +743,10 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
-    def run_dag(self, loss_fn=None):
+    def run_dag(self, loss_fn=None, it: int | None = None):
+        """Run one iteration; ``it`` names it explicitly, else a local counter does."""
         # Mark the entire iteration boundary for the NVTX timeline.
-        iter_idx = getattr(self, "_iter_counter", 0)
+        iter_idx = it if it is not None else getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
         # Debug-only: expose the iteration counter for E2E fault injection.
         self.dag_executor._iter_count = iter_idx

@@ -6,13 +6,12 @@ import time
 import ray
 import torch
 
-from src.piper import piper_exec_dag
-from src.compile import piper_setup
-from src.state import (
-    LOG_LEVEL,
-    create_logger,
-    piper_metadata,
-)
+from src.compile import compile
+from src.config import ActorConfig
+from src.driver import setup
+from src.schedule import load_schedule_info
+from src.state import LOG_LEVEL, create_logger
+from src.topology import Topology
 
 from models.llama3 import (
     LLAMA_1B,
@@ -42,15 +41,15 @@ def _model_config(name: str):
     raise ValueError(f"Unknown LLaMA model: {name}")
 
 
-def _raw_metrics(args, iter_times, peak_memory_stats):
-    """Assemble raw per-dp-rank measurements + run config for the harness.
+def _raw_metrics(args, program, iter_times, peak_memory_stats):
+    """Assemble raw measurements + run config for the harness.
 
     No derived statistics are computed here; the harness summarizes the metrics
-    and writes the CSV. ``peak_memory_by_rank`` maps global rank -> peak bytes.
+    and writes the CSV. ``iter_times_s`` are driver-side step times and
+    ``peak_memory_by_rank`` maps global rank -> peak bytes.
     """
-    info = dict(getattr(piper_metadata, "schedule_info", {}) or {})
+    info = program.schedule_info
     return {
-        "dp_rank": int(os.environ["PIPER_DP_RANK"]),
         "model": args.model,
         "schedule": info.get(
             "name", os.path.splitext(os.path.basename(args.schedule_directives_file))[0]
@@ -68,14 +67,18 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
     }
 
 
-def main(args, pg):
+def main(args):
     llama_config = _model_config(args.model)
+    topology = Topology.from_schedule(args.schedule_directives_file)
+    num_stages = int(load_schedule_info(args.schedule_directives_file)["num_stages"])
 
     loss_mod = torch.nn.CrossEntropyLoss()
     loss_fn = lambda output, labels: loss_mod(output.view(-1, output.size(-1)), labels.view(-1))
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len))
     y = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len))
+    # Every DP slot trains on the same random batch.
+    inputs, labels = [[x]] * topology.dp, [y] * topology.dp
 
     freqs_cis = precompute_freqs_cis(
         llama_config.dim // llama_config.n_heads,
@@ -86,29 +89,31 @@ def main(args, pg):
     causal = torch.triu(causal, diagonal=1)
     mask = torch.hstack([torch.zeros((args.seq_len, 0)), causal])
 
-    piper_setup(
+    program = compile(
         Transformer,
-        model_args=(llama_config, args.seq_len),
-        optim_fn=torch.optim.Adam,
+        model_args=(llama_config, args.seq_len, num_stages),
         example_inputs=[x],
-        example_outputs=y,
-        activation_checkpointing=args.activation_checkpointing,
-        num_checkpoints=args.num_checkpoints,
-        model_dtype=torch.bfloat16,
-        pg=pg,
-        nsight=args.nsight,
-        temp_dir=args.temp_dir,
+        schedule_file=args.schedule_directives_file,
+        dtype=torch.bfloat16,
         visualize_dag=args.viz,
-        const_attrs={"freqs_cis": freqs_cis, "mask": mask},
-        use_inductor=args.use_inductor,
-        pp_outer=args.pp_outer,
-        schedule_directives_file=args.schedule_directives_file,
     )
+    rt = setup(
+        topology,
+        actors=ActorConfig(
+            use_inductor=args.use_inductor,
+            nsight=args.nsight,
+            temp_dir=args.temp_dir,
+            pp_outer=args.pp_outer,
+        ),
+    )
+    rt.load(program, torch.optim.Adam, const_attrs={"freqs_cis": freqs_cis, "mask": mask})
 
-    actors = piper_metadata.actors
+    actors = rt.actors
+    it = 0
     logger.info(f"Running {args.warmup} warmup iterations")
     for _ in range(args.warmup):
-        piper_exec_dag(loss_fn, log_stats=True)
+        rt.step(it, inputs, labels, loss_fn)
+        it += 1
         time.sleep(1)
 
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
@@ -116,16 +121,18 @@ def main(args, pg):
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec_dag(loss_fn, log_stats=True)
+        rt.step(it, inputs, labels, loss_fn)
+        it += 1
         end = time.perf_counter()
         iter_times.append(end - start)
+        logger.info(f"step_time={iter_times[-1]:.3f}s")
         time.sleep(1)
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
     )
 
-    metrics = _raw_metrics(args, iter_times, peak_memory_stats)
+    metrics = _raw_metrics(args, program, iter_times, peak_memory_stats)
 
     if args.pytorch_profiler:
         profile_dir = getattr(args, "profile_dir", "") or os.path.join(
@@ -134,7 +141,8 @@ def main(args, pg):
         logger.info(f"Running {args.pytorch_profiler_iters} PyTorch-profiled iterations")
         ray.get([actor.start_pytorch_profiler.remote() for actor in actors.values()])
         for _ in range(args.pytorch_profiler_iters):
-            piper_exec_dag(loss_fn)
+            rt.step(it, inputs, labels, loss_fn)
+            it += 1
             time.sleep(1)
         ray.get([
             actor.stop_pytorch_profiler.remote(profile_dir)

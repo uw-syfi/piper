@@ -89,6 +89,27 @@ This example also expects four visible CUDA devices.
 The harness appends 1F1B `split` and `order` directives for two pipeline ranks and four microbatches.
 Each run creates `out/<timestamp>/` with the complete generated schedule and metrics.
 
+## Driver API
+
+A training script is one Ray driver process that compiles the model, sets up the actors, and steps:
+
+```python
+import torch
+import src as piper
+
+topology = piper.Topology.from_schedule("schedule.json")
+program = piper.compile(Model, model_args=(cfg,), example_inputs=[x], schedule_file="schedule.json")
+rt = piper.setup(topology, actors=piper.ActorConfig(use_inductor=True))
+rt.load(program, torch.optim.Adam, const_attrs={"rope_cache": rope_cache})
+for it in range(num_iters):
+    result = rt.step(it, inputs_per_dp_slot, labels_per_dp_slot, loss_fn)
+```
+
+* `compile` traces the model on the meta device and lowers the schedule directives into one `DagProgram` shard per pipeline rank. It is a pure function: no Ray, no global state.
+* `setup` reserves a placement group, spawns `dp * pp` actors as `rt.actors[(dp, pp)]`, and builds their process groups from explicit rank lists.
+* `load` ships each shard to its actors and synchronizes replicated weights across DP replicas.
+* `step` runs one iteration on every DP slot and returns a `StepResult` with per-slot losses and `next_iter`; a failing slot raises `StepFailed`.
+
 ## Overview of Inputs
 
 ### Annotations
