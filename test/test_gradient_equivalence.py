@@ -55,15 +55,15 @@ def _schedule(pp: int, dp: int, num_microbatches: int = 1, order=build_1f1b_sche
     return directives
 
 
-def _check_one_step(tmp_path, schedule: list[dict], dp: int, local_batch: int) -> None:
+def _check_one_step(tmp_path, schedule: list[dict], dp: int, local_batch: int, model_class=_TwoStage, dim=DIM) -> None:
     torch.manual_seed(0)
     batches = [
-        ((torch.randn(local_batch, DIM),), torch.randn(local_batch, DIM)) for _ in range(dp)
+        ((torch.randn(local_batch, dim),), torch.randn(local_batch, dim)) for _ in range(dp)
     ]
     results = run_program(
-        tmp_path, schedule, train, _TwoStage, str(tmp_path / "schedule.json"), batches, 1,
+        tmp_path, schedule, train, model_class, str(tmp_path / "schedule.json"), batches, 1,
     )
-    expected = reference_sgd_step(_TwoStage(), merged(results[0]["initial"]), batches)
+    expected = reference_sgd_step(model_class(), merged(results[0]["initial"]), batches)
     for rank, result in enumerate(results):
         got = merged(result["final"])
         assert got.keys() == expected.keys()
@@ -84,6 +84,29 @@ def test_pp2_two_microbatches(ray_cpu, tmp_path, split_backward) -> None:
     order = lambda n_ranks, n_mbs: _gpipe(n_ranks, n_mbs, split_backward)
     _check_one_step(tmp_path, _schedule(pp=2, dp=1, num_microbatches=2, order=order), dp=1, local_batch=4)
 
+
+
+class _FourLayers(nn.Module):
+    """One stage of four 1 MiB fp32 layers, so bucket_size=1 makes four buckets."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(512, 512, bias=False) for _ in range(4))
+
+    def forward(self, x):
+        with annotate("PP"):
+            for layer in self.layers:
+                x = torch.tanh(layer(x))
+            return x
+
+
+def test_dp2_buckets_two_microbatches(ray_cpu, tmp_path) -> None:
+    schedule = [
+        {"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+        {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1], "bucket_size": 1},
+        {"op": "split", "filter": {}, "dim_name": "MB", "num_microbatches": 2},
+    ]
+    _check_one_step(tmp_path, schedule, dp=2, local_batch=4, model_class=_FourLayers, dim=512)
 
 
 def test_each_microbatch_gets_its_own_slice(ray_cpu, tmp_path) -> None:
