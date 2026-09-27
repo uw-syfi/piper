@@ -100,3 +100,31 @@ def train(model_class, schedule_path: str, batches: list, steps: int, **setup_kw
         return {"initial": initial, "losses": losses, "final": params_by_rank()}
     finally:
         kill_actors()
+
+
+def dynamo_param_name(fqn: str) -> str:
+    """Return the placeholder name Dynamo gives parameter *fqn*, e.g. ``a.weight``."""
+    *modules, leaf = fqn.split(".")
+    return "l_self_" + "".join(f"modules_{m}_" for m in modules) + f"parameters_{leaf}_"
+
+
+def reference_sgd_step(model: torch.nn.Module, initial: dict, batches: list) -> dict:
+    """Take one SGD step (lr=1) on the concatenated *batches*, from Piper's *initial* weights.
+
+    Returns the updated parameters under their Dynamo placeholder names.
+    """
+    with torch.no_grad():
+        for fqn, param in model.named_parameters():
+            param.copy_(initial[dynamo_param_name(fqn)])
+    inputs = torch.cat([batch[0][0] for batch in batches])
+    labels = torch.cat([batch[1] for batch in batches])
+    torch.nn.functional.mse_loss(model(inputs), labels).backward()
+    return {
+        dynamo_param_name(fqn): (param - param.grad).detach()
+        for fqn, param in model.named_parameters()
+    }
+
+
+def merged(params: dict[int, dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Merge per-PP-rank parameter dicts into one."""
+    return {name: value for per_rank in params.values() for name, value in per_rank.items()}

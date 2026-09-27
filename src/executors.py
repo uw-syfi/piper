@@ -126,6 +126,7 @@ class CommunicationExecutor:
         with stream_ctx:
             for grad in grad_tensors:
                 dist.all_reduce(grad, group=self.runtime.dp_group)
+                grad.div_(self.runtime.dp_degree)
         return total_bytes
 
     def reduce_scatter(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
@@ -152,7 +153,8 @@ class CommunicationExecutor:
             total_bytes = flat_grads.numel() * flat_grads.element_size()
             tmp = torch.empty_like(rs_out)
             dist.reduce_scatter_tensor(tmp, flat_grads, group=self.runtime.dp_group)
-            rs_out.add_(tmp)
+            # Divide this chunk alone: rs_out may already hold earlier chunks.
+            rs_out.add_(tmp.div_(self.runtime.dp_degree))
             return total_bytes
 
     def has_trainable_params_for_collective(self, ubid: Any, op_name: str) -> bool:
