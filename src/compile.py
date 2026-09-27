@@ -158,6 +158,13 @@ def piper_setup(
             schedule metadata internally.
     """
 
+    if activation_checkpointing or num_checkpoints != 1:
+        # Refuse before any actor or placement group exists, so nothing leaks.
+        raise NotImplementedError(
+            "Piper does not implement activation checkpointing yet; "
+            "activation_checkpointing and num_checkpoints were previously ignored."
+        )
+
     # Clear Dynamo's global compilation cache so that a previous piper_setup
     # call (e.g. with a different model size or schedule) in the same Python
     # worker process cannot contaminate this compilation via a stale cache hit.
