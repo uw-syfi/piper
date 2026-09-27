@@ -144,8 +144,8 @@ def piper_setup(
     Args:
         model: The model to compile.
         optim_fn: Callable ``(params) -> Optimizer`` used to create optimizers.
-        example_inputs: Example inputs for tracing.
-        example_outputs: Example outputs (labels) for tracing.
+        example_inputs: Example inputs for tracing: one microbatch.
+        example_outputs: Example outputs (labels) for tracing: one microbatch.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
         const_attrs: Values for non-trainable buffers and attributes, keyed by
@@ -345,8 +345,10 @@ def piper_setup(
             "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
             loss_pp_ranks[0],
         )
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    # The example is one microbatch; a step takes every microbatch at once.
+    num_mbs = int(schedule_info["num_microbatches"])
+    ray.get(piper_metadata.actors[0].load_input.remote([torch.cat([x] * num_mbs) for x in example_inputs]))
     ray.get([
-        piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
+        piper_metadata.actors[pp_rank].load_labels.remote(torch.cat([example_outputs] * num_mbs))
         for pp_rank in loss_pp_ranks
     ])

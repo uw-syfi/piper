@@ -290,8 +290,9 @@ def _normalize_split_directive(directive: Any) -> tuple[dict[str, Any], str, int
     if "filter" not in directive:
         raise ValueError(f"split directive requires 'filter': {directive}")
     dim_name = directive.get("dim_name")
-    if not isinstance(dim_name, str) or not dim_name:
-        raise ValueError(f"split directive requires non-empty string dim_name: {directive}")
+    if dim_name != "MB":
+        # The runtime reads the microbatch index from the "MB" tag alone.
+        raise ValueError(f"split directive requires dim_name 'MB': {directive}")
     num_microbatches = int(directive.get("num_microbatches", 0))
     if num_microbatches <= 0:
         raise ValueError(f"split directive requires num_microbatches > 0: {directive}")

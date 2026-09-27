@@ -141,6 +141,7 @@ class RuntimeState:
     world_size: int
     no_nvtx: bool = False
     device: str = "cpu"
+    num_microbatches: int = 1
     dp_group: Any = None
     ep_group: Any = None
     pp_lo_hi: Any = None

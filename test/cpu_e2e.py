@@ -78,22 +78,31 @@ def params_by_rank() -> dict[int, dict[str, torch.Tensor]]:
 def train(model_class, schedule_path: str, batches: list, steps: int, **setup_kwargs) -> dict:
     """Set up Piper on this DP rank, run *steps* steps on its batch, and report.
 
-    *batches* holds one ``(inputs, labels)`` pair per DP rank. Returns the
+    *batches* holds one ``(inputs, labels)`` pair per DP rank, with every
+    microbatch stacked along dim 0. Returns the
     parameters before and after training, keyed by PP rank, and the losses.
     """
     from src.compile import piper_setup
     from src.piper import piper_exec_dag
+    from src.schedule import load_schedule_info
+    from src.state import piper_metadata
 
     try:
         inputs, labels = batches[dp_rank()]
+        num_mbs = load_schedule_info(schedule_path)["num_microbatches"]
         setup_kwargs.setdefault("model_dtype", torch.float32)
         setup_kwargs.setdefault("optim_fn", lambda params: torch.optim.SGD(params, lr=1.0))
         piper_setup(
             model_class,
-            example_inputs=inputs,
-            example_outputs=labels,
+            example_inputs=[t.chunk(num_mbs)[0] for t in inputs],
+            example_outputs=labels.chunk(num_mbs)[0],
             schedule_directives_file=schedule_path,
             **setup_kwargs,
+        )
+        actors = piper_metadata.actors
+        ray.get(
+            [actors[0].load_input.remote(list(inputs))]
+            + [actor.load_labels.remote(labels) for actor in actors.values()]
         )
         initial = params_by_rank()
         losses = [piper_exec_dag(torch.nn.functional.mse_loss) for _ in range(steps)]
@@ -108,14 +117,20 @@ def dynamo_param_name(fqn: str) -> str:
     return "l_self_" + "".join(f"modules_{m}_" for m in modules) + f"parameters_{leaf}_"
 
 
+def load_initial(model: torch.nn.Module, initial: dict) -> torch.nn.Module:
+    """Copy Piper's *initial* weights into *model*."""
+    with torch.no_grad():
+        for fqn, param in model.named_parameters():
+            param.copy_(initial[dynamo_param_name(fqn)])
+    return model
+
+
 def reference_sgd_step(model: torch.nn.Module, initial: dict, batches: list) -> dict:
     """Take one SGD step (lr=1) on the concatenated *batches*, from Piper's *initial* weights.
 
     Returns the updated parameters under their Dynamo placeholder names.
     """
-    with torch.no_grad():
-        for fqn, param in model.named_parameters():
-            param.copy_(initial[dynamo_param_name(fqn)])
+    load_initial(model, initial)
     inputs = torch.cat([batch[0][0] for batch in batches])
     labels = torch.cat([batch[1] for batch in batches])
     torch.nn.functional.mse_loss(model(inputs), labels).backward()

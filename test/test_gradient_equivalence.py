@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from examples.build_schedule import build_1f1b_schedule
 from src.piper import annotate
-from test.cpu_e2e import merged, ray_cpu, reference_sgd_step, run_program, train  # noqa: F401
+from test.cpu_e2e import load_initial, merged, ray_cpu, reference_sgd_step, run_program, train  # noqa: F401
 
 DIM = 8
 
@@ -56,3 +56,16 @@ def _check_one_step(tmp_path, schedule: list[dict], dp: int, local_batch: int) -
 
 def test_dp2_replicate(ray_cpu, tmp_path) -> None:
     _check_one_step(tmp_path, _schedule(pp=1, dp=2), dp=2, local_batch=4)
+
+
+def test_each_microbatch_gets_its_own_slice(ray_cpu, tmp_path) -> None:
+    torch.manual_seed(0)
+    x, y = torch.randn(4, DIM), torch.randn(4, DIM)
+    (result,) = run_program(
+        tmp_path, _schedule(pp=1, dp=1, num_microbatches=2), train,
+        _TwoStage, str(tmp_path / "schedule.json"), [((x,), y)], 1,
+    )
+    model = load_initial(_TwoStage(), merged(result["initial"]))
+    with torch.no_grad():
+        expected = [nn.functional.mse_loss(model(xs), ys).item() for xs, ys in zip(x.chunk(2), y.chunk(2))]
+    assert result["losses"][0] == pytest.approx(expected)

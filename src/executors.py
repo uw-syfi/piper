@@ -546,6 +546,26 @@ class DagExecutor:
         items = sorted(tag.items(), key=lambda kv: kv[0])
         return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
 
+    def _microbatch(self, batch: torch.Tensor, mb_idx: int) -> torch.Tensor:
+        """Return microbatch *mb_idx* of *batch*, which holds every microbatch along dim 0."""
+        num_mbs = self.runtime.num_microbatches
+        if batch.shape[0] % num_mbs != 0:
+            raise ValueError(
+                f"batch dim {batch.shape[0]} does not split into {num_mbs} microbatches"
+            )
+        return batch.chunk(num_mbs)[mb_idx]
+
+    def _microbatch_inputs(self, ubid: Any, inputs: list, mb_idx: int) -> list:
+        chunks = [self._microbatch(t, mb_idx) for t in inputs]
+        traced = [tuple(shape) for shape, _dtype, _requires_grad in self.stages.bucket(ubid).forward_input_meta]
+        got = [tuple(t.shape) for t in chunks[: len(traced)]]
+        if got != traced:
+            raise ValueError(
+                f"microbatch inputs have shapes {got}, but the graph was traced with {traced}. "
+                f"Load {self.runtime.num_microbatches} microbatches of the traced size per step."
+            )
+        return chunks
+
     def _wait_for_all_gather(self, compute_node: Any) -> None:
         compute_stream_ctx = self.runtime.stream_for_task(compute_node)
         for pred in compute_node.data_preds:
@@ -747,7 +767,7 @@ class DagExecutor:
                         input_tensors = self.buffers.task[recv_pred.uid]
                         self.buffers.release(recv_pred.uid)
                     else:
-                        input_tensors = inputs
+                        input_tensors = self._microbatch_inputs(ubid, inputs, mb_idx)
 
                     self._wait_for_all_gather(node)
 
@@ -788,7 +808,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            outputs_or_loss = [
+                                loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            ]
                         loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
                     elif recv_pred is not None:
@@ -883,7 +905,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            stage_outputs_or_loss = [
+                                loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            ]
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]

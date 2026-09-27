@@ -233,10 +233,12 @@ class PiperActor:
         return filepath
 
     def load_input(self, inputs):
+        """Load one step's inputs: every microbatch, stacked along dim 0."""
         self.inputs = [inp.to(self.runtime.device) for inp in inputs]
         self.logger.debug(f"Actor {self.runtime.global_rank} loaded inputs {len(self.inputs)}")
 
     def load_labels(self, labels):
+        """Load one step's labels: every microbatch, stacked along dim 0."""
         self.labels = labels.to(self.runtime.device)
         self.logger.debug(f"Actor {self.runtime.global_rank} loaded labels {self.labels.shape}")
 
@@ -758,6 +760,9 @@ class PiperActor:
                 src.data_succs.append(dst)
                 dst.data_preds.append(src)
 
+        self.runtime.num_microbatches = 1 + max(
+            int(n.tag.get("MB") or 0) for n in training_dag.nodes.values()
+        )
         for n in training_dag.nodes.values():
             n.task_type = _training_dag_task_type(n)
             mb = n.tag.get("MB", 0)

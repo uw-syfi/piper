@@ -89,8 +89,10 @@ def _log_loss(data_rank, it, losses):
 
 
 def _train_step(args, it, data_rank, dp_degree, loss_fn, **kw):
+    # A step takes every microbatch at once, each of --batch-size rows.
+    num_mbs = int(piper_metadata.schedule_info.get("num_microbatches", 1))
     x, y = _make_batch(args.data_seed, it, data_rank, dp_degree,
-                       args.batch_size, args.seq_len)
+                       args.batch_size * num_mbs, args.seq_len)
     _load_batch(x, y)
     losses = piper_exec_dag(loss_fn, **kw)
     _log_loss(data_rank, it, losses)
