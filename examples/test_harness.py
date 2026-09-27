@@ -2,8 +2,8 @@
 
 This is a small harness around model example modules such as
 ``examples.test_qwen`` and ``examples.test_llama``. It consumes schedule/runtime
-arguments, parses the selected test module's arguments, starts Ray, creates the
-Piper placement group, and runs the model through ``PiperProgramCoordinator``.
+arguments, parses the selected test module's arguments, starts Ray, and runs
+the test module's ``main`` as the single Piper driver.
 """
 
 from __future__ import annotations
@@ -20,9 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 import ray
-from ray.util.placement_group import placement_group_table
 
-from src.coordinator import PiperProgramCoordinator, create_piper_placement_group
 from src.schedule import load_schedule_directives
 from src.visualization import visualize_order_directives
 
@@ -192,9 +190,9 @@ def main() -> None:
 
     if args.pytorch_profiler:
         forwarded_args.append("--pytorch-profiler")
-    dp_metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
-    if dp_metrics:
-        rows = _metrics_rows(dp_metrics)
+    metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
+    if metrics:
+        rows = _metrics_rows(metrics)
         results_csv = run_dir / "results.csv"
         _write_results_csv(results_csv, rows)
         print(f"metrics written to {results_csv}")
@@ -218,7 +216,7 @@ def _run_test_module(
     test_args: list[str],
     *,
     profile_dir: Path | None = None,
-) -> list[dict]:
+) -> dict:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -228,8 +226,6 @@ def _run_test_module(
     if hasattr(test_ns, "temp_dir"):
         test_ns.temp_dir = args.temp_dir
     test_ns.profile_dir = str(profile_dir) if profile_dir is not None else ""
-    if hasattr(test_module, "_derive_num_stages"):
-        test_ns.num_stages = test_module._derive_num_stages(test_ns.schedule_directives_file)
 
     namespace = args.ray_namespace or module_name.rsplit(".", 1)[-1].replace("test_", "")
     ray.init(
@@ -240,17 +236,7 @@ def _run_test_module(
         _temp_dir=args.temp_dir,
     )
     try:
-        pp_outer = getattr(test_ns, "pp_outer", False)
-        pg = create_piper_placement_group(test_ns.schedule_directives_file, pp_outer=pp_outer)
-        ray.get(pg.ready(), timeout=600)
-        logging.getLogger(module_name).info(placement_group_table(pg))
-        coordinator = PiperProgramCoordinator.remote(
-            schedule_directives_file=test_ns.schedule_directives_file,
-            pp_outer=pp_outer,
-        )
-        handles = coordinator.run_program.remote(test_module.main, pg, test_ns, pg)
-        dp_metrics = ray.get(handles)
-        return dp_metrics
+        return test_module.main(test_ns)
     finally:
         ray.shutdown()
 
@@ -521,28 +507,29 @@ def _contained_cuda_dag_label(
     return max(labels.items(), key=lambda item: item[1])[0]
 
 
-def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
-    """Summarize the raw metrics into one CSV row per DP rank (no averaging
-    across DP ranks).
+def _metrics_rows(m: dict) -> list[dict]:
+    """Summarize the raw metrics into one CSV row per DP replica.
 
-    Each row's timing scalars come from that DP rank's own iter times; peak
-    memory is taken from that DP rank's per-(global=pp)-rank values and emitted
-    as one peak_memory_pp{i}_gb column per pp rank.
+    Step times are measured once on the driver and shared by every row; peak
+    memory is that replica's per-stage value, emitted as one
+    peak_memory_pp{i}_gb column per pp rank.
     """
-    rows: list[dict] = []
-    for m in sorted(dp_metrics, key=lambda d: int(d.get("dp_rank", 0))):
-        iter_times = m.get("iter_times_s") or []
-        mean_iter = statistics.fmean(iter_times) if iter_times else float("nan")
-        std_iter = statistics.pstdev(iter_times) if len(iter_times) > 1 else 0.0
-        tokens = (
-            (m.get("batch_size") or 0)
-            * (m.get("num_microbatches") or 1)
-            * (m.get("seq_len") or 0)
-        )
-        throughput = tokens / mean_iter if iter_times and mean_iter else float("nan")
+    iter_times = m.get("iter_times_s") or []
+    mean_iter = statistics.fmean(iter_times) if iter_times else float("nan")
+    std_iter = statistics.pstdev(iter_times) if len(iter_times) > 1 else 0.0
+    tokens = (
+        (m.get("batch_size") or 0)
+        * (m.get("num_microbatches") or 1)
+        * (m.get("seq_len") or 0)
+    )
+    throughput = tokens / mean_iter if iter_times and mean_iter else float("nan")
+    peak = m.get("peak_memory_by_rank") or {}
+    pp = int(m.get("pp") or 1)
 
+    rows: list[dict] = []
+    for dp_rank in range(int(m.get("dp") or 1)):
         row: dict = {
-            "dp_rank": m.get("dp_rank"),
+            "dp_rank": dp_rank,
             "model": m.get("model"),
             "schedule": m.get("schedule"),
             "pp": m.get("pp"),
@@ -555,13 +542,11 @@ def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
             "iter_time_std_s": std_iter,
             "throughput_tokens_per_s": throughput,
         }
-        # peak_memory_by_rank is keyed by global rank; within a DP replica the
-        # global ranks ascend with pp stage (both pp-inner and pp-outer layouts),
-        # so enumerate them as local stage indices for columns that align across
-        # DP-rank rows.
-        peak = m.get("peak_memory_by_rank") or {}
-        for stage, rank in enumerate(sorted(peak, key=lambda r: int(r))):
-            row[f"peak_memory_pp{stage}_gb"] = float(peak[rank]) / (1024 ** 3)
+        # Global ranks are pp-inner: replica dp_rank owns ranks dp_rank*pp .. +pp-1.
+        for stage in range(pp):
+            rank = dp_rank * pp + stage
+            if rank in peak:
+                row[f"peak_memory_pp{stage}_gb"] = float(peak[rank]) / (1024 ** 3)
         rows.append(row)
     return rows
 

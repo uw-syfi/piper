@@ -367,11 +367,8 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
         self.seq_len = seq_len
         if num_stages is None:
-            from src.state import piper_metadata
-
-            schedule_info = piper_metadata.schedule_info or {}
-            num_stages = int(schedule_info.get("num_stages", schedule_info.get("pp_degree", 2)))
-        self.num_stages = num_stages
+            raise ValueError("Transformer requires num_stages (number of place directives)")
+        self.num_stages = int(num_stages)
 
         def log_size(layer, indent=0):
             num_params = sum(p.numel() for p in layer.parameters())
