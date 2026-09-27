@@ -473,6 +473,8 @@ class ParamStorage:
                 shard_optim.step()
             shard_param.grad = None
 
+        self._gather_updated_shards(stream_ctx)
+
         for ubid in self.stages.param_sharded_ubids:
             bucket = self.stages.bucket(ubid)
             for param, *_ in bucket.param_view_specs:
@@ -483,6 +485,21 @@ class ParamStorage:
                 if storage.size() != 0:
                     storage.resize_(0)
             bucket.full_params_fresh = False
+
+    def _gather_updated_shards(self, stream_ctx: AbstractContextManager) -> None:
+        """Copy every rank's updated shard into the full params of a ZeRO-2 bucket.
+
+        Under ZeRO-2 each rank keeps the full params but steps only its own
+        shard, which is a view into them at this rank's offset, so one in-place
+        all-gather refreshes the other shards. ZeRO-3 buckets gather before use.
+        """
+        for ubid, bucket in self.stages.buckets.items():
+            if bucket.shard_optimizer is None or ubid in self.stages.param_sharded_ubids:
+                continue
+            with stream_ctx, torch.no_grad():
+                dist.all_gather_into_tensor(
+                    bucket.flat_params, bucket.shard_param.detach(), group=self.runtime.dp_group
+                )
 
     def _has_trainable_params_for_collective(self, ubid: Any, op_name: str) -> bool:
         bucket = self.stages.get_bucket(ubid)

@@ -76,6 +76,13 @@ def test_dp2_replicate(ray_cpu, tmp_path) -> None:
     _check_one_step(tmp_path, _schedule(pp=1, dp=2), dp=2, local_batch=4)
 
 
+@pytest.mark.parametrize("num_microbatches", [1, 2])
+@pytest.mark.parametrize("zero", [{"shard_grads": True}], ids=["zero2"])
+def test_dp2_zero(ray_cpu, tmp_path, zero, num_microbatches) -> None:
+    schedule = _schedule(pp=1, dp=2, num_microbatches=num_microbatches, **zero)
+    _check_one_step(tmp_path, schedule, dp=2, local_batch=4)
+
+
 def test_dp2_two_microbatches(ray_cpu, tmp_path) -> None:
     _check_one_step(tmp_path, _schedule(pp=1, dp=2, num_microbatches=2), dp=2, local_batch=4)
 
