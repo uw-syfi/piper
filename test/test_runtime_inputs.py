@@ -82,3 +82,84 @@ def test_first_segment_receives_the_model_input() -> None:
     idx = first.input_idxs[0]
     assert tuple(first.graphargs[idx].shape) == (2, 8)
     assert not isinstance(first.graphargs[idx], torch.nn.Parameter)
+
+
+class _TwoInputs(nn.Module):
+    def __init__(self, dim: int = 8):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, myself, pos):
+        with annotate("PP"):
+            # pos is used first, so Dynamo lifts it before myself.
+            return self.fc(pos) + myself
+
+
+def _first_segment_input_names(model, *inputs, arg_names) -> list[str]:
+    seen: dict = {}
+
+    def _backend(gm, example_inputs):
+        _, segments = split_gm_by_annotations(gm, arg_names)
+        first = segments[0]
+        seen["names"] = [first.placeholders[i].name for i in first.input_idxs]
+        return gm.forward
+
+    _reset_annotation_state()
+    torch._dynamo.reset()
+    torch.compile(model, backend=_backend, fullgraph=True)(*inputs)
+    return seen["names"]
+
+
+def test_runtime_inputs_follow_forward_argument_order() -> None:
+    names = _first_segment_input_names(
+        _TwoInputs(), torch.randn(2, 8), torch.randn(2, 8), arg_names=["myself", "pos"]
+    )
+    assert names == ["l_myself_", "l_pos_"]
+
+
+class _UnusedMiddleArg(nn.Module):
+    def __init__(self, dim: int = 8):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x, unused, y):
+        with annotate("PP"):
+            return self.fc(x) + y
+
+
+def test_unused_forward_argument_is_refused() -> None:
+    x, unused, y = (torch.randn(2, 8) for _ in range(3))
+    with pytest.raises(Exception, match=r"\['unused'\] are not used"):
+        _first_segment_input_names(_UnusedMiddleArg(), x, unused, y, arg_names=["x", "unused", "y"])
+
+
+_GLOBAL_SCALE = torch.ones(8)
+
+
+class _GlobalTensor(nn.Module):
+    def __init__(self, dim: int = 8):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        with annotate("PP"):
+            return self.fc(x) * _GLOBAL_SCALE
+
+
+def test_global_tensor_is_refused() -> None:
+    with pytest.raises(Exception, match="Piper cannot feed placeholder"):
+        _first_segment_input_names(_GlobalTensor(), torch.randn(2, 8), arg_names=["x"])
+
+
+def test_split_outside_the_backend_is_refused() -> None:
+    captured: dict = {}
+
+    def _backend(gm, example_inputs):
+        captured["gm"] = gm
+        return gm.forward
+
+    _reset_annotation_state()
+    torch._dynamo.reset()
+    torch.compile(_Net(), backend=_backend, fullgraph=True)(torch.randn(2, 8))
+    with pytest.raises(ValueError, match="no Dynamo source"):
+        split_gm_by_annotations(captured["gm"])

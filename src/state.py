@@ -48,5 +48,6 @@ class PiperMetadata:
     schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
     schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
     schedule_info: dict = {}  # Derived schedule facts such as pp/dp/mbs
+    forward_arg_names: Optional[list] = None  # Model forward() argument names, in order
 
 piper_metadata = PiperMetadata()

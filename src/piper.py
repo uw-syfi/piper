@@ -172,7 +172,9 @@ def piper(gm, example_inputs, **kwargs):
 
     schedule_info = getattr(piper_metadata, "schedule_info", {}) or {}
     schedule_directives = getattr(piper_metadata, "schedule_directives", None)
-    _top_level_gm, annotation_segments = split_gm_by_annotations(gm)
+    _top_level_gm, annotation_segments = split_gm_by_annotations(
+        gm, getattr(piper_metadata, "forward_arg_names", None)
+    )
 
     if not annotation_segments:
         raise ValueError(

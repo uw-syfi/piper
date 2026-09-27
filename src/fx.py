@@ -396,26 +396,75 @@ def _example_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
 
 
+def _placeholder_source(node: fx.Node) -> Any:
+    """Return the Dynamo source of *node*; Dynamo sets it only while it runs the backend."""
+    grapharg = node.meta.get("grapharg")
+    return None if grapharg is None else getattr(grapharg, "source", None)
+
+
+def _source_root(source: Any) -> Any:
+    while getattr(source, "base", None) is not None:
+        source = source.base
+    return source
+
+
+def _runtime_input_arg_name(node: fx.Node) -> str | None:
+    """Return the ``forward`` argument name *node* was lifted from, if known."""
+    source = _placeholder_source(node)
+    if source is None or getattr(source, "base", None) is not None:
+        return None
+    return getattr(source, "local_name", None)
+
+
 def _placeholder_is_runtime_input(node: fx.Node) -> bool:
+    """Check if an FX placeholder node is a runtime input (i.e. the token stream) and not module state."""
     ex = _example_value(node)
     if not isinstance(ex, torch.Tensor):
         return False
-    if isinstance(ex, torch.nn.Parameter):
+    source = _placeholder_source(node)
+    if source is None:
+        raise ValueError(
+            f"Placeholder {node.name!r} has no Dynamo source. Split the graph inside a "
+            "torch.compile backend: Dynamo deletes meta['grapharg'] when the backend returns."
+        )
+    # The source is where Dynamo reads the value at each call:
+    # L['self']... is module state, a bare L['<arg>'] is a forward argument.
+    root_name = getattr(_source_root(source), "local_name", None)
+    if root_name == "self":
         return False
-    if bool(getattr(ex, "requires_grad", False)):
-        return False
-    # Dynamo attaches meta["grapharg"] to *every* placeholder while the backend
-    # is running (checked on torch 2.10.0), and clears it afterwards. Testing for
-    # it here therefore rejected the real model input as well as the lifted
-    # parameters, so seg 0 got input_idxs=[] and _load_stage zero-filled the
-    # input slot: the model trained on zeros and load_input's data was ignored.
-    # The three checks above already exclude parameters and anything requiring
-    # grad, and the name check excludes lifted module attributes such as
-    # l_self_freqs_cis and l_self_mask, which must stay graphargs so that
-    # load_const_attrs can fill them.
-    if "self" in node.name:
-        return False
-    return True
+    if root_name is not None and getattr(source, "base", None) is None:
+        return True
+    raise ValueError(
+        f"Piper cannot feed placeholder {node.name!r} (source {source.name}). "
+        "Pass the tensor as a forward argument or register it on the module."
+    )
+
+
+def _sort_runtime_inputs(placeholders: list[fx.Node], arg_names: list[str] | None) -> list[fx.Node]:
+    """Order runtime inputs by ``forward`` argument position.
+
+    Dynamo lifts inputs in first-use order, but callers pass them by position.
+    """
+    if arg_names is None:
+        return placeholders
+    positions_by_node: dict[fx.Node, int] = {}
+    for node in placeholders:
+        name = _runtime_input_arg_name(node)
+        if name is None or name not in arg_names:
+            raise ValueError(
+                f"Runtime input {node.name!r} does not match a forward argument {arg_names}"
+            )
+        positions_by_node[node] = arg_names.index(name)
+    ordered = sorted(placeholders, key=positions_by_node.__getitem__)
+    positions = [positions_by_node[node] for node in ordered]
+    names = [arg_names[p] for p in positions]
+    if positions != list(range(len(positions))):
+        unused = [name for name in arg_names[: max(positions, default=-1) + 1] if name not in names]
+        raise ValueError(
+            f"Forward arguments {unused} are not used by the traced graph. Piper feeds "
+            "inputs by position, so remove the unused arguments or move them last."
+        )
+    return ordered
 
 
 def _grapharg_for_placeholder(node: fx.Node) -> Any:
@@ -512,13 +561,17 @@ def _select_boundary_tensor_idx(nodes: list[fx.Node]) -> int | None:
     return 0 if nodes else None
 
 
-def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
+def split_gm_by_annotations(
+    gm: fx.GraphModule,
+    input_arg_names: list[str] | None = None,
+) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
     """Split a GraphModule into contiguous subgraphs by Piper annotation stack.
 
     Piper annotations are carried in ``node.meta['custom']['piper_annotations']``.
     The full stack, including nested annotations, is part of the split key. The
     schedule-facing tag for each segment is the stack projected to
-    ``{annotation_name: auto_index}``.
+    ``{annotation_name: auto_index}``. *input_arg_names* are the model's
+    ``forward`` argument names; segment 0 takes its runtime inputs in that order.
     """
     nodes = list(gm.graph.nodes)
     compute_nodes = [
@@ -569,6 +622,9 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         node for node in nodes
         if node.op == "placeholder" and node not in runtime_placeholders
     }
+    ordered_runtime_placeholders = _sort_runtime_inputs(
+        [node for node in nodes if node in runtime_placeholders], input_arg_names
+    )
 
     value_seg: dict[fx.Node, int] = dict(node_seg)
     for node in runtime_placeholders:
@@ -625,9 +681,8 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             pos += 1
 
         if seg == 0:
-            for node in nodes:
-                if node in runtime_placeholders:
-                    _add_placeholder(node, node.name, is_runtime_input=True)
+            for node in ordered_runtime_placeholders:
+                _add_placeholder(node, node.name, is_runtime_input=True)
         else:
             for node in seg_cross_in[seg]:
                 _add_placeholder(node, f"_xseg_{node.name}", is_runtime_input=True)

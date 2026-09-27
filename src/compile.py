@@ -1,6 +1,7 @@
 import ray
 import torch
 import copy
+import inspect
 import os
 import time
 from pathlib import Path
@@ -174,6 +175,7 @@ def piper_setup(
     piper_metadata.training_dag = None
     piper_metadata.per_pp_training_dags = None
     piper_metadata.compiled_data_store = None
+    piper_metadata.forward_arg_names = None
 
     pp_degree = int(schedule_info["pp_degree"])
 
@@ -260,6 +262,8 @@ def piper_setup(
             model = model_class(*tuple(resolved_model_args or ()), **dict(resolved_model_kwargs or {}))
             if model_dtype is not None:
                 model = model.to(model_dtype)
+
+        piper_metadata.forward_arg_names = list(inspect.signature(model.forward).parameters)
 
         num_params = sum(p.numel() for p in model.parameters())
         if model_dtype == torch.bfloat16:
