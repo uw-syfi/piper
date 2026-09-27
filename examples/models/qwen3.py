@@ -328,11 +328,8 @@ class PiperQwen3Model(Qwen3Model):
     def __init__(self, config: Qwen3ModelArgs, num_stages: int):
         super().__init__(config)
         if num_stages is None:
-            from src.state import piper_metadata
-
-            schedule_info = piper_metadata.schedule_info or {}
-            num_stages = int(schedule_info.get("num_stages", schedule_info.get("pp_degree", 2)))
-        self.num_stages = num_stages
+            raise ValueError("PiperQwen3Model requires num_stages (number of place directives)")
+        self.num_stages = int(num_stages)
 
         # Replace TransformerBlock layers with AnnotatedQwen3TransformerBlock
         for layer_id in range(config.n_layers):

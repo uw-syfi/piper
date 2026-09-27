@@ -22,7 +22,7 @@ def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
     """Raise or sleep if a PIPER_FAULT spec matches this execution point.
 
     pass_name: "bwd" or "upd".
-    iter_count: 0-based run_dag iteration counter (warmup iterations count).
+    iter_count: 0-based run_step iteration counter (warmup iterations count).
     dp_rank: this actor's DP rank.
 
     Spec format: "<pass>:<iter>:<dp_rank>[:sleep:<s>]", comma-separated.
@@ -489,7 +489,7 @@ class DagExecutor:
     communication: CommunicationExecutor
     compute: ComputeExecutor
     logger: Any
-    # 0-based iteration counter, set by PiperActor.run_dag each call.
+    # 0-based iteration counter, set by PiperActor.run_step each call.
     # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
     _iter_count: int = 0
 
@@ -580,8 +580,8 @@ class DagExecutor:
         loss_fn=None,
     ) -> None:
         """Run one iteration of the loaded TrainingDAG."""
-        assert dag is not None, "load_training_dag() must be called before run_dag()"
-        assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
+        assert dag is not None, "load_program() must be called before run_step()"
+        assert sorted_dag_nodes is not None, "load_program() must initialize sorted node order"
 
         self.params.drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
@@ -612,7 +612,7 @@ class DagExecutor:
 
             if debug_enabled:
                 self.logger.debug(
-                    f"run_dag dispatch: {task_type.value} "
+                    f"run_step dispatch: {task_type.value} "
                     f"tag={node_tag}"
                 )
 

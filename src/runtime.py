@@ -112,6 +112,7 @@ class StageStore:
     param_sharded_ubids: set[Any] = field(default_factory=set)
     grad_sharded_ubids: set[Any] = field(default_factory=set)
     zero_managed_ubids: set[Any] = field(default_factory=set)
+    replicated_ubids: set[Any] = field(default_factory=set)
 
     def clear_loaded_modules(self) -> None:
         self.graph_modules.clear()
@@ -139,19 +140,17 @@ class RuntimeState:
     dp_degree: int
     pp_degree: int
     world_size: int
+    global_rank: int
     no_nvtx: bool = False
     device: str = "cpu"
     dp_group: Any = None
     ep_group: Any = None
+    dp_group_ranks: list[int] = field(default_factory=list)
     pp_lo_hi: Any = None
     pp_hi_lo: Any = None
     streams: dict[str, AbstractContextManager] = field(default_factory=dict)
     pytorch_profiler_enabled: bool = False
     torch_profiler: Any = None
-
-    @property
-    def global_rank(self) -> int:
-        return self.pp_rank + self.dp_rank * self.pp_degree
 
     def pipeline_peer_global_rank(self, pp_rank: int) -> int:
         return pp_rank + self.dp_rank * self.pp_degree
@@ -176,7 +175,7 @@ class RuntimeState:
 
     def stream_for_id(self, stream_id: str) -> AbstractContextManager:
         assert stream_id in self.streams, (
-            f"TrainingDAG referenced stream={stream_id!r}, but load_training_dag "
+            f"TrainingDAG referenced stream={stream_id!r}, but load_program "
             f"initialized only {sorted(self.streams)}"
         )
         return self.streams[stream_id]
