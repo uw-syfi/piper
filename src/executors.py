@@ -600,7 +600,7 @@ class DagExecutor:
         labels: Any,
         loss_buffer: list,
         loss_fn=None,
-    ) -> None:
+    ) -> dict | None:
         """Run one iteration of the loaded TrainingDAG."""
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
@@ -1016,20 +1016,15 @@ class DagExecutor:
             self.runtime.nvtx_pop()
         return step_result
 
-    def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list):
+    def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list) -> dict:
         self.params.drain_pending_frees()
-        if self.params.has_zero_shard_optimizers():
-            _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
-            self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
-            losses = list(loss_buffer)
-            loss_buffer.clear()
-            self.dev.synchronize()
-            return [float(l) for l in losses]
-
         for ar_evt in self.events.all_reduce.values():
             self.dev.wait_event(stream_ctx, ar_evt)
 
         _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
+        # A schedule can mix ZeRO buckets with ordinary ones, so step both kinds.
+        if self.params.has_zero_shard_optimizers():
+            self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue

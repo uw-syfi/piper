@@ -88,6 +88,17 @@ def test_dp2_zero(ray_cpu, tmp_path, zero, num_microbatches) -> None:
     _check_one_step(tmp_path, schedule, dp=2, local_batch=4)
 
 
+def test_dp2_zero2_beside_a_replicated_stage(ray_cpu, tmp_path) -> None:
+    schedule = [
+        {"op": "place", "filter": {"PP": 0}, "devices": [0, 1]},
+        {"op": "place", "filter": {"PP": 1}, "devices": [0, 1]},
+        {"op": "replicate", "filter": {"PP": 0}, "devices": [0, 1], "shard_grads": True},
+        {"op": "replicate", "filter": {"PP": 1}, "devices": [0, 1]},
+        {"op": "split", "filter": {}, "dim_name": "MB", "num_microbatches": 1},
+    ]
+    _check_one_step(tmp_path, schedule, dp=2, local_batch=4)
+
+
 def test_dp2_two_microbatches(ray_cpu, tmp_path) -> None:
     _check_one_step(tmp_path, _schedule(pp=1, dp=2, num_microbatches=2), dp=2, local_batch=4)
 
