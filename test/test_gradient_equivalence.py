@@ -23,6 +23,23 @@ class _TwoStage(nn.Module):
             return self.b(h)
 
 
+def _gpipe(n_ranks: int, n_mbs: int, split_backward: bool = False) -> list[dict]:
+    """Order every forward before every backward, on each rank.
+
+    On CPU, gloo's send blocks until the peer receives, so 1F1B and ZeroBubble,
+    whose sends cross between ranks, deadlock there. This order never crosses.
+    """
+    backward = ["BI", "BW"] if split_backward else ["B"]
+    return [
+        {
+            "op": "order",
+            "filters": [[{"PP": rank, "MB": mb, "PASS": "F"}] for mb in range(n_mbs)]
+            + [[{"PP": rank, "MB": mb, "PASS": p}] for mb in range(n_mbs) for p in backward],
+        }
+        for rank in range(n_ranks)
+    ]
+
+
 def _schedule(pp: int, dp: int, num_microbatches: int = 1, order=build_1f1b_schedule, **replicate) -> list[dict]:
     """Place the two stages on *pp* ranks, each replicated on *dp* ranks."""
     directives: list[dict] = []
@@ -56,6 +73,17 @@ def _check_one_step(tmp_path, schedule: list[dict], dp: int, local_batch: int) -
 
 def test_dp2_replicate(ray_cpu, tmp_path) -> None:
     _check_one_step(tmp_path, _schedule(pp=1, dp=2), dp=2, local_batch=4)
+
+
+def test_dp2_two_microbatches(ray_cpu, tmp_path) -> None:
+    _check_one_step(tmp_path, _schedule(pp=1, dp=2, num_microbatches=2), dp=2, local_batch=4)
+
+
+@pytest.mark.parametrize("split_backward", [False, True], ids=["fused_backward", "split_backward"])
+def test_pp2_two_microbatches(ray_cpu, tmp_path, split_backward) -> None:
+    order = lambda n_ranks, n_mbs: _gpipe(n_ranks, n_mbs, split_backward)
+    _check_one_step(tmp_path, _schedule(pp=2, dp=1, num_microbatches=2, order=order), dp=1, local_batch=4)
+
 
 
 def test_each_microbatch_gets_its_own_slice(ray_cpu, tmp_path) -> None:

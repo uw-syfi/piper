@@ -808,10 +808,10 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            outputs_or_loss = [
-                                loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
-                            ]
-                        loss_buffer.append(outputs_or_loss[0].detach())
+                            loss = loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            # Grads accumulate over microbatches, so each backpropagates 1/M.
+                            outputs_or_loss = [loss / self.runtime.num_microbatches]
+                        loss_buffer.append(loss.detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -905,9 +905,8 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            stage_outputs_or_loss = [
-                                loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
-                            ]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            stage_outputs_or_loss = [loss / self.runtime.num_microbatches]
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
