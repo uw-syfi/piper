@@ -907,6 +907,7 @@ class DagExecutor:
                         with node_stream_ctx:
                             loss = loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
                             stage_outputs_or_loss = [loss / self.runtime.num_microbatches]
+                        loss_buffer.append(loss.detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]

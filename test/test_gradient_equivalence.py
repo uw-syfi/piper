@@ -69,6 +69,7 @@ def _check_one_step(tmp_path, schedule: list[dict], dp: int, local_batch: int, m
         assert got.keys() == expected.keys()
         for name in expected:
             torch.testing.assert_close(got[name], expected[name], msg=f"dp rank {rank}: {name}")
+    return results
 
 
 def test_dp2_replicate(ray_cpu, tmp_path) -> None:
@@ -82,7 +83,10 @@ def test_dp2_two_microbatches(ray_cpu, tmp_path) -> None:
 @pytest.mark.parametrize("split_backward", [False, True], ids=["fused_backward", "split_backward"])
 def test_pp2_two_microbatches(ray_cpu, tmp_path, split_backward) -> None:
     order = lambda n_ranks, n_mbs: _gpipe(n_ranks, n_mbs, split_backward)
-    _check_one_step(tmp_path, _schedule(pp=2, dp=1, num_microbatches=2, order=order), dp=1, local_batch=4)
+    (result,) = _check_one_step(
+        tmp_path, _schedule(pp=2, dp=1, num_microbatches=2, order=order), dp=1, local_batch=4
+    )
+    assert len(result["losses"][0]) == 2
 
 
 
