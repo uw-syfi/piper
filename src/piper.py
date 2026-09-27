@@ -4,7 +4,6 @@ from typing import Iterator
 
 import ray
 import torch.fx as fx
-from torch._dynamo.backends.registry import register_backend
 
 from .fx import PIPER_ANNOTATIONS_META_KEY, split_gm_by_annotations
 from .dag import (
@@ -165,55 +164,66 @@ def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[Tra
     return subdags
 
 
-@register_backend
-def piper(gm, example_inputs, **kwargs):
-    """TrainingDAG backend: split by Piper annotations and lower schedule directives."""
-    del example_inputs, kwargs
+class DagBackend:
+    """TorchDynamo backend: split the traced graph by Piper annotations and
+    lower the schedule directives into one TrainingDAG per PP rank.
 
-    schedule_info = getattr(piper_metadata, "schedule_info", {}) or {}
-    schedule_directives = getattr(piper_metadata, "schedule_directives", None)
-    _top_level_gm, annotation_segments = split_gm_by_annotations(gm)
+    schedule_directives: parsed schedule program.
+    visualize_dag: render per-rank DAG artifacts under ``artifact_dir``.
+    artifact_dir: output directory for visualizations.
+    """
 
-    if not annotation_segments:
-        raise ValueError(
-            "No Piper annotations found in the traced graph. Wrap model compute "
-            "with src.piper.annotate(...) before compiling with Piper."
+    def __init__(
+        self,
+        schedule_directives: list[dict],
+        visualize_dag: bool = False,
+        artifact_dir: str = "out",
+    ):
+        self.schedule_directives = list(schedule_directives)
+        self.visualize_dag = visualize_dag
+        self.artifact_dir = artifact_dir
+        self.training_dag: TrainingDAG | None = None
+        self.per_pp_training_dags: list[TrainingDAG] | None = None
+
+    def __call__(self, gm, example_inputs, **kwargs):
+        del example_inputs, kwargs
+        _top_level_gm, annotation_segments = split_gm_by_annotations(gm)
+
+        if not annotation_segments:
+            raise ValueError(
+                "No Piper annotations found in the traced graph. Wrap model compute "
+                "with src.piper.annotate(...) before compiling with Piper."
+            )
+
+        training_dag = build_training_dag(annotation_segments)
+        _validate_schedule_tags_exist(training_dag, self.schedule_directives)
+        apply_schedule_directives(training_dag, self.schedule_directives)
+        self.training_dag = training_dag
+        per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
+        for i, subdag in enumerate(per_pp_training_dags):
+            zero_chains = _prune_zero_lifetime_metadata(subdag)
+            resolve_total_order_per_stream(subdag)
+            _add_inter_chain_temporal_edges(subdag, zero_chains)
+            if self.visualize_dag:
+                log_training_dag_dependencies(subdag)
+                print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=self.artifact_dir)
+                render_training_dag(subdag, output_path=f"{self.artifact_dir}/training_dag_pp{i}")
+        self.per_pp_training_dags = per_pp_training_dags
+
+        logger.debug(
+            "built TrainingDAG with %d nodes and %d edges, split into %d local PP-rank DAG(s)",
+            len(training_dag.nodes),
+            len(training_dag.edges),
+            len(per_pp_training_dags),
         )
 
-    # Build and store the new directed DAG representation for later scheduling transforms.
-    training_dag = build_training_dag(annotation_segments)
-    _validate_schedule_tags_exist(training_dag, schedule_directives)
-    apply_schedule_directives(
-        training_dag,
-        schedule_directives,
-    )
-    piper_metadata.training_dag = training_dag
-    per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
-    artifact_dir = getattr(piper_metadata, "artifact_dir", "out")
-    for i, subdag in enumerate(per_pp_training_dags):
-        zero_chains = _prune_zero_lifetime_metadata(subdag)
-        resolve_total_order_per_stream(subdag)
-        _add_inter_chain_temporal_edges(subdag, zero_chains)
-        if getattr(piper_metadata, "visualize_dag", False):
-            log_training_dag_dependencies(subdag)
-            print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
-            render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
-    piper_metadata.per_pp_training_dags = per_pp_training_dags
+        def callback(*args, _gm=gm):
+            logger.warning(
+                "piper compiled callback invoked directly; running local graph execution"
+            )
+            return _gm(*args)
 
-    logger.debug(
-        "built TrainingDAG with %d nodes and %d edges, split into %d local PP-rank DAG(s)",
-        len(training_dag.nodes),
-        len(training_dag.edges),
-        len(per_pp_training_dags),
-    )
-
-    def callback(*args, _gm=gm):
-        logger.warning(
-            "piper compiled callback invoked directly; running local graph execution"
-        )
-        return _gm(*args)
-
-    return callback
+        return callback
 
 
 def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None = None) -> list:
