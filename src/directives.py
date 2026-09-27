@@ -703,6 +703,7 @@ def _bucket_matched_fwd_nodes(
                         "input_names": [n.name for n in bgm.graph.nodes if n.op == "placeholder"],
                         "output_names": [],
                         "a2a_boundary_after": None,
+                        "slot_fqns": dict(fwd_node.node_meta["slot_fqns"]),
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
                         "bucket_key": f_uid,

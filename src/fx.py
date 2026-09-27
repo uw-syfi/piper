@@ -1,12 +1,13 @@
 import torch
 import torch.fx as fx
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 import inspect
 import importlib
 import json
 import operator
+import re
 
 from .state import create_logger, LOG_LEVEL
 
@@ -340,6 +341,8 @@ class AnnotationSegment:
     graphargs: list[Any]
     placeholders: list[fx.Node]
     a2a_boundary_after: dict[str, Any] | None = None
+    slot_fqns: dict[str, str] = field(default_factory=dict)
+    """Placeholder name -> module path, for each lifted parameter or buffer."""
 
 
 def _inject_piper_annotation(node: fx.Node, name: str, index: int, uid: int) -> None:
@@ -406,6 +409,29 @@ def _source_root(source: Any) -> Any:
     while getattr(source, "base", None) is not None:
         source = source.base
     return source
+
+
+_MODULE_PATH_PART = re.compile(
+    r"\._(?:modules|parameters|buffers)\['([^']*)'\]|\.([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _slot_fqn(node: fx.Node) -> str | None:
+    """Return the module path of a lifted parameter or buffer, such as ``layers.0.norm.weight``."""
+    source = _placeholder_source(node)
+    prefix = "L['self']"
+    if source is None or not source.name.startswith(prefix):
+        return None
+    rest = source.name[len(prefix):]
+    parts: list[str] = []
+    pos = 0
+    while pos < len(rest):
+        match = _MODULE_PATH_PART.match(rest, pos)
+        if match is None:
+            return None
+        parts.append(match.group(1) if match.group(1) is not None else match.group(2))
+        pos = match.end()
+    return ".".join(parts) or None
 
 
 def _runtime_input_arg_name(node: fx.Node) -> str | None:
@@ -662,6 +688,7 @@ def split_gm_by_annotations(
         new_input_idxs: list[int] = []
         new_param_idxs: list[int] = []
         new_graphargs: list[Any] = []
+        slot_fqns: dict[str, str] = {}
         pos = 0
 
         def _add_placeholder(node: fx.Node, name: str, *, is_runtime_input: bool) -> None:
@@ -678,6 +705,14 @@ def split_gm_by_annotations(
             else:
                 new_param_idxs.append(pos)
                 new_graphargs.append(_grapharg_for_placeholder(node))
+                fqn = _slot_fqn(node)
+                if fqn is None:
+                    raise ValueError(
+                        f"Piper cannot find the module path of slot {node.name!r} "
+                        f"(source {getattr(_placeholder_source(node), 'name', None)}). "
+                        "Register the tensor as a parameter, buffer or attribute of a module."
+                    )
+                slot_fqns[new_ph.name] = fqn
             pos += 1
 
         if seg == 0:
@@ -760,6 +795,7 @@ def split_gm_by_annotations(
                 graphargs=new_graphargs,
                 placeholders=placeholders,
                 a2a_boundary_after=boundary_after,
+                slot_fqns=slot_fqns,
             )
         )
 

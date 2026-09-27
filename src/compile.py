@@ -131,6 +131,7 @@ def piper_setup(
     temp_dir: str = None,
     visualize_dag: bool = False,
     const_attrs: dict = None,
+    strict_const_attrs: bool = False,
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
 ):
@@ -147,6 +148,11 @@ def piper_setup(
         example_outputs: Example outputs (labels) for tracing.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
+        const_attrs: Values for non-trainable buffers and attributes, keyed by
+            module path (e.g. ``"layers.0.attention.mask"``). Values are cast
+            to the dtype of the traced slot.
+        strict_const_attrs: Raise if a non-trainable slot has no const_attrs
+            entry. By default Piper zero-fills it and logs a warning.
         schedule_directives_file: JSON schedule description consumed by the
             TrainingDAG backend. When provided, Piper derives pp/dp/mbs
             schedule metadata internally.
@@ -246,11 +252,10 @@ def piper_setup(
         k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
         for k, v in (const_attrs or {}).items()
     }
-    if _const_attrs:
-        ray.get([
-            actor.load_const_attrs.remote(_const_attrs)
-            for actor in piper_metadata.actors.values()
-        ])
+    ray.get([
+        actor.load_const_attrs.remote(_const_attrs, strict=strict_const_attrs)
+        for actor in piper_metadata.actors.values()
+    ])
 
     if dp_rank == 0:
         # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---

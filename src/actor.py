@@ -1,7 +1,6 @@
 import ray
 import torch
 import os
-import re
 from typing import Any
 import gc
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
@@ -167,8 +166,10 @@ class PiperActor:
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the coordinator before compilation so _load_stage can fill them in
-        # instead of zero-initializing.  Keyed by bare attribute name (e.g. "freqs_cis").
+        # instead of zero-initializing.  Keyed by module path (e.g. "layers.0.mask").
         self.model_const_attrs: dict = {}
+        self.strict_const_attrs = False
+        self.zero_filled_slots: list[str] = []
 
     def get_params_cpu(self) -> dict:
         """Return all trainable parameters as CPU tensors, keyed by name."""
@@ -238,13 +239,15 @@ class PiperActor:
         self.labels = labels.to(self.runtime.device)
         self.logger.debug(f"Actor {self.runtime.global_rank} loaded labels {self.labels.shape}")
 
-    def load_const_attrs(self, const_attrs: dict) -> None:
+    def load_const_attrs(self, const_attrs: dict, strict: bool = False) -> None:
         """Store non-trainable constant tensor attributes (e.g. freqs_cis, mask).
 
-        *const_attrs* maps bare attribute name → CPU tensor.  Values are moved to
-        the actor's device so ``_load_stage`` can copy them directly.
+        *const_attrs* maps module path → CPU tensor.  Values are moved to the
+        actor's device so ``_load_stage`` can copy them directly.  With *strict*,
+        a non-trainable slot that no constant fills raises instead of warning.
         """
         self.model_const_attrs = {k: v.to(self.runtime.device) for k, v in const_attrs.items()}
+        self.strict_const_attrs = bool(strict)
 
     def get_node_ip_and_free_port(self):
         import socket
@@ -375,7 +378,8 @@ class PiperActor:
         """Load a (possibly bucketed) stage.
 
         *modules_data* is a list of dicts, one per module/bucket, each with keys:
-        ``gm_data``, ``graphargs``, ``input_idxs``, ``param_idxs``, ``bucket_key``.
+        ``gm_data``, ``graphargs``, ``input_idxs``, ``param_idxs``, ``bucket_key``,
+        ``slot_fqns``.
 
         A non-bucketed stage is represented as a single-element list.
         All per-bucket data structures are keyed by ``bucket_key`` so run_dag
@@ -419,6 +423,7 @@ class PiperActor:
             shared_placeholder_names = list(
                 bd.get("shared_placeholder_names", bd.get("placeholder_names", []))
             )
+            slot_fqns = dict(bd["slot_fqns"])
             # Extract FX placeholder names for each param index.
             bucket.param_names = [
                 shared_placeholder_names[i] if i < len(shared_placeholder_names) else f"ubid{ubid}_p{i}"
@@ -448,20 +453,23 @@ class PiperActor:
                     t.requires_grad_(True)
                     torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
-                    # Non-trainable slot: try to fill from const attrs (freqs_cis, mask, …)
-                    # before falling back to zeros.  Dynamo names direct model attrs as
-                    # "l_self_<attr_name>", so strip that prefix to get the bare name.
+                    # Non-trainable slot: fill it from const attrs (freqs_cis, mask, …)
+                    # by its module path, which the backend recorded for every slot.
                     ph_name = shared_placeholder_names[i] if i < len(shared_placeholder_names) else ""
-                    attr_name = re.sub(r'^l_self_', '', ph_name)
+                    attr_name = slot_fqns.get(ph_name)
+                    if attr_name is None:
+                        raise ValueError(f"stage {stage_id}: no module path for slot {ph_name!r}")
                     const_val = self.model_const_attrs.get(attr_name)
-                    if (
-                        const_val is not None
-                        and tuple(const_val.shape) == tuple(arg.shape)
-                        and const_val.dtype == arg.dtype
-                    ):
-                        t.copy_(const_val)
-                    else:
+                    if const_val is None:
                         t.zero_()
+                        self.zero_filled_slots.append(attr_name)
+                    elif tuple(const_val.shape) != tuple(arg.shape):
+                        raise ValueError(
+                            f"const_attrs[{attr_name!r}] has shape {tuple(const_val.shape)}, "
+                            f"but the model slot has shape {tuple(arg.shape)}"
+                        )
+                    else:
+                        t.copy_(const_val)
                 realized[i] = t
 
             shared_name_to_idx = {
@@ -698,6 +706,7 @@ class PiperActor:
                 "apply_zero": bool(meta.get("apply_zero", True)),
                 "training_dag_uid": getattr(node, "uid", None),
                 "triton_constant_args": dict(meta.get("triton_constant_args", {})),
+                "slot_fqns": dict(meta["slot_fqns"]),
             }
             stage_to_modules[int(stage_id)].append(module_data)
 
@@ -705,6 +714,7 @@ class PiperActor:
             "load_training_dag: no FWD compute nodes with gm metadata found"
         )
 
+        self.zero_filled_slots = []
         for stage_id in sorted(stage_to_modules.keys()):
             self._load_stage(
                 stage_id=stage_id,
@@ -712,6 +722,14 @@ class PiperActor:
                 a2a_boundaries={},
                 use_activation_checkpointing=False,
             )
+        if self.zero_filled_slots:
+            message = (
+                f"Actor {self.runtime.global_rank}: no const_attrs entry for non-trainable "
+                f"slot(s) {sorted(set(self.zero_filled_slots))}; they are zero-filled"
+            )
+            if self.strict_const_attrs:
+                raise ValueError(message)
+            self.logger.warning(message)
 
         # Build runtime adjacency on TrainingDAG nodes so run_dag can execute directly.
         for n in training_dag.nodes.values():
