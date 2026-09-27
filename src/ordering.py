@@ -2,6 +2,7 @@ from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
     _has_path,
+    _remove_node_and_incident_edges,
     _topological_levels,
     _topological_order,
 )
@@ -180,3 +181,50 @@ def resolve_total_order_per_stream(dag: TrainingDAG) -> None:
                             )
                         )
                 current_uid = next_uid
+
+
+def prune_redundant_reduces(dag: TrainingDAG) -> None:
+    """Keep one gradient all-reduce per bucket: the one after its last backward.
+
+    Split inserts one REDUCE_COMM per microbatch. Each would all-reduce the
+    accumulated ``.grad`` in place while the next microbatch's backward adds
+    into it on another stream. Runs after ``resolve_total_order_per_stream``,
+    so the backward nodes of one bucket are totally ordered.
+    """
+    by_bucket: dict[object, list[str]] = {}
+    for uid, node in dag.nodes.items():
+        if node.node_kind == "REDUCE_COMM":
+            by_bucket.setdefault(node.node_meta.get("bucket_key"), []).append(uid)
+
+    topo_idx = {uid: i for i, uid in enumerate(_topological_order(dag))}
+    for bucket, reduce_uids in by_bucket.items():
+        if len(reduce_uids) < 2:
+            continue
+        bwd_of = {uid: dag.nodes[uid].node_meta["bwd_uid"] for uid in reduce_uids}
+        last = max(reduce_uids, key=lambda uid: topo_idx[bwd_of[uid]])
+        ancestors = _ancestors(dag, bwd_of[last])
+        if any(bwd_of[uid] not in ancestors for uid in reduce_uids if uid != last):
+            raise ValueError(
+                f"bucket {bucket!r}: no single backward follows all others among "
+                f"{sorted(bwd_of.values())}; cannot place one gradient all-reduce"
+            )
+        for uid in reduce_uids:
+            if uid == last:
+                continue
+            preds = sorted(dag.preds[uid])
+            succs = sorted(dag.succs[uid])
+            _remove_node_and_incident_edges(dag, uid)
+            for src in preds:
+                for dst in succs:
+                    dag.add_edge(TrainingDAGEdge(src_uid=src, dst_uid=dst, dep_kind="temporal"))
+
+
+def _ancestors(dag: TrainingDAG, uid: str) -> set[str]:
+    seen: set[str] = set()
+    stack = list(dag.preds.get(uid, set()))
+    while stack:
+        cur = stack.pop()
+        if cur not in seen:
+            seen.add(cur)
+            stack.extend(dag.preds.get(cur, set()))
+    return seen

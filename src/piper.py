@@ -25,6 +25,7 @@ from .directives import (
 )
 from .ordering import (
     _serial_topological_order,
+    prune_redundant_reduces,
     resolve_total_order_per_stream,
 )
 from .state import LOG_LEVEL, create_logger, piper_metadata
@@ -195,6 +196,7 @@ def piper(gm, example_inputs, **kwargs):
     for i, subdag in enumerate(per_pp_training_dags):
         zero_chains = _prune_zero_lifetime_metadata(subdag)
         resolve_total_order_per_stream(subdag)
+        prune_redundant_reduces(subdag)
         _add_inter_chain_temporal_edges(subdag, zero_chains)
         if getattr(piper_metadata, "visualize_dag", False):
             log_training_dag_dependencies(subdag)
