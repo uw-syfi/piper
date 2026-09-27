@@ -434,7 +434,8 @@ class ParamStorage:
             f"all_gather_full_params: ubid={ubid} dispatched but full params are already fresh; "
             "DAG is constructing a redundant ALL_GATHER"
         )
-        with stream_ctx:
+        # No autograd: gloo writes the gathered chunks through views of flat_params.
+        with stream_ctx, torch.no_grad():
             self.logger.debug(
                 f"[all_gather_begin] rank={self.runtime.global_rank} ubid={ubid}: "
                 f"flat_numel={flat_params.numel()} flat_storage={flat_params.untyped_storage().size()} "

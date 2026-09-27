@@ -77,9 +77,14 @@ def test_dp2_replicate(ray_cpu, tmp_path) -> None:
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 2])
-@pytest.mark.parametrize("zero", [{"shard_grads": True}], ids=["zero2"])
+@pytest.mark.parametrize("zero", [{"shard_grads": True}, {"shard_params": True}], ids=["zero2", "zero3"])
 def test_dp2_zero(ray_cpu, tmp_path, zero, num_microbatches) -> None:
     schedule = _schedule(pp=1, dp=2, num_microbatches=num_microbatches, **zero)
+    # Finish each microbatch before the next, so ZeRO-3 parameter lifetimes do not overlap.
+    schedule.append({
+        "op": "order",
+        "filters": [[{"MB": mb, "PASS": p}] for mb in range(num_microbatches) for p in ("F", "B")],
+    })
     _check_one_step(tmp_path, schedule, dp=2, local_batch=4)
 
 

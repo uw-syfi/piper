@@ -173,13 +173,26 @@ class PiperActor:
         self.zero_filled_slots: list[str] = []
 
     def get_params_cpu(self) -> dict:
-        """Return all trainable parameters as CPU tensors, keyed by name."""
+        """Return all trainable parameters as CPU tensors, keyed by name.
+
+        ZeRO-3 buckets hold only a shard between steps, so this gathers them:
+        call it on every DP rank at once.
+        """
         params = {}
         for ubid, bucket in self.stages.buckets.items():
+            gathered = {}
+            if ubid in self.stages.param_sharded_ubids and bucket.shard_param is not None:
+                shard = bucket.shard_param.detach()
+                full = shard.new_empty(shard.numel() * self.runtime.dp_degree)
+                dist.all_gather_into_tensor(full, shard, group=self.runtime.dp_group)
+                gathered = {
+                    id(param): full[offset:offset + numel].view(shape)
+                    for param, offset, numel, shape in bucket.param_view_specs
+                }
             for idx, name in zip(bucket.param_idxs, bucket.param_names):
                 p = bucket.forward_args[idx]
                 if p is not None:
-                    params[name] = p.detach().cpu().clone()
+                    params[name] = gathered.get(id(p), p).detach().cpu().clone()
         return params
 
     def get_and_reset_peak_memory_stats(self) -> tuple:
