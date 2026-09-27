@@ -3,6 +3,7 @@ import torch
 import os
 from typing import Any
 import gc
+import zlib
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
 import torch.distributed as dist
 from collections import defaultdict
@@ -389,8 +390,9 @@ class PiperActor:
             f"Loading stage {stage_id} ({len(modules_data)} module(s)) on actor {self.runtime.global_rank}"
         )
 
+        # Each parameter is seeded from its module path, never from the rank,
+        # so every DP replica and every pipeline split starts from the same weights.
         g = torch.Generator(device=self.runtime.device)
-        g.manual_seed(1000 * self.runtime.global_rank + stage_id)
 
         first_gm = None
 
@@ -449,23 +451,24 @@ class PiperActor:
                 if arg is None:
                     continue
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
+                ph_name = shared_placeholder_names[i] if i < len(shared_placeholder_names) else ""
+                fqn = slot_fqns.get(ph_name)
+                if fqn is None:
+                    raise ValueError(f"stage {stage_id}: no module path for slot {ph_name!r}")
                 if arg.requires_grad:
                     t.requires_grad_(True)
+                    g.manual_seed(zlib.crc32(fqn.encode()))
                     torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
                     # Non-trainable slot: fill it from const attrs (freqs_cis, mask, …)
                     # by its module path, which the backend recorded for every slot.
-                    ph_name = shared_placeholder_names[i] if i < len(shared_placeholder_names) else ""
-                    attr_name = slot_fqns.get(ph_name)
-                    if attr_name is None:
-                        raise ValueError(f"stage {stage_id}: no module path for slot {ph_name!r}")
-                    const_val = self.model_const_attrs.get(attr_name)
+                    const_val = self.model_const_attrs.get(fqn)
                     if const_val is None:
                         t.zero_()
-                        self.zero_filled_slots.append(attr_name)
+                        self.zero_filled_slots.append(fqn)
                     elif tuple(const_val.shape) != tuple(arg.shape):
                         raise ValueError(
-                            f"const_attrs[{attr_name!r}] has shape {tuple(const_val.shape)}, "
+                            f"const_attrs[{fqn!r}] has shape {tuple(const_val.shape)}, "
                             f"but the model slot has shape {tuple(arg.shape)}"
                         )
                     else:
