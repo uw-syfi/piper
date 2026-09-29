@@ -128,6 +128,7 @@ def build_training_dag(
                 "input_names": in_names,
                 "output_names": out_names,
                 "a2a_boundary_after": segment.a2a_boundary_after,
+                "slot_fqns": dict(segment.slot_fqns),
                 "triton_constant_args": _collect_triton_constant_args(segment.gm),
             },
         )

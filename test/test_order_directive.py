@@ -144,6 +144,7 @@ def test_bucket_rewrite_resolves_split_microbatch_bwd_by_metadata(monkeypatch) -
         "graphargs": [],
         "input_idxs": [],
         "param_idxs": [],
+        "slot_fqns": {},
     })
     dag.add_node(fwd)
     dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))

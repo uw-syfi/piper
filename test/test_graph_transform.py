@@ -1,4 +1,3 @@
-import pytest
 import torch
 import torch.fx as fx
 import torch.nn as nn
@@ -23,12 +22,19 @@ class _AnnotatedNet(nn.Module):
             return self.fc3(x)
 
 
-def _capture_gm(model: nn.Module, x: torch.Tensor):
+def _capture_gm(model: nn.Module, x: torch.Tensor, prepare=None):
+    """Trace *model* and split its graph inside the backend, where Dynamo sources exist."""
     captured: dict = {}
 
     def _backend(gm, example_inputs):
         captured["gm"] = gm
         captured["inputs"] = list(example_inputs)
+        if prepare is not None:
+            prepare(gm)
+        try:
+            captured["segments"] = split_gm_by_annotations(gm)[1]
+        except ValueError as err:
+            captured["error"] = err
         return gm.forward
 
     _reset_annotation_state()
@@ -36,7 +42,7 @@ def _capture_gm(model: nn.Module, x: torch.Tensor):
     with torch.no_grad():
         ref = compiled(x).detach().clone()
 
-    return captured["gm"], captured["inputs"], ref
+    return captured, ref
 
 
 def _placeholder_values(gm: fx.GraphModule, example_inputs: list) -> dict[str, object]:
@@ -78,8 +84,8 @@ def test_split_gm_by_annotations_handles_nested_annotation_segments() -> None:
     model = _AnnotatedNet()
     x = torch.randn(2, 8)
 
-    gm, example_inputs, ref = _capture_gm(model, x)
-    _, segments = split_gm_by_annotations(gm)
+    captured, ref = _capture_gm(model, x)
+    gm, example_inputs, segments = captured["gm"], captured["inputs"], captured["segments"]
 
     assert [segment.tag for segment in segments] == [
         {"PP": 0},
@@ -113,13 +119,15 @@ def test_split_gm_by_annotations_ignores_non_piper_custom_metadata() -> None:
 
 def test_split_gm_by_annotations_rejects_mixed_annotated_and_unannotated_compute() -> None:
     torch.manual_seed(0)
-    gm, _, _ = _capture_gm(_AnnotatedNet(), torch.randn(2, 8))
-    first_compute = next(
-        node
-        for node in gm.graph.nodes
-        if node.op not in ("placeholder", "get_attr", "output")
-    )
-    first_compute.meta.pop("custom", None)
 
-    with pytest.raises(ValueError, match="without Piper annotations"):
-        split_gm_by_annotations(gm)
+    def _drop_first_annotation(gm: fx.GraphModule) -> None:
+        first_compute = next(
+            node
+            for node in gm.graph.nodes
+            if node.op not in ("placeholder", "get_attr", "output")
+        )
+        first_compute.meta.pop("custom", None)
+
+    captured, _ = _capture_gm(_AnnotatedNet(), torch.randn(2, 8), prepare=_drop_first_annotation)
+
+    assert "without Piper annotations" in str(captured.get("error"))

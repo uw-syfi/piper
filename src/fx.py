@@ -1,12 +1,13 @@
 import torch
 import torch.fx as fx
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 import inspect
 import importlib
 import json
 import operator
+import re
 
 from .state import create_logger, LOG_LEVEL
 
@@ -340,6 +341,8 @@ class AnnotationSegment:
     graphargs: list[Any]
     placeholders: list[fx.Node]
     a2a_boundary_after: dict[str, Any] | None = None
+    slot_fqns: dict[str, str] = field(default_factory=dict)
+    """Placeholder name -> module path, for each lifted parameter or buffer."""
 
 
 def _inject_piper_annotation(node: fx.Node, name: str, index: int, uid: int) -> None:
@@ -396,17 +399,98 @@ def _example_value(node: fx.Node) -> Any:
     return node.meta.get("example_value", node.meta.get("val"))
 
 
+def _placeholder_source(node: fx.Node) -> Any:
+    """Return the Dynamo source of *node*; Dynamo sets it only while it runs the backend."""
+    grapharg = node.meta.get("grapharg")
+    return None if grapharg is None else getattr(grapharg, "source", None)
+
+
+def _source_root(source: Any) -> Any:
+    while getattr(source, "base", None) is not None:
+        source = source.base
+    return source
+
+
+_MODULE_PATH_PART = re.compile(
+    r"\._(?:modules|parameters|buffers)\['([^']*)'\]|\.([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _slot_fqn(node: fx.Node) -> str | None:
+    """Return the module path of a lifted parameter or buffer, such as ``layers.0.norm.weight``."""
+    source = _placeholder_source(node)
+    prefix = "L['self']"
+    if source is None or not source.name.startswith(prefix):
+        return None
+    rest = source.name[len(prefix):]
+    parts: list[str] = []
+    pos = 0
+    while pos < len(rest):
+        match = _MODULE_PATH_PART.match(rest, pos)
+        if match is None:
+            return None
+        parts.append(match.group(1) if match.group(1) is not None else match.group(2))
+        pos = match.end()
+    return ".".join(parts) or None
+
+
+def _runtime_input_arg_name(node: fx.Node) -> str | None:
+    """Return the ``forward`` argument name *node* was lifted from, if known."""
+    source = _placeholder_source(node)
+    if source is None or getattr(source, "base", None) is not None:
+        return None
+    return getattr(source, "local_name", None)
+
+
 def _placeholder_is_runtime_input(node: fx.Node) -> bool:
+    """Check if an FX placeholder node is a runtime input (i.e. the token stream) and not module state."""
     ex = _example_value(node)
     if not isinstance(ex, torch.Tensor):
         return False
-    if isinstance(ex, torch.nn.Parameter):
+    source = _placeholder_source(node)
+    if source is None:
+        raise ValueError(
+            f"Placeholder {node.name!r} has no Dynamo source. Split the graph inside a "
+            "torch.compile backend: Dynamo deletes meta['grapharg'] when the backend returns."
+        )
+    # The source is where Dynamo reads the value at each call:
+    # L['self']... is module state, a bare L['<arg>'] is a forward argument.
+    root_name = getattr(_source_root(source), "local_name", None)
+    if root_name == "self":
         return False
-    if bool(getattr(ex, "requires_grad", False)):
-        return False
-    if "self" in node.name or "grapharg" in node.meta:
-        return False
-    return True
+    if root_name is not None and getattr(source, "base", None) is None:
+        return True
+    raise ValueError(
+        f"Piper cannot feed placeholder {node.name!r} (source {source.name}). "
+        "Pass the tensor as a forward argument or register it on the module."
+    )
+
+
+def _sort_runtime_inputs(placeholders: list[fx.Node], arg_names: list[str] | None) -> list[fx.Node]:
+    """Order runtime inputs by ``forward`` argument position.
+
+    Dynamo lifts inputs in first-use order, but callers pass them by position.
+    """
+    if arg_names is None:
+        return placeholders
+    positions_by_node: dict[fx.Node, int] = {}
+    for node in placeholders:
+        name = _runtime_input_arg_name(node)
+        if name is None or name not in arg_names:
+            raise ValueError(
+                f"Runtime input {node.name!r} does not match a forward argument {arg_names}"
+            )
+        positions_by_node[node] = arg_names.index(name)
+    ordered = sorted(placeholders, key=positions_by_node.__getitem__)
+    positions = [positions_by_node[node] for node in ordered]
+    names = [arg_names[p] for p in positions]
+    if positions != list(range(len(positions))):
+        unused = [name for name in arg_names[: max(positions, default=-1) + 1] if name not in names]
+        raise ValueError(
+            f"Forward arguments {unused} are not used by the traced graph. Piper feeds "
+            "inputs by position, so remove the unused arguments or move them last."
+        )
+    return ordered
 
 
 def _grapharg_for_placeholder(node: fx.Node) -> Any:
@@ -503,13 +587,17 @@ def _select_boundary_tensor_idx(nodes: list[fx.Node]) -> int | None:
     return 0 if nodes else None
 
 
-def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
+def split_gm_by_annotations(
+    gm: fx.GraphModule,
+    input_arg_names: list[str] | None = None,
+) -> tuple[fx.GraphModule, list[AnnotationSegment]]:
     """Split a GraphModule into contiguous subgraphs by Piper annotation stack.
 
     Piper annotations are carried in ``node.meta['custom']['piper_annotations']``.
     The full stack, including nested annotations, is part of the split key. The
     schedule-facing tag for each segment is the stack projected to
-    ``{annotation_name: auto_index}``.
+    ``{annotation_name: auto_index}``. *input_arg_names* are the model's
+    ``forward`` argument names; segment 0 takes its runtime inputs in that order.
     """
     nodes = list(gm.graph.nodes)
     compute_nodes = [
@@ -560,6 +648,9 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         node for node in nodes
         if node.op == "placeholder" and node not in runtime_placeholders
     }
+    ordered_runtime_placeholders = _sort_runtime_inputs(
+        [node for node in nodes if node in runtime_placeholders], input_arg_names
+    )
 
     value_seg: dict[fx.Node, int] = dict(node_seg)
     for node in runtime_placeholders:
@@ -597,6 +688,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
         new_input_idxs: list[int] = []
         new_param_idxs: list[int] = []
         new_graphargs: list[Any] = []
+        slot_fqns: dict[str, str] = {}
         pos = 0
 
         def _add_placeholder(node: fx.Node, name: str, *, is_runtime_input: bool) -> None:
@@ -613,12 +705,19 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
             else:
                 new_param_idxs.append(pos)
                 new_graphargs.append(_grapharg_for_placeholder(node))
+                fqn = _slot_fqn(node)
+                if fqn is None:
+                    raise ValueError(
+                        f"Piper cannot find the module path of slot {node.name!r} "
+                        f"(source {getattr(_placeholder_source(node), 'name', None)}). "
+                        "Register the tensor as a parameter, buffer or attribute of a module."
+                    )
+                slot_fqns[new_ph.name] = fqn
             pos += 1
 
         if seg == 0:
-            for node in nodes:
-                if node in runtime_placeholders:
-                    _add_placeholder(node, node.name, is_runtime_input=True)
+            for node in ordered_runtime_placeholders:
+                _add_placeholder(node, node.name, is_runtime_input=True)
         else:
             for node in seg_cross_in[seg]:
                 _add_placeholder(node, f"_xseg_{node.name}", is_runtime_input=True)
@@ -696,6 +795,7 @@ def split_gm_by_annotations(gm: fx.GraphModule) -> tuple[fx.GraphModule, list[An
                 graphargs=new_graphargs,
                 placeholders=placeholders,
                 a2a_boundary_after=boundary_after,
+                slot_fqns=slot_fqns,
             )
         )
 

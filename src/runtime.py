@@ -141,6 +141,7 @@ class RuntimeState:
     world_size: int
     no_nvtx: bool = False
     device: str = "cpu"
+    num_microbatches: int = 1
     dp_group: Any = None
     ep_group: Any = None
     pp_lo_hi: Any = None
@@ -433,7 +434,8 @@ class ParamStorage:
             f"all_gather_full_params: ubid={ubid} dispatched but full params are already fresh; "
             "DAG is constructing a redundant ALL_GATHER"
         )
-        with stream_ctx:
+        # No autograd: gloo writes the gathered chunks through views of flat_params.
+        with stream_ctx, torch.no_grad():
             self.logger.debug(
                 f"[all_gather_begin] rank={self.runtime.global_rank} ubid={ubid}: "
                 f"flat_numel={flat_params.numel()} flat_storage={flat_params.untyped_storage().size()} "
@@ -472,6 +474,8 @@ class ParamStorage:
                 shard_optim.step()
             shard_param.grad = None
 
+        self._gather_updated_shards(stream_ctx)
+
         for ubid in self.stages.param_sharded_ubids:
             bucket = self.stages.bucket(ubid)
             for param, *_ in bucket.param_view_specs:
@@ -482,6 +486,21 @@ class ParamStorage:
                 if storage.size() != 0:
                     storage.resize_(0)
             bucket.full_params_fresh = False
+
+    def _gather_updated_shards(self, stream_ctx: AbstractContextManager) -> None:
+        """Copy every rank's updated shard into the full params of a ZeRO-2 bucket.
+
+        Under ZeRO-2 each rank keeps the full params but steps only its own
+        shard, which is a view into them at this rank's offset, so one in-place
+        all-gather refreshes the other shards. ZeRO-3 buckets gather before use.
+        """
+        for ubid, bucket in self.stages.buckets.items():
+            if bucket.shard_optimizer is None or ubid in self.stages.param_sharded_ubids:
+                continue
+            with stream_ctx, torch.no_grad():
+                dist.all_gather_into_tensor(
+                    bucket.flat_params, bucket.shard_param.detach(), group=self.runtime.dp_group
+                )
 
     def _has_trainable_params_for_collective(self, ubid: Any, op_name: str) -> bool:
         bucket = self.stages.get_bucket(ubid)

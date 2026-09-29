@@ -1,6 +1,7 @@
 import ray
 import torch
 import copy
+import inspect
 import os
 import time
 from pathlib import Path
@@ -130,6 +131,7 @@ def piper_setup(
     temp_dir: str = None,
     visualize_dag: bool = False,
     const_attrs: dict = None,
+    strict_const_attrs: bool = False,
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
 ):
@@ -142,14 +144,26 @@ def piper_setup(
     Args:
         model: The model to compile.
         optim_fn: Callable ``(params) -> Optimizer`` used to create optimizers.
-        example_inputs: Example inputs for tracing.
-        example_outputs: Example outputs (labels) for tracing.
+        example_inputs: Example inputs for tracing: one microbatch.
+        example_outputs: Example outputs (labels) for tracing: one microbatch.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
+        const_attrs: Values for non-trainable buffers and attributes, keyed by
+            module path (e.g. ``"layers.0.attention.mask"``). Values are cast
+            to the dtype of the traced slot.
+        strict_const_attrs: Raise if a non-trainable slot has no const_attrs
+            entry. By default Piper zero-fills it and logs a warning.
         schedule_directives_file: JSON schedule description consumed by the
             TrainingDAG backend. When provided, Piper derives pp/dp/mbs
             schedule metadata internally.
     """
+
+    if activation_checkpointing or num_checkpoints != 1:
+        # Refuse before any actor or placement group exists, so nothing leaks.
+        raise NotImplementedError(
+            "Piper does not implement activation checkpointing yet; "
+            "activation_checkpointing and num_checkpoints were previously ignored."
+        )
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
     # call (e.g. with a different model size or schedule) in the same Python
@@ -174,6 +188,7 @@ def piper_setup(
     piper_metadata.training_dag = None
     piper_metadata.per_pp_training_dags = None
     piper_metadata.compiled_data_store = None
+    piper_metadata.forward_arg_names = None
 
     pp_degree = int(schedule_info["pp_degree"])
 
@@ -244,11 +259,10 @@ def piper_setup(
         k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
         for k, v in (const_attrs or {}).items()
     }
-    if _const_attrs:
-        ray.get([
-            actor.load_const_attrs.remote(_const_attrs)
-            for actor in piper_metadata.actors.values()
-        ])
+    ray.get([
+        actor.load_const_attrs.remote(_const_attrs, strict=strict_const_attrs)
+        for actor in piper_metadata.actors.values()
+    ])
 
     if dp_rank == 0:
         # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---
@@ -260,6 +274,8 @@ def piper_setup(
             model = model_class(*tuple(resolved_model_args or ()), **dict(resolved_model_kwargs or {}))
             if model_dtype is not None:
                 model = model.to(model_dtype)
+
+        piper_metadata.forward_arg_names = list(inspect.signature(model.forward).parameters)
 
         num_params = sum(p.numel() for p in model.parameters())
         if model_dtype == torch.bfloat16:
@@ -336,8 +352,10 @@ def piper_setup(
             "No compute_loss node found in per-PP DAGs; falling back to labels on pp_rank=%s",
             loss_pp_ranks[0],
         )
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    # The example is one microbatch; a step takes every microbatch at once.
+    num_mbs = int(schedule_info["num_microbatches"])
+    ray.get(piper_metadata.actors[0].load_input.remote([torch.cat([x] * num_mbs) for x in example_inputs]))
     ray.get([
-        piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
+        piper_metadata.actors[pp_rank].load_labels.remote(torch.cat([example_outputs] * num_mbs))
         for pp_rank in loss_pp_ranks
     ])

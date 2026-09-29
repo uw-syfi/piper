@@ -126,6 +126,7 @@ class CommunicationExecutor:
         with stream_ctx:
             for grad in grad_tensors:
                 dist.all_reduce(grad, group=self.runtime.dp_group)
+                grad.div_(self.runtime.dp_degree)
         return total_bytes
 
     def reduce_scatter(self, ubid: Any, stream_ctx: AbstractContextManager) -> int:
@@ -152,7 +153,8 @@ class CommunicationExecutor:
             total_bytes = flat_grads.numel() * flat_grads.element_size()
             tmp = torch.empty_like(rs_out)
             dist.reduce_scatter_tensor(tmp, flat_grads, group=self.runtime.dp_group)
-            rs_out.add_(tmp)
+            # Divide this chunk alone: rs_out may already hold earlier chunks.
+            rs_out.add_(tmp.div_(self.runtime.dp_degree))
             return total_bytes
 
     def has_trainable_params_for_collective(self, ubid: Any, op_name: str) -> bool:
@@ -544,6 +546,26 @@ class DagExecutor:
         items = sorted(tag.items(), key=lambda kv: kv[0])
         return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
 
+    def _microbatch(self, batch: torch.Tensor, mb_idx: int) -> torch.Tensor:
+        """Return microbatch *mb_idx* of *batch*, which holds every microbatch along dim 0."""
+        num_mbs = self.runtime.num_microbatches
+        if batch.shape[0] % num_mbs != 0:
+            raise ValueError(
+                f"batch dim {batch.shape[0]} does not split into {num_mbs} microbatches"
+            )
+        return batch.chunk(num_mbs)[mb_idx]
+
+    def _microbatch_inputs(self, ubid: Any, inputs: list, mb_idx: int) -> list:
+        chunks = [self._microbatch(t, mb_idx) for t in inputs]
+        traced = [tuple(shape) for shape, _dtype, _requires_grad in self.stages.bucket(ubid).forward_input_meta]
+        got = [tuple(t.shape) for t in chunks[: len(traced)]]
+        if got != traced:
+            raise ValueError(
+                f"microbatch inputs have shapes {got}, but the graph was traced with {traced}. "
+                f"Load {self.runtime.num_microbatches} microbatches of the traced size per step."
+            )
+        return chunks
+
     def _wait_for_all_gather(self, compute_node: Any) -> None:
         compute_stream_ctx = self.runtime.stream_for_task(compute_node)
         for pred in compute_node.data_preds:
@@ -578,7 +600,7 @@ class DagExecutor:
         labels: Any,
         loss_buffer: list,
         loss_fn=None,
-    ) -> None:
+    ) -> dict | None:
         """Run one iteration of the loaded TrainingDAG."""
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
@@ -745,7 +767,7 @@ class DagExecutor:
                         input_tensors = self.buffers.task[recv_pred.uid]
                         self.buffers.release(recv_pred.uid)
                     else:
-                        input_tensors = inputs
+                        input_tensors = self._microbatch_inputs(ubid, inputs, mb_idx)
 
                     self._wait_for_all_gather(node)
 
@@ -786,8 +808,10 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
-                        loss_buffer.append(outputs_or_loss[0].detach())
+                            loss = loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            # Grads accumulate over microbatches, so each backpropagates 1/M.
+                            outputs_or_loss = [loss / self.runtime.num_microbatches]
+                        loss_buffer.append(loss.detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -881,7 +905,9 @@ class DagExecutor:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with node_stream_ctx:
-                            stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                            loss = loss_fn(fwd_out["out_with_grad"][0], self._microbatch(labels, mb_idx))
+                            stage_outputs_or_loss = [loss / self.runtime.num_microbatches]
+                        loss_buffer.append(loss.detach())
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.buffers.task[recv_pred.uid]
@@ -990,20 +1016,15 @@ class DagExecutor:
             self.runtime.nvtx_pop()
         return step_result
 
-    def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list):
+    def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list) -> dict:
         self.params.drain_pending_frees()
-        if self.params.has_zero_shard_optimizers():
-            _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
-            self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
-            losses = list(loss_buffer)
-            loss_buffer.clear()
-            self.dev.synchronize()
-            return [float(l) for l in losses]
-
         for ar_evt in self.events.all_reduce.values():
             self.dev.wait_event(stream_ctx, ar_evt)
 
         _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
+        # A schedule can mix ZeRO buckets with ordinary ones, so step both kinds.
+        if self.params.has_zero_shard_optimizers():
+            self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue

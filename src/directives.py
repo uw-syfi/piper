@@ -290,8 +290,9 @@ def _normalize_split_directive(directive: Any) -> tuple[dict[str, Any], str, int
     if "filter" not in directive:
         raise ValueError(f"split directive requires 'filter': {directive}")
     dim_name = directive.get("dim_name")
-    if not isinstance(dim_name, str) or not dim_name:
-        raise ValueError(f"split directive requires non-empty string dim_name: {directive}")
+    if dim_name != "MB":
+        # The runtime reads the microbatch index from the "MB" tag alone.
+        raise ValueError(f"split directive requires dim_name 'MB': {directive}")
     num_microbatches = int(directive.get("num_microbatches", 0))
     if num_microbatches <= 0:
         raise ValueError(f"split directive requires num_microbatches > 0: {directive}")
@@ -627,24 +628,14 @@ def _bucket_matched_fwd_nodes(
 
         pre_bytes = _param_bytes(graphargs, param_idxs)
 
-        try:
-            buckets = bucket_stage(
-                gm,
-                graphargs,
-                input_idxs,
-                param_idxs,
-                bucket_size_bytes=bucket_size_bytes,
-                debug_name=fwd_uid,
-            )
-        except Exception as exc:
-            logger.warning(
-                "replicate bucketing skipped for node %s (stage=%s seg=%s): %s",
-                fwd_uid,
-                fwd_node.node_meta.get("stage_id"),
-                fwd_node.node_meta.get("segment_id"),
-                exc,
-            )
-            continue
+        buckets = bucket_stage(
+            gm,
+            graphargs,
+            input_idxs,
+            param_idxs,
+            bucket_size_bytes=bucket_size_bytes,
+            debug_name=fwd_uid,
+        )
         if len(buckets) <= 1:
             continue
         original_param_names = set(_param_names(gm, param_idxs))
@@ -678,10 +669,15 @@ def _bucket_matched_fwd_nodes(
         orig_stage = int(fwd_node.node_meta.get("stage_id", -1))
         orig_seg = int(fwd_node.node_meta.get("segment_id", -1))
 
+        # Split copies of one segment share its bucket_key, so derive bucket
+        # keys from it rather than from the per-microbatch uid: every
+        # microbatch must train the same parameters.
+        base_key = fwd_node.node_meta.get("bucket_key", fwd_uid)
         fwd_bucket_uids: list[str] = []
         bwd_bucket_uids: list[str] = []
         for bi, (bgm, b_in, b_param, b_args) in enumerate(buckets):
             f_uid = f"{fwd_uid}.bucket{bi}"
+            bucket_key = f"{base_key}.bucket{bi}"
             b_uid = f"{f_uid}.bwd"
             fwd_bucket_uids.append(f_uid)
             bwd_bucket_uids.append(b_uid)
@@ -702,10 +698,16 @@ def _bucket_matched_fwd_nodes(
                         "graphargs": list(b_args),
                         "input_names": [n.name for n in bgm.graph.nodes if n.op == "placeholder"],
                         "output_names": [],
-                        "a2a_boundary_after": None,
+                        # The last bucket emits the segment's outputs, so it owns
+                        # the segment's all-to-all boundary.
+                        "a2a_boundary_after": (
+                            fwd_node.node_meta.get("a2a_boundary_after")
+                            if bi == len(buckets) - 1 else None
+                        ),
+                        "slot_fqns": dict(fwd_node.node_meta["slot_fqns"]),
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
-                        "bucket_key": f_uid,
+                        "bucket_key": bucket_key,
                     },
                 )
             )
@@ -721,7 +723,7 @@ def _bucket_matched_fwd_nodes(
                         "fwd_uid": f_uid,
                         "bucket_idx": bi,
                         "num_buckets": len(buckets),
-                        "bucket_key": f_uid,
+                        "bucket_key": bucket_key,
                         "compute_loss": bool(bwd_node.node_meta.get("compute_loss", False)) and bi == (len(buckets) - 1),
                     },
                 )

@@ -268,8 +268,6 @@ def bucket_stage(
         if not merged_boundary:
             break
 
-    _log_bucket_plan("final", merged)
-
     n_segs = len(merged)
     if n_segs == 1:
         return [(stage_gm, list(input_idxs), list(param_idxs), list(graphargs))]
