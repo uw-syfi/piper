@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 #!/usr/bin/env python3
 """Generate timing-only Figures 1--4 from the frozen final corpus.
 

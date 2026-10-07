@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Benchmark one NCCL all-reduce rank on each of several Ray nodes.
 
 The actors are placed in a STRICT_SPREAD placement group, so every rank runs

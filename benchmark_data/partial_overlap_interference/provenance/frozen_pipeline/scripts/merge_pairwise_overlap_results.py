@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Merge compatible pairwise-overlap benchmark JSON documents.
 
 The merge is deliberately lossless: every input keeps its placement, clock,

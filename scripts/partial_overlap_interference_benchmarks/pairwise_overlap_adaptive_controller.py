@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """CPU-side adaptive controller for pairwise-overlap benchmark samples.
 
 The GPU runner produces one aggregate row per attempted treatment.  This

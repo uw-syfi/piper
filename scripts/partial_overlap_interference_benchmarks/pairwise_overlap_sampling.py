@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Adaptive sampling primitives for pairwise-overlap benchmark cells.
 
 The GPU runner owns launch ordering and sample validity.  This module owns only

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Case-boundary restart and idempotence support for overlap benchmarks.
 
 GPU actor state is deliberately *not* checkpointed.  A case is the smallest

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 #!/usr/bin/env python3
 """Render Figure 1 from its committed, estimator-valid aggregate source."""
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Trace-anchored Triton pointwise operations for the overlap suite.
 
 These helpers reproduce the mathematical model operations while making the

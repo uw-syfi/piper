@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Hopper physical-resource measurements for overlap diagnostics.
 
 The supported cluster does not grant CUPTI/Nsight Compute performance-counter

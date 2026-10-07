@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: MIT
 // Validate CUDA Green Context SM isolation with physical %smid observations.
 //
 // The probe splits one device's complete SM resource into two partitions,

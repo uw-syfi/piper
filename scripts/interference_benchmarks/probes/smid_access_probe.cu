@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: MIT
 // Report the physical SM IDs used by a CUDA kernel.
 //
 // Each CTA requests slightly more than half of an SM's shared memory, forcing

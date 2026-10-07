@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Acceptance and sweep-coverage checks for pairwise-overlap corpora.
 
 The validator intentionally depends only on the Python standard library.  It

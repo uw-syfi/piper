@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Replay significant compute/communication trace classes on eight H100s.
 
 The input is produced by ``analyze_trace_compute_comm_overlaps.py`` with both

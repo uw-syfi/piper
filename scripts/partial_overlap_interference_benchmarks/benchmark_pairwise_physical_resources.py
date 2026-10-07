@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Collect frozen pairwise physical-resource points with Hopper NVML GPM.
 
 This diagnostic-only runner does no geometry search.  It consumes the frozen

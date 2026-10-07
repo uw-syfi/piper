@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Replace Figure 1's wall-average NVML SM column with peak footprint estimates.
 
 The estimate is derived from the exact primary kernel launch in the original

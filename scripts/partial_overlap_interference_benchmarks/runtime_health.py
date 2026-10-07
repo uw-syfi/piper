@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Optional NVML runtime-health sampling for GPU benchmarks.
 
 The benchmark suite must remain usable in environments where ``pynvml`` is

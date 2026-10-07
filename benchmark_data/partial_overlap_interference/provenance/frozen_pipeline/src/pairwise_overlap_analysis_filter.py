@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Canonical sample inclusion rules for pairwise-overlap estimates.
 
 Adaptive runs preserve rows that the controller rejected, plus a bounded tail
