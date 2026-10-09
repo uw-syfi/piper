@@ -234,6 +234,14 @@ Optional artifact generation flags:
 * Normal hardware timing runs exactly `--iters` measured iterations after
   `--warmup` warmup iterations.
 
+## NVIDIA contribution
+
+The NVIDIA-authored changes in this repository are a one-time contribution
+from NVIDIA to Piper. NVIDIA's work on them is complete, and NVIDIA is not
+accepting outside contributions to them. Piper is owned and maintained by
+the University of Washington; to contribute to Piper, follow the upstream
+project at https://github.com/uw-syfi/piper.
+
 ## Citation
 
 If you use Piper in your research, please cite:
